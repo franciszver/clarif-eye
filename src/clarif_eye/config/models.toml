@@ -59,7 +59,7 @@ currency_count_threshold = 1
 keyword_hit_threshold = 1
 # Keyword-alone override: this many distinct keyword hits route to
 # research even if neither of the other two signals fires. High-stakes
-# documents like a prescription label ("TABLETS", "MG", "DAILY") often
+# documents like a prescription label ("TABLETS", "MG", "REFILLS") often
 # carry almost no digit/currency density, so vocabulary alone must be able
 # to decide - see router.py module docstring.
 keyword_strong_hit_threshold = 2
@@ -83,8 +83,17 @@ keywords = [
     # is purely billing vocabulary, so a prescription label - the
     # highest-stakes input this router sees - could never score a keyword
     # hit at all.
+    # Generic time/frequency words ("daily", "hours", "twice", "every",
+    # "take") were removed here (regression fix, P1 router heuristic):
+    # combined with keyword_strong_hit_threshold = 2, they made ordinary
+    # signage (opening hours, parking limits, bus schedules) hit the
+    # keyword-alone override and route to the expensive research path. The
+    # medication cases below still reach that override on specific
+    # vocabulary alone (tablet/mg/refill etc.), so the generic words were
+    # never load-bearing for the medication safety case - see router.py
+    # module docstring and tests/test_router.py.
     "tablet", "tablets", "capsule", "capsules", "dose", "doses", "dosage",
     "mg", "ml", "prescription", "prescriptions", "refill", "refills",
-    "pharmacy", "take", "daily", "twice", "hours", "warning", "exp",
+    "pharmacy", "warning", "exp",
     "expiry", "expiration", "pill", "pills",
 ]

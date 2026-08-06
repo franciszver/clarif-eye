@@ -254,6 +254,25 @@ def test_medication_labels_route_to_research(case_id, ocr):
     assert decision.complexity_flag is True, f"{case_id}: reason={decision.reason}"
 
 
+# --- Regression fix: generic time/frequency words must not send ordinary ---
+# --- signage to the research path -------------------------------------------
+
+
+ORDINARY_SIGN_LABELS = [
+    ("open_daily_24_hours", "OPEN DAILY 24 HOURS"),
+    ("parking_2_hours_max", "PARKING 2 HOURS MAX 8AM-6PM DAILY"),
+    ("buses_every_2_hours", "BUSES EVERY 2 HOURS DAILY 06:00 22:00"),
+    ("happy_hour_every_day", "HAPPY HOUR EVERY DAY 4PM TO 6PM"),
+    ("gym_hours", "GYM HOURS MON-FRI 6AM-10PM"),
+]
+
+
+@pytest.mark.parametrize("case_id,ocr", ORDINARY_SIGN_LABELS, ids=[c[0] for c in ORDINARY_SIGN_LABELS])
+def test_ordinary_signs_with_time_words_route_to_fast_synth(case_id, ocr):
+    decision = classify_complexity(ocr, "a printed sign")
+    assert decision.complexity_flag is False, f"{case_id}: reason={decision.reason}"
+
+
 # --- FIX 2: scene_context (model prose) must not contribute to scoring ------
 
 

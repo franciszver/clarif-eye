@@ -41,7 +41,7 @@ complexity_flag is True if:
   - keyword_hits alone reaches `keyword_strong_hit_threshold` (a lower,
     single-signal bar). This exists because some high-stakes documents -
     a prescription label chief among them - carry their signal almost
-    entirely in vocabulary ("TABLETS", "MG", "DAILY") rather than in
+    entirely in vocabulary ("TABLETS", "MG", "REFILLS") rather than in
     digit or currency density, and a wrong dosage read aloud is worse
     than an occasional unnecessary trip through the slower path, so two
     or more distinct keyword hits are treated as sufficient on their
@@ -256,7 +256,7 @@ def classify_complexity(ocr_output, scene_context, config=None):
     signal_score = sum((digit_signal, currency_signal, keyword_signal))
 
     # A prescription label's evidence is almost entirely vocabulary
-    # ("TABLETS", "MG", "DAILY") with no reliable digit/currency density,
+    # ("TABLETS", "MG", "REFILLS") with no reliable digit/currency density,
     # so two or more distinct keyword hits alone are enough - see module
     # docstring.
     keyword_strong_signal = keyword_hits >= config.keyword_strong_hit_threshold
