@@ -27,10 +27,11 @@ from clarif_eye.vision import run_vision
 
 # Total-pipeline deadline (issue #17 / P6.1). D16 gave "eyes"/"brain" their
 # own per-role ceilings inside client.complete (30s/45s), but nothing
-# bounded the whole graph run - a live measurement found a research-path
-# request taking 99.0s end to end even though 30+45=75s from ceilings
-# alone should already have been close to the worst case (research + tts
-# fill the rest). This closes that gap.
+# bounded the whole graph run: the ceilings cap each model call, not the
+# sum of them plus research and tts, so the TAIL was unbounded. One live UI
+# run was observed at 99.0s - an outlier, not typical (measured medians are
+# ~21-31s; see the DEFAULT justification below) - but an unbounded tail is
+# a structural gap regardless of how often it bites. This closes it.
 #
 # MECHANISM: config["configurable"]["deadline"], an ABSOLUTE
 # time.monotonic() timestamp, set once by the caller before invoking the
