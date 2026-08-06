@@ -17,6 +17,7 @@ just no longer computes the rule itself.
 
 from clarif_eye.client import LadderExhaustedError, OpenRouterClient, OpenRouterError
 from clarif_eye.router import classify_complexity
+from clarif_eye.speech import strip_code_fence
 
 # Chosen because it's trivial to generate reliably in a prompt and trivial
 # to parse with a plain string search - no JSON-in-prose or code-fence
@@ -60,16 +61,6 @@ def _build_messages(image_data):
     ]
 
 
-def _strip_code_fence(text):
-    """Strip a leading/trailing ``` fence line (and language tag) if present."""
-    lines = text.split("\n")
-    if lines and lines[0].strip().startswith("```"):
-        lines = lines[1:]
-    if lines and lines[-1].strip().startswith("```"):
-        lines = lines[:-1]
-    return "\n".join(lines).strip()
-
-
 def _parse_reply(reply):
     """Parse the model's reply into (ocr_output, scene_context), or None.
 
@@ -109,7 +100,7 @@ def _parse_reply(reply):
     def section_text(start_index, marker, end_index):
         first_line = lines[start_index].strip()[len(marker) :]
         body_lines = [first_line] + lines[start_index + 1 : end_index]
-        return _strip_code_fence("\n".join(body_lines).strip())
+        return strip_code_fence("\n".join(body_lines).strip())
 
     if ocr_index < scene_index:
         ocr_text = section_text(ocr_index, OCR_MARKER, scene_index)
@@ -122,6 +113,48 @@ def _parse_reply(reply):
         return None
 
     return ocr_text, scene_text
+
+
+# This node's own degradation messages, as named constants rather than
+# inline literals. Downstream consumers (synth.py) must be able to detect
+# "vision failed and scene_context is actually an error message, not a
+# scene description" WITHOUT matching against the English wording, so that
+# rewording one of these messages for accessibility (issues #15/#18) can't
+# silently break that detection - see is_degraded_scene below.
+DEGRADED_CONFIG_ERROR = (
+    "Vision could not run because of a configuration problem with the "
+    "service. Please tell whoever set this up."
+)
+DEGRADED_LADDER_EXHAUSTED = (
+    "Vision could not run right now: every available model was busy or "
+    "unavailable. Please try again in a moment."
+)
+DEGRADED_UNEXPECTED_ERROR = (
+    "Vision could not run because of an unexpected internal error. Please "
+    "try again, and tell whoever set this up if it keeps happening."
+)
+DEGRADED_EMPTY_REPLY = "The vision model returned an empty response."
+DEGRADED_UNPARSEABLE_REPLY = "The vision model's response could not be understood."
+
+
+def is_degraded_scene(text):
+    """True if `text` IS (exactly, modulo surrounding whitespace) one of
+    this module's own degradation messages.
+
+    Structural, not textual: this checks identity against the named
+    constants above, not a hunt for prefixes/keywords in English prose. A
+    caller (synth.py) uses this to tell "vision produced an error message"
+    apart from "vision produced a real scene description" without having
+    to know or guess at the wording.
+    """
+    stripped = (text or "").strip()
+    return stripped in (
+        DEGRADED_CONFIG_ERROR,
+        DEGRADED_LADDER_EXHAUSTED,
+        DEGRADED_UNEXPECTED_ERROR,
+        DEGRADED_EMPTY_REPLY,
+        DEGRADED_UNPARSEABLE_REPLY,
+    )
 
 
 def _degraded(message):
@@ -152,45 +185,32 @@ def run_vision(image_data, client=None):
         try:
             client = _default_client()
         except OpenRouterError:
-            return _degraded(
-                "Vision could not run because of a configuration problem with "
-                "the service. Please tell whoever set this up."
-            )
+            return _degraded(DEGRADED_CONFIG_ERROR)
     try:
         try:
             result = client.complete("eyes", _build_messages(image_data))
         except LadderExhaustedError:
-            return _degraded(
-                "Vision could not run right now: every available model was busy "
-                "or unavailable. Please try again in a moment."
-            )
+            return _degraded(DEGRADED_LADDER_EXHAUSTED)
         except OpenRouterError:
-            return _degraded(
-                "Vision could not run because of a configuration problem with "
-                "the service. Please tell whoever set this up."
-            )
+            return _degraded(DEGRADED_CONFIG_ERROR)
         except Exception:
             # Contract (module docstring): no raw exception may escape into
             # the graph. This catches everything else the injected client
             # could raise (ValueError, TimeoutError, KeyError, RuntimeError,
             # ...) without swallowing KeyboardInterrupt/SystemExit, which
             # derive from BaseException, not Exception.
-            return _degraded(
-                "Vision could not run because of an unexpected internal "
-                "error. Please try again, and tell whoever set this up if "
-                "it keeps happening."
-            )
+            return _degraded(DEGRADED_UNEXPECTED_ERROR)
     finally:
         if owns_client:
             client.close()
 
     reply = result.content
     if not isinstance(reply, str) or not reply.strip():
-        return _degraded("The vision model returned an empty response.")
+        return _degraded(DEGRADED_EMPTY_REPLY)
 
     parsed = _parse_reply(reply)
     if parsed is None:
-        return _degraded("The vision model's response could not be understood.")
+        return _degraded(DEGRADED_UNPARSEABLE_REPLY)
 
     ocr_output, scene_context = parsed
     return {

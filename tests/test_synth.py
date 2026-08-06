@@ -44,6 +44,16 @@ def assert_tts_safe(text):
         f"raw URL survived: {text!r}"
     )
     assert not re.search(r"([^\w\s])\1{2,}", text), f"bare punctuation run survived: {text!r}"
+    # FIX 5: reject the markup shapes review found assert_tts_safe missing.
+    # Ordinary prose keeps balanced brackets/parens (e.g. "(open 9-5)"), so
+    # these check balance/adjacency, not "no brackets/parens at all".
+    assert text.count("[") == text.count("]"), f"unbalanced brackets survived: {text!r}"
+    assert text.count("(") == text.count(")"), f"unbalanced parentheses survived: {text!r}"
+    assert "](" not in text, f"raw markdown link fragment survived: {text!r}"
+    assert not re.search(r"</?[a-zA-Z][^<>]*>", text), f"HTML/angle-bracket tag survived: {text!r}"
+    assert ", ," not in text, f"comma run survived: {text!r}"
+    assert not text.startswith(","), f"leading comma survived: {text!r}"
+    assert not text.endswith(","), f"trailing comma survived: {text!r}"
 
 
 # --- Fake client, same shape as test_vision.py's ----------------------------
@@ -371,3 +381,123 @@ def test_full_compiled_graph_runs_end_to_end_on_fast_path_with_fake_client():
     assert result["complexity_flag"] is False
     assert_tts_safe(result["final_output"])
     assert result["audio_file_path"] != ""
+
+
+# --- FIX 5: assert_tts_safe now rejects previously-passing broken output ---
+#
+# These pin the exact three defects the fresh review found: the OLD
+# sanitiser produced these strings and the OLD assert_tts_safe passed them.
+# The strings below are literal, hand-verified outputs of the pre-fix code
+# (not run through to_spoken_text) - they exist purely to prove the
+# strengthened assertion now catches this shape of breakage.
+
+
+def test_assert_tts_safe_rejects_old_garbled_markdown_link_output():
+    garbled = "Check [our menu](a web link for prices."
+    with pytest.raises(AssertionError):
+        assert_tts_safe(garbled)
+
+
+def test_assert_tts_safe_rejects_old_table_comma_soup_output():
+    garbled = ", Item , Price , , Burger , $8.00 ,"
+    with pytest.raises(AssertionError):
+        assert_tts_safe(garbled)
+
+
+def test_assert_tts_safe_rejects_untouched_html():
+    garbled = "The sign says <b>OPEN</b> and <i>24 hours</i>."
+    with pytest.raises(AssertionError):
+        assert_tts_safe(garbled)
+
+
+# --- FIX 2/3/4 through the node: link/table/HTML replies sanitise cleanly --
+
+
+def test_reply_containing_a_markdown_link_sanitises_cleanly():
+    client = FakeSynthClient(content="Check [our menu](https://example.com/menu) for prices.")
+
+    result = run_fast_synth("some text", "a scene", client)
+
+    assert_tts_safe(result["final_output"])
+    assert "our menu" in result["final_output"]
+
+
+def test_reply_containing_a_table_sanitises_cleanly():
+    client = FakeSynthClient(
+        content="| Item | Price |\n|------|-------|\n| Burger | $8.00 |\n"
+    )
+
+    result = run_fast_synth("some text", "a scene", client)
+
+    assert_tts_safe(result["final_output"])
+    assert "Burger" in result["final_output"]
+
+
+def test_reply_containing_html_sanitises_cleanly():
+    client = FakeSynthClient(content="The sign says <b>OPEN</b> and <i>24 hours</i>.")
+
+    result = run_fast_synth("some text", "a scene", client)
+
+    assert_tts_safe(result["final_output"])
+    assert "OPEN" in result["final_output"]
+
+
+# --- FIX 7: vision failure detection is structural, not textual ------------
+
+
+def test_rewording_a_vision_degradation_message_does_not_break_detection(monkeypatch):
+    from clarif_eye import vision
+
+    monkeypatch.setattr(
+        vision,
+        "DEGRADED_LADDER_EXHAUSTED",
+        "Sorry, the picture-reading service is temporarily too busy to help.",
+    )
+
+    def _boom():
+        raise AssertionError("model must not be called for a degraded scene")
+
+    monkeypatch.setattr(synth, "_default_client", _boom)
+
+    result = run_fast_synth("", vision.DEGRADED_LADDER_EXHAUSTED)
+
+    assert vision.is_degraded_scene(vision.DEGRADED_LADDER_EXHAUSTED)
+    assert_tts_safe(result["final_output"])
+    assert "temporarily too busy" in result["final_output"]
+
+
+# --- FIX 8(a): table separator row is pinned, not dead weight --------------
+
+
+def test_table_separator_row_is_dropped_not_read_as_dashes():
+    client = FakeSynthClient(content="| Item | Price |\n|------|-------|\n| Burger | $8.00 |\n")
+
+    result = run_fast_synth("some text", "a scene", client)
+
+    # Exact pin: the separator row must contribute nothing at all - not
+    # dashes, not an extra empty sentence between the two real rows.
+    assert result["final_output"] == "Item, Price. Burger, $8.00."
+
+
+# --- FIX 8(b): real ocr_output with a degraded scene_context ---------------
+
+
+def test_real_ocr_output_is_not_dropped_when_scene_context_is_degraded():
+    """Documents the deliberate choice: OCR text is appended, not discarded.
+
+    Today vision.py's own _degraded() always pairs a degradation message
+    with ocr_output == "", so this combination isn't reachable through the
+    compiled graph - but run_fast_synth is public, and issue #8 may compose
+    state differently. The model is still not called (the scene
+    description is unreliable), but real OCR text must survive into
+    final_output rather than being silently discarded.
+    """
+
+    result = run_fast_synth(
+        "WIFI_PASSWORD_2026",
+        "The vision model's response could not be understood.",
+    )
+
+    assert_tts_safe(result["final_output"])
+    assert "WIFI_PASSWORD_2026" in result["final_output"]
+    assert "could not be understood" in result["final_output"]

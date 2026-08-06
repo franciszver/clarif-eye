@@ -27,10 +27,9 @@ regularly (see vision.py's module docstring):
     passed straight through as final_output.
 """
 
-import re
-
 from clarif_eye.client import LadderExhaustedError, OpenRouterClient, OpenRouterError
-from clarif_eye.vision import _strip_code_fence
+from clarif_eye.speech import to_spoken_text as _to_spoken_text
+from clarif_eye.vision import is_degraded_scene
 
 SYNTH_PROMPT = (
     "You are the final stage of an assistant that describes photos aloud "
@@ -45,73 +44,14 @@ SYNTH_PROMPT = (
     "be read aloud, nothing else."
 )
 
-# vision.py's own degraded() messages all begin with one of these two
-# phrases (see vision.py's four literal degradation strings). Matched by
-# prefix, not full equality, so a minor rewording of the message text
-# doesn't silently break this detection.
-_VISION_DEGRADATION_PREFIXES = ("Vision could not run", "The vision model")
+# Sanitisation (_to_spoken_text) lives in clarif_eye.speech and is imported
+# above - shared with vision.py so issue #8's analysis node can reuse the
+# same mechanics instead of copying them.
 
-# --- Sanitisation -------------------------------------------------------
-
-# Markdown bold/italic/underline markers: **x**, __x__, *x*, _x_. Just the
-# marker characters are dropped; the wrapped words are spoken text, kept.
-_BOLD_ITALIC_RE = re.compile(r"(\*\*|__|\*|_)")
-# A line that starts (after whitespace) with a markdown heading marker.
-_HEADING_RE = re.compile(r"^\s*#+\s*", re.MULTILINE)
-# A line that starts (after whitespace) with a bullet marker.
-_BULLET_RE = re.compile(r"^\s*[-*•]\s+", re.MULTILINE)
-# A line that starts (after whitespace) with a numbered-list marker.
-_NUMBERED_RE = re.compile(r"^\s*\d+[.)]\s+", re.MULTILINE)
-# Table separator rows, e.g. "|------|-------|" or "---|---".
-_TABLE_SEPARATOR_RE = re.compile(r"^\s*[-:|\s]*\|[-:|\s]*$", re.MULTILINE)
-_URL_RE = re.compile(r"\b(?:https?://|www\.)\S+", re.IGNORECASE)
-_EMOJI_RE = re.compile(
-    "["
-    "\U0001f300-\U0001faff"
-    "\U00002600-\U000027bf"
-    "\U0001f1e6-\U0001f1ff"
-    "]"
-)
-# A punctuation character repeated 3+ times in a row (e.g. "!!!", "----",
-# "..."), collapsed to a single occurrence rather than read aloud as noise.
-_PUNCT_RUN_RE = re.compile(r"([^\w\s])\1{2,}")
-
-
-def _to_spoken_text(text):
-    """Strip/normalise markup so `text` is safe to hand to text-to-speech.
-
-    Defensive, not cosmetic: models routinely ignore SYNTH_PROMPT's "plain
-    prose only" instruction, so this runs on every reply regardless of what
-    was asked for.
-    """
-    text = _strip_code_fence(text)
-    text = text.replace("`", "")
-    text = _TABLE_SEPARATOR_RE.sub(" ", text)
-    text = _HEADING_RE.sub("", text)
-    text = _BULLET_RE.sub("", text)
-    text = _NUMBERED_RE.sub("", text)
-    text = _BOLD_ITALIC_RE.sub("", text)
-    text = text.replace("|", ", ")
-    text = _URL_RE.sub("a web link", text)
-    text = _EMOJI_RE.sub("", text)
-    text = _PUNCT_RUN_RE.sub(r"\1", text)
-    # Flatten to a single line of flowing prose: a list turned into
-    # separate short lines above should read as one continuous script, not
-    # be read aloud with unnatural pauses between fragments.
-    lines = [line.strip() for line in text.split("\n")]
-    text = " ".join(line for line in lines if line)
-    text = re.sub(r"\s+", " ", text).strip()
-    # Nothing but leftover punctuation/whitespace (e.g. a reply that was
-    # pure markup noise) is not speakable content - treat it the same as
-    # an empty reply rather than reading stray commas and pipes aloud.
-    if not re.search(r"\w", text):
-        return ""
-    return text
-
-
-def _looks_like_vision_degradation(scene_context):
-    stripped = scene_context.strip()
-    return any(stripped.startswith(prefix) for prefix in _VISION_DEGRADATION_PREFIXES)
+# Detecting "scene_context is actually one of vision.py's own degradation
+# messages, not a real scene description" is vision.py's job (FIX 7): it
+# owns those messages and exposes a structural predicate for them, so a
+# rewording of the message text there can't silently break detection here.
 
 
 def _default_client():
@@ -143,7 +83,22 @@ def run_fast_synth(ocr_output, scene_context, client=None):
     ocr_output = ocr_output or ""
     scene_context = scene_context or ""
 
-    if _looks_like_vision_degradation(scene_context):
+    if is_degraded_scene(scene_context):
+        # Deliberate choice (FIX 8b): scene_context being a vision failure
+        # message does not mean any real ocr_output that came with it is
+        # worthless - run_fast_synth is public and issue #8 may compose
+        # state differently than the current graph does (today vision.py's
+        # own _degraded() always pairs a degradation message with
+        # ocr_output == "", so this combination isn't reachable through the
+        # graph yet, but this function must not silently drop real OCR text
+        # if that ever changes). The description failed and is not safe to
+        # feed to the model as if it were real, so the model is still not
+        # called - but any OCR text is appended to what gets read aloud
+        # instead of being discarded.
+        if ocr_output.strip():
+            return _degraded(
+                f"{scene_context} However, this text was found in the photo: {ocr_output}"
+            )
         return _degraded(scene_context)
 
     if not scene_context.strip():
