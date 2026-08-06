@@ -110,30 +110,34 @@ def analysis_node(state, config=None, client=None):
     return run_analysis(state["ocr_output"], state["scene_context"], state["scraper_data"], client)
 
 
-def tts_node(state, config=None, provider=None):
-    """TTS node (issue #11/P3.1): turns final_output into an audio file.
+def tts_node(state, config=None, provider=None, providers=None):
+    """TTS node (issue #11/P3.1, chain added by #12/P3.2): turns final_output
+    into an audio file, trying a provider chain in order.
 
-    The substantive logic (provider seam, file lifecycle, degradation)
+    The substantive logic (provider chain, file lifecycle, degradation)
     lives in clarif_eye.tts.run_tts so this stays a thin adapter, the same
-    pattern the other nodes use. `provider` is injectable directly or via
-    config["configurable"]["tts_provider"]; when neither is supplied,
-    run_tts constructs a real EdgeTtsProvider lazily. The output directory
-    is injectable only via config["configurable"]["tts_out_dir"] (used by
-    tests driving the compiled graph, so audio never lands in a fixed path
-    or the repo); when absent, run_tts falls back to its own bounded
-    per-process temp directory. Deliberately a DIFFERENT configurable key
-    than "client" (used by vision_node/fast_synth_node/analysis_node for
-    their OpenRouterClient) - a TTS provider is a different type serving a
+    pattern the other nodes use. `provider` (single) / `providers` (chain)
+    are injectable directly or via config["configurable"]["tts_provider"] /
+    ["tts_providers"]; when none are supplied, run_tts falls back to its
+    real DEFAULT_PROVIDER_CHAIN. The output directory is injectable only
+    via config["configurable"]["tts_out_dir"] (used by tests driving the
+    compiled graph, so audio never lands in a fixed path or the repo); when
+    absent, run_tts falls back to its own bounded per-process temp
+    directory. Deliberately a DIFFERENT configurable key than "client"
+    (used by vision_node/fast_synth_node/analysis_node for their
+    OpenRouterClient) - a TTS provider is a different type serving a
     different purpose, and reusing the same key would silently hand the
     wrong kind of object to whichever node ran second, the same reasoning
     research_node's "research_client" key documents.
     """
     _record(config, "tts")
     configurable = (config or {}).get("configurable", {})
+    if providers is None:
+        providers = configurable.get("tts_providers")
     if provider is None:
         provider = configurable.get("tts_provider")
     out_dir = configurable.get("tts_out_dir")
-    return run_tts(state["final_output"], provider=provider, out_dir=out_dir)
+    return run_tts(state["final_output"], provider=provider, providers=providers, out_dir=out_dir)
 
 
 def dynamic_router(state):
