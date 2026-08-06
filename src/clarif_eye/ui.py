@@ -96,6 +96,133 @@ IMAGE_INPUT_ELEM_ID = "photo-input"
 # (issue #48 / P5.4 - see ARIA_LIVE_HEAD's image-labelling comment below).
 UPLOADED_PHOTO_ALT = "The photo you submitted"
 
+# --- "How this works" section (issue #49 / P4.3) ---------------------------
+#
+# Owner request: a section near the bottom explaining the pipeline, the data
+# flow, and the LangGraph implementation, since this is a demo application.
+# Content below is checked against the source it describes, not against the
+# issue's own wording or the (older, no longer accurate) architecture doc:
+#   - graph.py: build_graph() registers exactly 5 nodes (vision, fast_synth,
+#     research, analysis, tts). "router" is NOT a 6th node - dynamic_router
+#     is the function evaluated by a conditional edge out of "vision"; it is
+#     plain Python (state["complexity_flag"] in/out, no client, no network -
+#     see router.py's module docstring "computed locally with no model
+#     call, per the architecture doc's requirement that routing be pure
+#     Python").
+#   - state.py: ClarifEyeState is a 7-key TypedDict.
+#   - registry.py / config/models.toml: the "eyes" and "brain" roles each
+#     hold an ORDERED ladder of free-only (":free", policy D10) model IDs,
+#     tried in turn on failure.
+#   - pyproject.toml's [project].dependencies lists langgraph, not
+#     langchain - this app does not use langchain, so the text below never
+#     claims it does.
+#   - tts.py: DEFAULT_PROVIDER_CHAIN is (EdgeTtsProvider, GttsProvider); if
+#     every provider fails, audio_file_path == "" and the UI falls back to
+#     text (see this module's "THE THREE OUTCOMES" docstring above).
+#   - analysis.py: on the deep-analysis path only, _numbers_verified checks
+#     every number-like token in the drafted script against the
+#     photographed text (+ scene description + any web lookup) before it is
+#     spoken; a token that doesn't trace back degrades to a safe
+#     "could not be verified" message instead of risking a wrong number.
+#     fast_synth.py has no equivalent check - the text below says "on the
+#     deep-analysis path", not "always", so it stays true to that asymmetry.
+#   - graph.py: DEFAULT_PIPELINE_BUDGET_SECONDS = 60.0, a total-pipeline
+#     deadline after which nodes degrade rather than block further (tts is
+#     deliberately exempt - see graph.py - so a blown deadline still ends in
+#     speech, not silence).
+#
+# ACCESSIBILITY (issue #49, learning from #48's mistake): real Markdown
+# heading syntax ("## "/"### "), which gr.Markdown renders as genuine
+# <h2>/<h3> elements a screen reader can navigate by heading - not
+# visually-styled prose. The flow is a plain numbered list, never a
+# diagram/image: a diagram that announces as a bare "graphic" (#48) is
+# worse than no diagram, and a text list carries the same information with
+# no such risk, so no image is used here at all (see
+# test_how_it_works_introduces_no_unlabelled_image). Always visible, no
+# collapsible toggle: simpler, and it avoids needing to get
+# aria-expanded/keyboard-toggle wiring right for a chunk of content that
+# costs a screen-reader/keyboard user nothing extra to skip past by
+# navigating to the next heading. Placed after the result textbox in
+# build_interface() below, so it never delays someone using the tool and
+# never sits between the live region and the result it announces.
+HOW_IT_WORKS_ELEM_ID = "how-it-works"
+HOW_IT_WORKS_MARKDOWN = """## How this works
+
+Clarif-Eye is a demo application. This section explains, honestly, what the
+code actually does with your photo.
+
+### The flow, step by step
+
+1. You take or upload a photo.
+2. A vision-language model reads any text in the photo and separately
+   describes the scene (what it is, its layout).
+3. A router decides, from that text alone, whether a quick description is
+   enough or the document is dense enough to need a closer look (an
+   itemised bill, a prescription label, a form with numbers on it). This
+   decision is plain Python - no model or network call - scoring things
+   like digit density, currency amounts, and document keywords.
+4. If a quick description is enough, the photographed text and scene
+   description are turned directly into the spoken script.
+5. If a closer look is needed, the app first does a web search related to
+   what was photographed, then a stronger text-reasoning model writes the
+   script from the photographed text, the scene description, and whatever
+   the search turned up.
+6. On that closer-look path, before anything is spoken, every number in the
+   drafted script is checked against the photographed text. If a number
+   doesn't trace back to what the camera actually saw, the app reports that
+   the result could not be verified rather than risk reading a wrong amount
+   or date aloud.
+7. The final script is converted to speech.
+
+### Inside the LangGraph pipeline
+
+This pipeline is built with [LangGraph](https://github.com/langchain-ai/langgraph)'s
+`StateGraph` (this app depends on `langgraph`, not `langchain` - there is no
+LangChain in this codebase). The graph state is a 7-key `TypedDict`:
+`image_data`, `ocr_output`, `scene_context`, `complexity_flag`,
+`scraper_data`, `final_output`, `audio_file_path`.
+
+Five nodes are registered: `vision`, `fast_synth`, `research`, `analysis`,
+and `tts`. Routing between them is a conditional edge out of `vision`,
+evaluated against `complexity_flag`: `False` goes to `fast_synth` then
+straight to `tts`; `True` goes to `research`, then `analysis`, then `tts`.
+That routing decision is evaluated locally in Python, with no model call -
+it is a deliberate design point, not an implementation shortcut: the router
+only ever needs to read text density and keywords, so it would be wasteful
+and slower to spend a model call deciding whether to spend a bigger one.
+
+### The two model roles
+
+Every text/vision model call goes through one of two roles, each an ordered
+ladder of free models tried in turn if an earlier one fails or times out:
+
+- **eyes** (reads the photo): `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`,
+  then `google/gemma-4-26b-a4b-it:free`.
+- **brain** (writes the closer-look description): `nvidia/nemotron-3-ultra-550b-a55b:free`,
+  then `nvidia/nemotron-3-super-120b-a12b:free`.
+
+### Honest operational notes
+
+- Every model in both ladders is a free-tier model. Free models can be
+  slower or less available than paid ones; the ladder exists so one model
+  being down or rate-limited doesn't take the app down with it.
+- Measured runs on the closer-look (deep-analysis) path have taken roughly
+  21 to 31 seconds end to end; the app tells you up front to expect up to
+  about 30 seconds, especially for photos with dense text.
+- The whole pipeline has a 60-second total budget. If it's about to be
+  exceeded, the app degrades to a simpler, faster answer built from
+  whatever was already read, rather than failing outright - except turning
+  the script into speech, which always still happens, so a blown budget
+  never means silence.
+- Speech synthesis tries two independent providers in order (Microsoft
+  Edge's TTS service, then Google Translate's TTS service). If both fail,
+  the description is still shown, and read by your own screen reader, as
+  text.
+- On the closer-look (deep-analysis) path, numbers spoken aloud are checked
+  against the photographed text before being read, as described above; this
+  check does not currently run on the quick-description path.
+"""
+
 # How long the deferred-play shim (see ARIA_LIVE_HEAD below) waits after
 # the audio element gets a src before it calls .play() - long enough for
 # a screen reader to finish speaking the (now short) STATUS_SUCCESS_AUDIO
@@ -658,6 +785,14 @@ def build_interface(resources):
         # SEQUENCING FIX" comment for why.
         audio_output = gr.Audio(label="Spoken description", autoplay=False, elem_id=AUDIO_ELEM_ID)
         text_output = gr.Textbox(label="Description (text)", lines=6, elem_id=RESULT_ELEM_ID)
+
+        # issue #49 / P4.3: placed AFTER the result area (never before it),
+        # so it never delays someone who came to use the tool and never
+        # sits between the live region and the result it announces. See
+        # HOW_IT_WORKS_MARKDOWN's module-level docstring for content
+        # sourcing and the accessibility reasoning behind a text-only
+        # section with no image/diagram.
+        gr.Markdown(HOW_IT_WORKS_MARKDOWN, elem_id=HOW_IT_WORKS_ELEM_ID)
 
         submit_event = submit_button.click(
             fn=_submit,
