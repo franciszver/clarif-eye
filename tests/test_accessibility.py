@@ -310,3 +310,70 @@ def test_focus_result_js_is_defensive_against_a_non_focusable_element():
     # element it targets can't be focused - a thrown error client-side
     # would be silent to the user but is still a correctness bug.
     assert "try" in FOCUS_RESULT_JS and "catch" in FOCUS_RESULT_JS
+
+
+# --- P5.2 / issue #16: audit-script surface closable offline ---------------
+#
+# Everything below is checkable WITHOUT a browser (same "STATIC/SOURCE-LEVEL
+# CHECK ONLY" discipline as the rest of this file). Anything that requires a
+# rendered DOM or an assistive technology is out of scope here - that is the
+# orchestrator's live audit (scripts/audit_accessibility.py's checklist) and
+# the human screen-reader pass recorded in prd/DECISIONS.md (D19).
+
+import re
+
+
+def test_no_positive_tabindex_anywhere_in_injected_markup():
+    # A positive tabindex (>0) hijacks the natural tab order, which is a
+    # WCAG 2.4.3 violation - the only tabindex this codebase should ever
+    # inject is "0" (re-enters the natural tab order without reordering
+    # it). Written to FAIL if any positive tabindex sneaks into either
+    # piece of injected JS/HTML.
+    injected = ARIA_LIVE_HEAD + FOCUS_RESULT_JS
+    for value in re.findall(r'tabindex["\'\s:=,]+["\']?(\d+)', injected, re.IGNORECASE):
+        assert int(value) == 0, f"positive tabindex found: {value}"
+
+
+def test_audit_script_exists_and_defines_the_required_checks():
+    from scripts import audit_accessibility as audit
+
+    # At least the categories issue #16 explicitly requires: accessible
+    # names, live-region wiring, focusable/tab-order description output,
+    # no positive tabindex, image alt text, and colour never being the
+    # sole carrier of information.
+    check_ids = {check["id"] for check in audit.CHECKS}
+    required = {
+        "accessible-names",
+        "live-region",
+        "description-focusable",
+        "no-positive-tabindex",
+        "image-alt-text",
+        "color-not-sole-carrier",
+    }
+    assert required <= check_ids
+
+
+def test_audit_checklist_stays_in_sync_with_ui_elem_ids():
+    # The checklist must reference the ACTUAL elem_ids the UI uses (import
+    # identity, not a hand-copied string) so the two can never silently
+    # drift apart - written to FAIL if the checklist is hand-authored
+    # against stale/copied ids instead of the real constants.
+    from scripts import audit_accessibility as audit
+
+    assert audit.STATUS_ELEM_ID is STATUS_ELEM_ID
+    assert audit.RESULT_ELEM_ID is RESULT_ELEM_ID
+
+    checklist_text = audit.render_checklist("http://example.invalid")
+    assert STATUS_ELEM_ID in checklist_text
+    assert RESULT_ELEM_ID in checklist_text
+
+
+def test_audit_js_payload_checks_for_positive_tabindex_and_missing_names():
+    from scripts import audit_accessibility as audit
+
+    payload = audit.js_payload()
+    assert "aria-live" in payload
+    assert "tabindex" in payload.lower()
+    # The payload must inspect accessible names (aria-label / innerText /
+    # label text), not just presence of elements.
+    assert "aria-label" in payload or "getAccessibleName" in payload
