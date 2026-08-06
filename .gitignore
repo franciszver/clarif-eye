@@ -1,0 +1,21 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Local strategy / decision log (working-process tier 3)
+prd/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Generated audio + scratch artifacts
+*.mp3
+*.wav
+.gradio/
