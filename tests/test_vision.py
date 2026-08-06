@@ -323,6 +323,98 @@ def test_parser_strips_code_fence_artifacts():
     assert parsed == ("hello", "a room")
 
 
+# --- Sentinel-delimited format (P1.8 / issue #29) ---------------------------
+#
+# The legacy OCR_TEXT:/SCENE: markers are anchored to line starts, so a
+# LEGITIMATE photographed document whose own text contains a line starting
+# "SCENE:" or "OCR_TEXT:" (a screenplay, a shooting schedule, a meeting
+# agenda) collided with the parser's own section markers and had to degrade
+# rather than guess (P1.2). Sentinel tokens that cannot plausibly occur in
+# photographed text remove that collision: the sentinels are tried first,
+# the legacy markers are a fallback (models drift back to the old format),
+# and repeated/missing sentinels still degrade rather than guess.
+
+SENTINEL_OCR = "<<<CLARIF_OCR>>>"
+SENTINEL_SCENE = "<<<CLARIF_SCENE>>>"
+
+
+def sentinel_reply(ocr="a coffee cup label", scene="a kitchen counter"):
+    return f"{SENTINEL_OCR}\n{ocr}\n{SENTINEL_SCENE}\n{scene}"
+
+
+def test_sentinel_format_happy_path_parses_ocr_and_scene():
+    parsed = _parse_reply(sentinel_reply("Open 9-5", "a shop front"))
+
+    assert parsed == ("Open 9-5", "a shop front")
+
+
+def test_sentinel_format_ocr_body_containing_legacy_marker_lines_is_returned_verbatim():
+    """The issue's acceptance test: a screenplay/agenda photo, sentinel format.
+
+    The OCR section's own text contains lines that start with SCENE: and
+    OCR_TEXT: - exactly the shape that collided with the legacy line-anchor
+    parser. Inside a sentinel-delimited section this text is just body
+    content and must come back whole, not truncated and not degraded.
+    """
+    reply = (
+        f"{SENTINEL_OCR}\n"
+        "INT. COFFEE SHOP - DAY\n"
+        "\n"
+        "OCR_TEXT: the barista call sheet on the counter\n"
+        "SCENE: 4 - JOE enters, orders a coffee\n"
+        "SCENE: 5 - JOE sits at the table\n"
+        f"{SENTINEL_SCENE}\n"
+        "a printed screenplay page taped to a coffee shop wall"
+    )
+
+    parsed = _parse_reply(reply)
+
+    assert parsed is not None
+    ocr_output, scene_context = parsed
+    assert "OCR_TEXT: the barista call sheet on the counter" in ocr_output
+    assert "SCENE: 4 - JOE enters, orders a coffee" in ocr_output
+    assert "SCENE: 5 - JOE sits at the table" in ocr_output
+    assert scene_context == "a printed screenplay page taped to a coffee shop wall"
+
+    client = FakeVisionClient(content=reply)
+    result = run_vision("base64data", client)
+    assert "SCENE: 4 - JOE enters, orders a coffee" in result["ocr_output"]
+    assert result["scene_context"] == "a printed screenplay page taped to a coffee shop wall"
+
+
+def test_sentinel_format_repeated_sentinel_degrades():
+    reply = (
+        f"{SENTINEL_OCR}\nmenu\n{SENTINEL_OCR}\nmenu2\n{SENTINEL_SCENE}\na room"
+    )
+
+    assert _parse_reply(reply) is None
+
+
+def test_sentinel_format_empty_ocr_section_is_valid():
+    reply = f"{SENTINEL_OCR}\n{SENTINEL_SCENE}\na room"
+
+    assert _parse_reply(reply) == ("", "a room")
+
+
+def test_sentinel_format_empty_scene_section_degrades():
+    reply = f"{SENTINEL_OCR}\nsome text\n{SENTINEL_SCENE}\n"
+
+    assert _parse_reply(reply) is None
+
+
+def test_missing_one_sentinel_falls_back_to_legacy_when_unambiguous():
+    """A partial/garbled sentinel reply with unambiguous legacy markers still parses."""
+    reply = f"{SENTINEL_OCR}\nOCR_TEXT: hello\nSCENE: a desk"
+
+    assert _parse_reply(reply) == ("hello", "a desk")
+
+
+def test_neither_sentinel_nor_legacy_markers_degrades():
+    reply = "not the format I asked for at all, no markers here"
+
+    assert _parse_reply(reply) is None
+
+
 # --- Client lifecycle (FIX 4) --------------------------------------------------
 
 

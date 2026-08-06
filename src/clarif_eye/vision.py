@@ -19,10 +19,22 @@ from clarif_eye.client import LadderExhaustedError, OpenRouterClient, OpenRouter
 from clarif_eye.router import classify_complexity
 from clarif_eye.speech import strip_code_fence
 
-# Chosen because it's trivial to generate reliably in a prompt and trivial
-# to parse with a plain string search - no JSON-in-prose or code-fence
-# fragility, and a model that garbles everything else usually still emits
-# recognizable line-start markers.
+# Sentinel tokens (P1.8 / issue #29): a photographed document's own text can
+# legitimately contain a line starting "OCR_TEXT:" or "SCENE:" (a
+# screenplay, a shooting schedule, a meeting agenda), which collides with
+# the legacy line-anchored markers below and forces a degrade even though
+# the reply was genuinely readable. This exact token cannot plausibly occur
+# in photographed text, so it is asked for and parsed first; the legacy
+# markers remain a fallback for when a model drifts back to the familiar
+# format (see _parse_legacy_reply and the recorded fixture).
+OCR_SENTINEL = "<<<CLARIF_OCR>>>"
+SCENE_SENTINEL = "<<<CLARIF_SCENE>>>"
+
+# Legacy markers (P1.2 / issue #5). Chosen because they're trivial to
+# generate reliably in a prompt and trivial to parse with a plain string
+# search - no JSON-in-prose or code-fence fragility, and a model that
+# garbles everything else usually still emits recognizable line-start
+# markers. Kept as a fallback parse path - see _parse_legacy_reply.
 OCR_MARKER = "OCR_TEXT:"
 SCENE_MARKER = "SCENE:"
 
@@ -30,9 +42,13 @@ VISION_PROMPT = (
     "You are the vision stage of an assistant that describes photos aloud "
     "for a visually impaired user. Look at the attached image and reply "
     "with EXACTLY two sections, in this exact format and nothing else:\n\n"
-    f"{OCR_MARKER} <any text visible in the image, or \"none\" if there is no text>\n"
-    f"{SCENE_MARKER} <a concise description of the scene and layout>\n\n"
-    "Do not add any other text before, between, or after these two lines."
+    f"{OCR_SENTINEL}\n"
+    "<any text visible in the image, or \"none\" if there is no text>\n"
+    f"{SCENE_SENTINEL}\n"
+    "<a concise description of the scene and layout>\n\n"
+    "Do not add any other text before, between, or after these two lines. "
+    f"{OCR_SENTINEL} and {SCENE_SENTINEL} must each appear alone on their "
+    "own line, exactly once."
 )
 
 # The client only ever receives base64 image bytes (state["image_data"]),
@@ -61,8 +77,53 @@ def _build_messages(image_data):
     ]
 
 
-def _parse_reply(reply):
-    """Parse the model's reply into (ocr_output, scene_context), or None.
+def _parse_sentinel_reply(reply):
+    """Parse a sentinel-delimited reply into (ocr_output, scene_context), or None.
+
+    A line counts as a sentinel ONLY if it is EXACTLY the sentinel token
+    (after stripping whitespace) - the sentinel cannot plausibly occur
+    inside photographed text, so unlike the legacy markers there is no
+    "mid-line occurrence" case to fold into body text. Content between/after
+    the two sentinel lines is taken verbatim, including lines that happen to
+    start with the legacy OCR_TEXT:/SCENE: markers - those are just body
+    text here, not section headers. If either sentinel is missing or
+    repeated, the reply is ambiguous and this returns None so the caller can
+    fall back to the legacy parser rather than guessing.
+    """
+    lines = reply.split("\n")
+
+    ocr_starts = [i for i, line in enumerate(lines) if line.strip() == OCR_SENTINEL]
+    scene_starts = [i for i, line in enumerate(lines) if line.strip() == SCENE_SENTINEL]
+
+    if len(ocr_starts) != 1 or len(scene_starts) != 1:
+        return None
+
+    ocr_index = ocr_starts[0]
+    scene_index = scene_starts[0]
+
+    def section_text(start_index, end_index):
+        body_lines = lines[start_index + 1 : end_index]
+        return strip_code_fence("\n".join(body_lines).strip())
+
+    if ocr_index < scene_index:
+        ocr_text = section_text(ocr_index, scene_index)
+        scene_text = section_text(scene_index, len(lines))
+    else:
+        scene_text = section_text(scene_index, ocr_index)
+        ocr_text = section_text(ocr_index, len(lines))
+
+    if not scene_text:
+        return None
+
+    return ocr_text, scene_text
+
+
+def _parse_legacy_reply(reply):
+    """Parse the OLD OCR_TEXT:/SCENE: reply format into (ocr, scene), or None.
+
+    Fallback path (P1.8 / issue #29): tried only when sentinel parsing
+    fails, since a model that drifts back to this familiar format (or a
+    recorded fixture predating the sentinel prompt) should still parse.
 
     None means the reply didn't follow the requested format and must be
     treated as a degraded response, not crash the node. An OCR section that
@@ -113,6 +174,21 @@ def _parse_reply(reply):
         return None
 
     return ocr_text, scene_text
+
+
+def _parse_reply(reply):
+    """Parse the model's reply into (ocr_output, scene_context), or None.
+
+    Order (P1.8 / issue #29): sentinels first (collision-proof against a
+    photographed document's own text), then the legacy OCR_TEXT:/SCENE:
+    markers as a fallback, then degrade. None means neither format matched
+    unambiguously and the caller must treat this as a degraded response,
+    not crash the node.
+    """
+    parsed = _parse_sentinel_reply(reply)
+    if parsed is not None:
+        return parsed
+    return _parse_legacy_reply(reply)
 
 
 # This node's own degradation messages, as named constants rather than
