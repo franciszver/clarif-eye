@@ -22,13 +22,21 @@ from clarif_eye.registry import RegistryError, load_registry
 
 API_BASE_URL = "https://openrouter.ai/api/v1"
 
-# Per-role latency budgets (seconds), from the product spec. This is a TOTAL
-# deadline for the whole complete() call (a UX contract for a blind user
-# waiting on spoken feedback), not a per-attempt timeout - each rung gets
-# whatever time is left in the budget, never more.
+# Per-role latency budgets (seconds). This is a TOTAL deadline for the whole
+# complete() call (a UX contract for a blind user waiting on spoken
+# feedback), not a per-attempt timeout - each rung gets whatever time is
+# left in the budget, never more.
+#
+# Owner decision D16: these are CEILINGS derived from live measurement
+# (issue P1.7 / #28), not targets - a call finishing well under the
+# ceiling is the expected case, not a bug.
+#   eyes  = 30.0  rung 1 typically ~5s; rung 2 (fallback) can reach ~15s and
+#                 needs headroom on top of that.
+#   brain = 45.0  still UNMEASURED; see issue #9, which owns re-measuring
+#                 and re-budgeting the brain ladder.
 ROLE_TIMEOUTS = {
-    "eyes": 8.0,
-    "brain": 25.0,
+    "eyes": 30.0,
+    "brain": 45.0,
 }
 DEFAULT_TIMEOUT = 25.0
 

@@ -3,17 +3,26 @@
 # Each role's ladder is tried in order: the first model is attempted first,
 # and later entries are fallbacks used only if an earlier one fails.
 #
-# The order below is a starting hypothesis, not a measured ranking. Issue
-# P1.6 will re-order these ladders based on observed latency.
-#
 # Policy (owner decision D10): every model ID must end in ":free". This is
 # enforced at load time in src/clarif_eye/registry.py.
+#
+# The `eyes` ladder below is MEASURED, not hypothesis (issue P1.7 / #28),
+# against a 1000x700 utility bill test image (known account number, amount
+# due, and header). Live latency, both accurate:
+#   nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free  5.4s, 4.6s -> rung 1
+#   google/gemma-4-26b-a4b-it:free                      15.2s, 7.0s -> rung 2
+# Removed from the old hypothesis ladder based on the same measurement run:
+#   google/gemma-4-31b-it:free        429 twice - rate-limited upstream, not
+#                                      transient
+#   nvidia/nemotron-nano-12b-v2-vl:free  121s then 504 - worse than useless
+#
+# The `brain` ladder below is still a starting hypothesis, not a measured
+# ranking - issue #9 owns re-ordering/pruning it.
 
 [eyes]
 ladder = [
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
     "google/gemma-4-26b-a4b-it:free",
-    "nvidia/nemotron-nano-12b-v2-vl:free",
-    "google/gemma-4-31b-it:free",
 ]
 
 [brain]
