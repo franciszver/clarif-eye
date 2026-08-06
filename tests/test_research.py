@@ -13,6 +13,8 @@ unexpected exception) degrading to scraper_data == "" rather than raising,
 KeyboardInterrupt propagating, the happy path, and client/searcher lifecycle.
 """
 
+import socket
+
 import httpx
 import pytest
 
@@ -45,6 +47,31 @@ def make_client(handler):
 
 def html_response(status_code=200, body="<html><body><p>Hello world</p></body></html>", content_type="text/html"):
     return httpx.Response(status_code, headers={"content-type": content_type}, text=body)
+
+
+def fake_getaddrinfo(hostname_to_ips):
+    """Build a socket.getaddrinfo replacement backed by a fixed hostname->IPs map.
+
+    No real DNS is ever performed by the SSRF tests below - every hostname
+    they use is normalised (rstrip('.').lower()) and looked up here.
+    """
+
+    def _fake(host, *args, **kwargs):
+        ips = hostname_to_ips.get(host)
+        if ips is None:
+            raise socket.gaierror(f"no fake DNS entry for {host!r}")
+        results = []
+        for ip in ips:
+            family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+            sockaddr = (ip, 0, 0, 0) if family == socket.AF_INET6 else (ip, 0)
+            results.append((family, socket.SOCK_STREAM, 6, "", sockaddr))
+        return results
+
+    return _fake
+
+
+def redirect_response(location, status_code=302):
+    return httpx.Response(status_code, headers={"location": location})
 
 
 # --- Query derivation -----------------------------------------------------
@@ -426,3 +453,167 @@ def test_scraper_data_is_a_plain_empty_string_whether_not_applicable_or_no_resul
     assert ran_and_found_nothing == ""
     assert not_applicable == ran_and_found_nothing
     assert isinstance(ran_and_found_nothing, str)
+
+
+# --- SSRF hardening ------------------------------------------------------
+#
+# The fetched URL comes from a DuckDuckGo result for a query derived from
+# ocr_output - attacker-controlled by photographing arbitrary text. No real
+# DNS or network access happens in any of these: socket.getaddrinfo is
+# monkeypatched to a fixed fake map, and the HTTP client is always an
+# httpx.MockTransport.
+#
+# IMPORTANT: the handler records calls into a list rather than raising
+# AssertionError on an unexpected request. run_research wraps the fetch in
+# `except Exception`, so a raised AssertionError would be silently
+# swallowed and degrade to the exact same {"scraper_data": ""} as a correct
+# rejection - masking the vulnerability instead of proving it's fixed (this
+# was caught during CHECK F: the first version of these tests still
+# "passed" against the vulnerable code). Asserting on the recorded call
+# list is what actually distinguishes "rejected before fetch" from "fetch
+# attempted and its result happened to be discarded".
+
+
+def no_fetch_client():
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        return html_response()
+
+    client = make_client(handler)
+    client.ssrf_test_calls = calls
+    return client
+
+
+@pytest.mark.parametrize(
+    "url,hostname,ips",
+    [
+        ("http://127.0.0.1/", "127.0.0.1", ["127.0.0.1"]),
+        ("http://localhost/", "localhost", ["127.0.0.1"]),
+        ("http://169.254.169.254/latest/meta-data/", "169.254.169.254", ["169.254.169.254"]),
+        ("http://10.0.0.5/", "10.0.0.5", ["10.0.0.5"]),
+        ("http://192.168.1.1/", "192.168.1.1", ["192.168.1.1"]),
+        ("http://172.16.0.1/", "172.16.0.1", ["172.16.0.1"]),
+        ("http://[::1]/", "::1", ["::1"]),
+        ("http://[fd00::1]/", "fd00::1", ["fd00::1"]),
+    ],
+)
+def test_ssrf_blocks_addresses_in_blocked_ranges(monkeypatch, url, hostname, ips):
+    monkeypatch.setattr(research.socket, "getaddrinfo", fake_getaddrinfo({hostname: ips}))
+    searcher = FakeSearcher(results=[{"href": url}])
+    client = no_fetch_client()
+
+    result = run_research("some product", "a scene", searcher=searcher, client=client)
+
+    assert result == {"scraper_data": ""}
+    assert client.ssrf_test_calls == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "file:///etc/passwd",
+        "ftp://example.com/",
+        "data:text/html,x",
+    ],
+)
+def test_ssrf_blocks_non_http_schemes(url):
+    # These never even reach _fetch_and_extract: _search_top_result already
+    # filters hrefs to http(s)-only, so the search "finds nothing usable".
+    # Directly exercise the scheme check too, since that's the actual new
+    # security control (defence in depth, not reliance on the search filter).
+    assert research._is_safe_url(url) is False
+
+    searcher = FakeSearcher(results=[{"href": url}])
+    client = no_fetch_client()
+
+    result = run_research("some product", "a scene", searcher=searcher, client=client)
+
+    assert result == {"scraper_data": ""}
+    assert client.ssrf_test_calls == []
+
+
+def test_ssrf_blocks_uppercase_localhost_with_trailing_dot(monkeypatch):
+    monkeypatch.setattr(research.socket, "getaddrinfo", fake_getaddrinfo({"localhost": ["127.0.0.1"]}))
+    searcher = FakeSearcher(results=[{"href": "http://LOCALHOST./"}])
+    client = no_fetch_client()
+
+    result = run_research("some product", "a scene", searcher=searcher, client=client)
+
+    assert result == {"scraper_data": ""}
+    assert client.ssrf_test_calls == []
+
+
+def test_ssrf_blocks_ip_literal_with_trailing_dot_and_port(monkeypatch):
+    monkeypatch.setattr(research.socket, "getaddrinfo", fake_getaddrinfo({"127.0.0.1": ["127.0.0.1"]}))
+    searcher = FakeSearcher(results=[{"href": "http://127.0.0.1.:80/"}])
+    client = no_fetch_client()
+
+    result = run_research("some product", "a scene", searcher=searcher, client=client)
+
+    assert result == {"scraper_data": ""}
+    assert client.ssrf_test_calls == []
+
+
+def test_ssrf_blocks_public_url_redirecting_to_metadata_endpoint(monkeypatch):
+    monkeypatch.setattr(
+        research.socket,
+        "getaddrinfo",
+        fake_getaddrinfo({"example.com": ["93.184.216.34"], "169.254.169.254": ["169.254.169.254"]}),
+    )
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        if request.url.host == "example.com":
+            return redirect_response("http://169.254.169.254/latest/meta-data/")
+        return html_response()
+
+    searcher = FakeSearcher(results=[{"href": "http://example.com/redirect-me"}])
+    client = make_client(handler)
+
+    result = run_research("some product", "a scene", searcher=searcher, client=client)
+
+    assert result == {"scraper_data": ""}
+    # The redirect target must never actually be requested - blocked at the
+    # hop, before the second fetch.
+    assert calls == ["http://example.com/redirect-me"]
+
+
+def test_ssrf_blocks_redirect_chain_longer_than_hop_cap(monkeypatch):
+    monkeypatch.setattr(research.socket, "getaddrinfo", fake_getaddrinfo({"example.com": ["93.184.216.34"]}))
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        # Always redirect to a new path on the same (safe) host - a chain
+        # longer than research._MAX_REDIRECT_HOPS.
+        n = len(calls)
+        return redirect_response(f"http://example.com/hop-{n + 1}")
+
+    searcher = FakeSearcher(results=[{"href": "http://example.com/hop-1"}])
+    client = make_client(handler)
+
+    result = run_research("some product", "a scene", searcher=searcher, client=client)
+
+    assert result == {"scraper_data": ""}
+    # initial fetch + _MAX_REDIRECT_HOPS redirects = the bounded number of
+    # attempts; the chain never runs away unbounded.
+    assert len(calls) == research._MAX_REDIRECT_HOPS + 1
+
+
+def test_benign_single_redirect_still_succeeds(monkeypatch):
+    monkeypatch.setattr(research.socket, "getaddrinfo", fake_getaddrinfo({"example.com": ["93.184.216.34"]}))
+
+    def handler(request):
+        if str(request.url) == "http://example.com/old-page":
+            return redirect_response("http://example.com/new-page")
+        return html_response(body="<html><body><p>The real content lives here.</p></body></html>")
+
+    searcher = FakeSearcher(results=[{"href": "http://example.com/old-page"}])
+    client = make_client(handler)
+
+    result = run_research("some product", "a scene", searcher=searcher, client=client)
+
+    assert "The real content lives here." in result["scraper_data"]
