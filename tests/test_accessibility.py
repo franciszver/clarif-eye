@@ -113,7 +113,24 @@ def test_status_idle_and_working_are_distinct_nonempty_strings():
 # --- handle_submit_staged: two-stage yield (received+working, then result) -
 
 
-def test_staged_submit_yields_working_then_success_with_audio():
+def test_staged_submit_yields_working_then_status_and_text_then_audio(monkeypatch):
+    # RED-FIRST against the previous (broken) approach: that version yielded
+    # only twice (working, then a final tuple with audio+text together) and
+    # relied on client-side JS to delay when the browser actually started
+    # sound. That JS could never work: with autoplay=False, Gradio never
+    # assigns the <audio> element a src at all, so the "loadeddata" event
+    # the JS waited on could never fire and audio never played - confirmed
+    # in a real browser (orchestrator), not by this suite, which passed the
+    # entire time. The gap is now created by yield timing instead: the
+    # status + description text land in a SEPARATE, earlier yield with no
+    # audio, then the audio path follows after AUDIO_PLAY_DELAY_MS, so
+    # Gradio only mounts the (now autoplaying) player once the completion
+    # announcement has had time to be spoken.
+    from clarif_eye.ui import AUDIO_PLAY_DELAY_MS
+
+    sleeps = []
+    monkeypatch.setattr("clarif_eye.ui.time.sleep", lambda seconds: sleeps.append(seconds))
+
     tts_module._last_result_set(
         tts_module.TtsResult("/tmp/out.mp3", (tts_module.ProviderAttempt("Edge", "success", ""),), "Edge")
     )
@@ -122,15 +139,24 @@ def test_staged_submit_yields_working_then_success_with_audio():
 
     updates = list(handle_submit_staged(FakeImage(), resources))
 
-    assert len(updates) == 2
+    assert len(updates) == 3
     first_status, first_audio, first_text = updates[0]
     assert first_status == STATUS_WORKING
     assert first_audio is None
 
-    final_status, final_audio, final_text = updates[1]
+    status_text_status, status_text_audio, status_text_text = updates[1]
+    assert status_text_status == STATUS_SUCCESS_AUDIO
+    assert status_text_audio is None
+    assert status_text_text == "A cat sits on a mat."
+
+    final_status, final_audio, final_text = updates[2]
     assert final_status == STATUS_SUCCESS_AUDIO
     assert final_audio == "/tmp/out.mp3"
     assert final_text == "A cat sits on a mat."
+
+    # The gap uses the shared constant, not a second, independently-chosen
+    # number.
+    assert sleeps == [AUDIO_PLAY_DELAY_MS / 1000]
 
 
 def test_staged_submit_announces_audio_unavailable_when_chain_exhausted():
@@ -384,13 +410,35 @@ def test_audit_js_payload_checks_for_positive_tabindex_and_missing_names():
 # Real screen-reader use (owner, Narrator on Windows - see
 # docs/ACCESSIBILITY.md's "Human screen-reader verified" section) found the
 # synthesized audio starting at the same moment the completion status was
-# still being spoken, so neither was intelligible. Two changes close this:
-# (1) the with-audio announcement is made SHORT, since the audio itself is
-# the completion signal and a long announcement is redundant *and* actively
-# collides with it; (2) playback is deliberately sequenced to start after a
-# delay instead of relying on brevity alone. Both are checked here
-# STRUCTURALLY, same discipline as the rest of this file - no string-
-# matching the description text, no browser/screen-reader claims.
+# still being spoken, so neither was intelligible. The with-audio
+# announcement is made SHORT (checked below), since the audio itself is the
+# completion signal and a long announcement is redundant *and* actively
+# collides with it.
+#
+# HONESTY / WHY THIS SECTION CHANGED SHAPE: the first attempt at closing the
+# gap turned autoplay OFF on the gr.Audio component and used client-side JS
+# (a MutationObserver plus a "loadeddata" listener) to start playback
+# deliberately, after a delay. That version's own tests here all passed -
+# and audio was completely broken in the browser the entire time. A
+# real-browser check (orchestrator, on this branch) found: status "ready",
+# a correct download link to a real .mp3 in #audio-output, but the <audio>
+# element's src was NEVER assigned, readyState stayed 0, and no
+# loadeddata/play/error event ever fired. The reason: Gradio only assigns
+# the <audio> element a source AT ALL when its own `autoplay` prop is on;
+# with it off, there is no src for any load event to ever fire for, so the
+# JS this file used to test could never run in practice. Only a real
+# browser could have caught this - pytest never renders a DOM or loads
+# media, so the old tests below (all removed) were checking real mechanics
+# of code that could never execute.
+#
+# THE FIX: autoplay=True is restored (that's what makes Gradio assign a
+# source and play it at all), and the gap is now created in Python instead
+# of JS - handle_submit_staged (see tests/test_accessibility.py's staged-
+# submit tests) yields the status and text first, then the audio path after
+# AUDIO_PLAY_DELAY_MS. What's checked here is therefore the presence of
+# autoplay=True and the elem_id the (now much smaller) JS shim still needs
+# for the surviving #52 user-gesture-delay wrapper - not a deferred-play
+# mechanism, which no longer exists.
 #
 # RED-FIRST: written to fail against the pre-fix code, where
 # STATUS_SUCCESS_AUDIO was the long "Description ready. Audio is playing;
@@ -417,16 +465,20 @@ def test_with_audio_status_no_longer_asserts_audio_is_playing_as_fact():
     assert "playing" not in STATUS_SUCCESS_AUDIO.lower()
 
 
-def test_audio_component_does_not_autoplay():
-    # Sequencing option (a): autoplay is turned OFF on the component itself
-    # so audio never starts the instant a src is set - a JS shim (checked
-    # below) starts it deliberately, after a delay, instead.
+def test_audio_component_autoplays():
+    # WRITTEN TO FAIL against the previous (broken) approach, which set
+    # autoplay=False. That's the actual root cause of #47/#52's regression
+    # (see the section comment above): without autoplay, Gradio never
+    # assigns the <audio> element a source at all, so no playback mechanism
+    # - JS or otherwise - can ever run. autoplay=True is what makes Gradio
+    # assign a source and play it; the announcement gap now comes from
+    # yield timing in handle_submit_staged instead.
     resources = _resources(FakeGraph())
     demo = build_interface(resources)
     try:
         audio_components = [c for c in _components(demo) if isinstance(c, gr.Audio)]
         assert len(audio_components) == 1
-        assert audio_components[0].autoplay is False
+        assert audio_components[0].autoplay is True
     finally:
         demo.close()
 
@@ -457,29 +509,22 @@ def test_image_input_declares_the_elem_id_the_image_labelling_shim_targets():
         demo.close()
 
 
-def test_sequencing_shim_defers_audio_playback_after_a_delay():
-    # STATIC/SOURCE-LEVEL CHECK ONLY (same discipline as the rest of this
-    # file): asserts the deferred-play mechanism is present in the injected
-    # markup, not that two voices actually stop colliding in a real
-    # screen reader - only a human screen-reader pass by the owner can
-    # confirm that (see docs/ACCESSIBILITY.md's Known defects entry for
-    # #47, which is updated to say "awaiting confirmation", never
-    # "confirmed fixed").
-    from clarif_eye.ui import AUDIO_ELEM_ID, AUDIO_PLAY_DELAY_MS
-
-    assert AUDIO_ELEM_ID in ARIA_LIVE_HEAD
-    assert "setTimeout" in ARIA_LIVE_HEAD
-    assert str(AUDIO_PLAY_DELAY_MS) in ARIA_LIVE_HEAD
-    assert ".play()" in ARIA_LIVE_HEAD
-    # Structural check (audio.src truthiness), never a text/string match
-    # against the status wording - same discipline status_for_result uses.
-    assert "audioEl.src" in ARIA_LIVE_HEAD
-    # Must not leave the user stuck in silence if the browser blocks
-    # programmatic playback: the rejected play() promise is swallowed, not
-    # left to throw, and the <audio> control itself stays present/visible
-    # (autoplay=False never hides it) so it remains reachable to play
-    # manually.
-    assert ".catch(" in ARIA_LIVE_HEAD
+def test_sequencing_gap_is_created_by_yield_timing_not_a_src_watching_shim():
+    # WRITTEN TO FAIL against the previous (broken) approach: that version
+    # asserted a JS mechanism (a "deferred-play" shim keyed off audioEl.src
+    # truthiness) that could never run, because autoplay=False meant
+    # audioEl.src was never assigned in the first place - see the section
+    # comment above for the real-browser evidence. The gap is now created
+    # by handle_submit_staged withholding the audio path for a later yield
+    # (see test_staged_submit_yields_working_then_status_and_text_then_audio
+    # in this file), so the mechanism to assert on lives in Python, not in
+    # ARIA_LIVE_HEAD. This test asserts that JS-side src-watching machinery
+    # for audio sequencing is actually gone, not merely renamed.
+    assert "audioEl.src" not in ARIA_LIVE_HEAD
+    assert "deferredPlaySrc" not in ARIA_LIVE_HEAD
+    assert "loadeddata" not in ARIA_LIVE_HEAD
+    assert "a11yAutoplayPending" not in ARIA_LIVE_HEAD
+    assert "a11yMediaListenerAttached" not in ARIA_LIVE_HEAD
 
 
 # --- P5.4 / issue #48: images announce as bare "graphic" -------------------
@@ -624,102 +669,49 @@ def test_pausing_is_not_delayed():
     assert "audioEl.pause = function" not in ARIA_LIVE_HEAD
 
 
-def test_autoplay_defer_still_present_and_unchanged():
+def test_autoplay_gap_constant_unchanged_but_no_longer_drives_js():
     from clarif_eye.ui import AUDIO_PLAY_DELAY_MS
 
-    # #47's mechanism (deferred AUTOMATIC playback) must still be intact:
-    # same constant, same value, still driving a setTimeout before the
-    # first automatic play attempt.
+    # The 1800ms figure survives (same wording target for the gap before
+    # audio starts), but it is no longer wired into a client-side
+    # setTimeout at all - it now sizes a time.sleep() in
+    # handle_submit_staged instead. See
+    # test_staged_submit_yields_working_then_status_and_text_then_audio.
     assert AUDIO_PLAY_DELAY_MS == 1800
-    assert str(AUDIO_PLAY_DELAY_MS) in ARIA_LIVE_HEAD
-    assert "deferredPlaySrc" in ARIA_LIVE_HEAD
+    assert str(AUDIO_PLAY_DELAY_MS) not in ARIA_LIVE_HEAD
 
 
-def test_user_gesture_delay_does_not_stack_on_top_of_pending_autoplay_defer():
-    # A user gesture arriving while the ~1800ms autoplay defer is still
-    # pending must not add a further USER_PLAY_DELAY_MS on top (that would
-    # produce ~2.8s of dead air instead of the intended ~1s). The shim must
-    # track whether the autoplay defer for this src is still pending and
-    # branch on it inside the wrapped .play().
-    assert "a11yAutoplayPending" in ARIA_LIVE_HEAD
-
-
-# --- Regression: audio never played at all (found in a real browser) ------
+# --- Regression, and the correction: audio never played at all ------------
 #
-# HONESTY: whether audio actually plays can only be confirmed in a real
-# browser - pytest never renders a DOM or loads real media, so nothing in
-# this file (before or after this fix) can prove playback happens. This
-# exact regression is the proof of that limit: the deferred-playback block
-# gated scheduling on `audioEl.src` being truthy at the moment apply() ran,
-# and the full 484-test suite above passed while audio was COMPLETELY
-# broken on main - a human (the owner), driving the real browser, found it
-# via Chrome DevTools, not this suite. `audioEl.src` is a JS PROPERTY
-# Gradio's Svelte player assigns; a property assignment produces no DOM
-# mutation, so the childList/subtree MutationObserver above never re-ran
-# apply() at the moment a source actually became available, and the old
-# gate (`audioEl.src && audioEl.dataset.deferredPlaySrc !== audioEl.src`)
-# was, in practice, never satisfied. These tests assert the STRUCTURE of
-# the fix (a real media-load event schedules playback, not a src check
-# alone) - they cannot and do not claim to prove sound comes out of a
-# speaker.
+# HONESTY, the whole point of this section: the FIRST attempt at issue #47
+# (client-side JS: autoplay=False + a MutationObserver + a "loadeddata"
+# listener that started playback once a media-load event fired) had its own
+# full suite of tests in this file, EVERY ONE OF WHICH PASSED, while audio
+# was COMPLETELY broken in the browser - not delayed, not mistimed, NEVER
+# PLAYED AT ALL. pytest never renders a DOM or loads real media, so nothing
+# any of those tests checked (MutationObserver present, addEventListener
+# for "loadeddata" present, preload forced to "auto", dedupe guards in the
+# right order, ...) could have caught the actual failure: with
+# autoplay=False, Gradio never assigns the <audio> element a src at all, so
+# "loadeddata" - the very event every one of those tests assumed would
+# eventually fire - never fires, ever. Only a real-browser check (the
+# orchestrator, driving the actual app on this branch) caught it: status
+# "Description ready.", a correct download link to a real .mp3 in
+# #audio-output, but the <audio> element's src absent, readyState 0, and
+# zero loadeddata/play/error events.
 #
-# RED-FIRST: written to FAIL against the pre-fix shim, which has no
-# addEventListener for any media-load event at all.
-
-
-def test_shim_schedules_playback_from_a_media_load_event_not_src_alone():
-    # The fix must not depend on apply() happening to observe audioEl.src
-    # becoming truthy (see this section's comment above for why that never
-    # reliably fires). Instead it must attach a real media event listener -
-    # loadeddata, canplay, or durationchange - to the audio element, and
-    # schedule playback from inside that listener's callback.
-    assert "addEventListener(" in ARIA_LIVE_HEAD
-    assert any(
-        f'"{event}"' in ARIA_LIVE_HEAD or f"'{event}'" in ARIA_LIVE_HEAD
-        for event in ("loadeddata", "canplay", "durationchange")
-    ), "no recognized media-load event is wired up to schedule playback"
-
-
-def test_shim_guards_against_duplicate_media_listeners_on_the_same_element():
-    # Gradio reuses the same <audio> DOM node across submissions (it never
-    # gets torn down and recreated), and apply() re-runs on every unrelated
-    # DOM mutation elsewhere on the page. Without a guard, a second (or
-    # hundredth) apply() call would attach another media-load listener to
-    # the same element, and a single loadeddata/canplay event would then
-    # schedule N overlapping/duplicate play attempts. Same guard discipline
-    # as every other check in apply() (aria-live, deferredPlaySrc,
-    # a11yPlayDelayWrapped, a11yImgDone).
-    assert "a11yMediaListenerAttached" in ARIA_LIVE_HEAD
-    # The guard must actually gate the addEventListener call, not just
-    # exist as an unused string somewhere in the shim.
-    guard_index = ARIA_LIVE_HEAD.index("a11yMediaListenerAttached")
-    listener_index = ARIA_LIVE_HEAD.index("addEventListener(")
-    assert guard_index < listener_index
-
-
-def test_shim_still_reschedules_on_a_second_submission():
-    # A second submission must play too, not just the first - the fix must
-    # not collapse into a one-shot listener that fires once ever and then
-    # goes silent for every subsequent result. The per-src dedupe
-    # (deferredPlaySrc) must live INSIDE the media-event callback (so it
-    # re-evaluates on every load event) rather than gating whether the
-    # listener itself gets attached.
-    assert "deferredPlaySrc" in ARIA_LIVE_HEAD
-    listener_index = ARIA_LIVE_HEAD.index("addEventListener(")
-    dedupe_index = ARIA_LIVE_HEAD.index("deferredPlaySrc")
-    assert dedupe_index > listener_index, (
-        "deferredPlaySrc dedupe must be evaluated inside the media-event "
-        "callback, not used to gate attaching the listener itself"
-    )
-
-
-def test_shim_sets_preload_so_media_events_actually_fire():
-    # An <audio> element with the browser's default (or Gradio's own)
-    # preload behaviour may never fetch enough data to fire loadeddata/
-    # canplay until playback is attempted - which would make the whole
-    # fix a no-op. The shim must force eager loading.
-    assert "preload" in ARIA_LIVE_HEAD
-    assert '"auto"' in ARIA_LIVE_HEAD or "'auto'" in ARIA_LIVE_HEAD
+# THE CORRECTION: none of that JS exists anymore (see
+# test_sequencing_gap_is_created_by_yield_timing_not_a_src_watching_shim
+# above, which asserts it is actually gone). autoplay=True is restored -
+# the only thing that makes Gradio assign a source and play it - and the
+# announcement gap is created by ordinary, directly-testable Python
+# (handle_submit_staged's yield order + time.sleep) instead of JS this
+# suite cannot meaningfully exercise. This does not make the new approach
+# "browser-proven" either - see docs/ACCESSIBILITY.md's Known defects
+# entry for #47, still awaiting a human screen-reader/browser
+# confirmation - but at minimum autoplay=True is a structural fact Gradio
+# either honors or doesn't, not a client-side mechanism whose one load-
+# bearing event this suite could never actually trigger.
 
 
 def test_user_gesture_delay_and_pause_behaviour_unchanged_by_the_fix():
