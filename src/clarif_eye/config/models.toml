@@ -30,3 +30,36 @@ ladder = [
     "nvidia/nemotron-3-ultra-550b-a55b:free",
     "nvidia/nemotron-3-super-120b-a12b:free",
 ]
+
+# Router complexity heuristic (issue #6 / P1.3). See src/clarif_eye/router.py
+# module docstring for the full justification. Short version: word count
+# alone is a poor proxy (the only real recorded sample, a 47-word utility
+# bill, is dense with numbers and was recorded complexity_flag=true - the
+# architecture doc's ">50 words" rule would misroute it to the fast path).
+# The heuristic instead scores three data-density signals (digit count,
+# currency-amount count, document keyword hits) plus a much higher word
+# count as a fallback for genuinely long documents. All numbers here are
+# judgment calibrated against that one sample, not a tuned corpus.
+[router]
+# Fallback: a document this long is worth the research path even with no
+# other signal (e.g. dense prose that doesn't match our keyword list).
+# Deliberately much higher than the doc's naive 50-word rule, so an
+# ordinary long sign/sentence does not trip it.
+word_count_threshold = 150
+# How many of the 3 signals below (digit density, currency, keywords) must
+# fire before routing to research.
+signal_score_threshold = 2
+# Digit density: total digit characters in ocr_output.
+digit_count_threshold = 6
+# Currency signal: count of currency-symbol-followed-by-digit matches.
+currency_count_threshold = 1
+# Keyword signal: count of keyword substring hits in ocr_output + scene_context.
+keyword_hit_threshold = 1
+currency_symbols = ["$", "€", "£", "¥"]
+keywords = [
+    "account number", "invoice", "reference number", "order number",
+    "confirmation number", "policy number", "tracking number",
+    "member id", "case number", "ticket number", "statement",
+    "bill", "receipt", "balance", "due", "payment", "amount due",
+    "total", "subtotal", "tax",
+]

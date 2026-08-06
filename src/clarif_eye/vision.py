@@ -9,13 +9,14 @@ an empty reply) degrades into a plain-English placeholder message plus a
 complexity_flag, so the graph can still route and reach tts/END. Issue #18
 owns turning these placeholder messages into polished spoken text.
 
-complexity_flag placeholder: issue #6 (P1.3) owns the real complexity
-heuristic and will replace the RULE below, not the node's ownership of the
-key - vision_node must keep returning complexity_flag regardless of who
-computes it.
+complexity_flag: computed by clarif_eye.router.classify_complexity (issue
+#6 / P1.3) from ocr_output and scene_context. This module keeps ownership
+of returning the key on every branch (including the degraded ones); it
+just no longer computes the rule itself.
 """
 
 from clarif_eye.client import LadderExhaustedError, OpenRouterClient, OpenRouterError
+from clarif_eye.router import classify_complexity
 
 # Chosen because it's trivial to generate reliably in a prompt and trivial
 # to parse with a plain string search - no JSON-in-prose or code-fence
@@ -123,20 +124,14 @@ def _parse_reply(reply):
     return ocr_text, scene_text
 
 
-def _complexity_flag(ocr_output):
-    # Placeholder rule (issue #6 / P1.3 owns the real heuristic): shared so
-    # run_vision and the fixture recorder script can't silently diverge.
-    return len(ocr_output) > 200
-
-
 def _degraded(message):
     return {
         "ocr_output": "",
         "scene_context": message,
-        # Placeholder rule (issue #6 / P1.3 owns the real heuristic): a
-        # failed vision pass is never "complex" enough to justify the
+        # A failed vision pass is never "complex" enough to justify the
         # slower research path - the fast path gets a spoken message to the
-        # user sooner.
+        # user sooner. This is a degradation-path decision, not part of the
+        # complexity heuristic itself.
         "complexity_flag": False,
     }
 
@@ -201,5 +196,5 @@ def run_vision(image_data, client=None):
     return {
         "ocr_output": ocr_output,
         "scene_context": scene_context,
-        "complexity_flag": _complexity_flag(ocr_output),
+        "complexity_flag": classify_complexity(ocr_output, scene_context).complexity_flag,
     }
