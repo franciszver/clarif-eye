@@ -13,7 +13,7 @@ from clarif_eye.client import CompletionResult, LadderExhaustedError, OpenRouter
 from clarif_eye.graph import build_graph, vision_node
 from clarif_eye.state import make_initial_state
 from clarif_eye import vision
-from clarif_eye.vision import _parse_reply, run_vision
+from clarif_eye.vision import _parse_reply, is_degraded_scene, run_vision
 
 # 200 words, no data-density signals: trips only the router's long-document
 # word-count fallback (see clarif_eye.router), not the digit/currency/keyword
@@ -421,3 +421,42 @@ def test_full_compiled_graph_degrades_gracefully_and_still_reaches_tts():
     assert trace[-1] == "tts"
     assert result["audio_file_path"] != ""
     assert isinstance(result["complexity_flag"], bool)
+
+
+# --- FIX 7: degradation detection is structural (named constants + a
+# public predicate), not a textual guess at English prose --------------------
+
+
+def test_is_degraded_scene_true_for_each_named_degradation_constant():
+    for message in (
+        vision.DEGRADED_CONFIG_ERROR,
+        vision.DEGRADED_LADDER_EXHAUSTED,
+        vision.DEGRADED_UNEXPECTED_ERROR,
+        vision.DEGRADED_EMPTY_REPLY,
+        vision.DEGRADED_UNPARSEABLE_REPLY,
+    ):
+        assert is_degraded_scene(message) is True
+
+
+def test_is_degraded_scene_false_for_a_real_scene_description():
+    assert is_degraded_scene("a kitchen counter with a coffee cup on it") is False
+
+
+def test_rewording_a_degradation_constant_still_detects_via_the_constant(monkeypatch):
+    """Detection must key off the constant, not a hardcoded copy of its text.
+
+    Reword DEGRADED_UNPARSEABLE_REPLY (as issues #15/#18 might, for
+    accessibility) and confirm is_degraded_scene still recognises the new
+    wording - because it checks against the constant's current value, not
+    a fixed prefix/keyword baked into is_degraded_scene itself.
+    """
+    monkeypatch.setattr(
+        vision,
+        "DEGRADED_UNPARSEABLE_REPLY",
+        "I couldn't make sense of what the vision model sent back.",
+    )
+
+    assert is_degraded_scene("I couldn't make sense of what the vision model sent back.") is True
+    # The stale, un-reworded text no longer matches - proving detection
+    # really does key off the (now-updated) constant, not old wording.
+    assert is_degraded_scene("The vision model's response could not be understood.") is False

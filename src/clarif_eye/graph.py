@@ -17,6 +17,7 @@ schema is exactly the 7 architecture-doc keys, nothing more.
 from langgraph.graph import END, StateGraph
 
 from clarif_eye.state import ClarifEyeState
+from clarif_eye.synth import run_fast_synth
 from clarif_eye.vision import run_vision
 
 
@@ -51,10 +52,19 @@ def vision_node(state, config=None, client=None):
     return run_vision(state["image_data"], client)
 
 
-def fast_synth_node(state, config=None):
-    """Stub for the fast-path synthesis node (issue #6)."""
+def fast_synth_node(state, config=None, client=None):
+    """Fast-path synthesis node (issue #7/P1.4): turns vision output into spoken text.
+
+    The substantive logic (prompt building, sanitisation, degradation)
+    lives in clarif_eye.synth.run_fast_synth so this stays a thin adapter,
+    the same pattern vision_node already uses. `client` is injectable
+    directly or via config["configurable"]["client"]; when neither is
+    supplied, run_fast_synth constructs a real OpenRouterClient lazily.
+    """
     _record(config, "fast_synth")
-    return {"final_output": "stub fast synthesis output"}
+    if client is None:
+        client = (config or {}).get("configurable", {}).get("client")
+    return run_fast_synth(state["ocr_output"], state["scene_context"], client)
 
 
 def research_node(state, config=None):
