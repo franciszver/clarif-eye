@@ -239,3 +239,32 @@ def test_focus_and_aria_live_js_target_the_right_elements():
     assert RESULT_ELEM_ID in FOCUS_RESULT_JS
     assert STATUS_ELEM_ID in ARIA_LIVE_HEAD
     assert "aria-live" in ARIA_LIVE_HEAD
+
+
+def test_aria_live_shim_uses_mutation_observer_not_load_only():
+    # Regression test for a real-browser bug found via Chrome DevTools:
+    # #status-live-region existed but carried NONE of aria-live/aria-atomic/
+    # role. The old shim ran on window "load", which fires BEFORE Gradio's
+    # SPA renders its components, so getElementById returned null and the
+    # shim was a silent no-op - a screen reader announced nothing during
+    # the ~15-30s wait.
+    #
+    # This asserts the shim observes the DOM for the element to appear
+    # (and survives Gradio re-rendering the status control on every run)
+    # instead of assuming it exists at a fixed moment - written to FAIL
+    # against the old, load-only shim.
+    #
+    # STATIC/SOURCE-LEVEL CHECK ONLY (same discipline as the rest of this
+    # file): this verifies the shim's structure, not that the attributes
+    # are actually applied in a rendered browser. That was verified
+    # manually with Chrome DevTools for this fix; there is no automated
+    # browser test in this suite covering it (Owner decision D13 accepted
+    # automated-only coverage for P5.1 - this does not extend that to
+    # "browser-verified").
+    assert "MutationObserver" in ARIA_LIVE_HEAD
+    assert "observe(" in ARIA_LIVE_HEAD
+    assert "childList" in ARIA_LIVE_HEAD and "subtree" in ARIA_LIVE_HEAD
+    # The bug, precisely: attributes applied ONLY from inside a window
+    # "load" handler. A correct shim must not depend solely on that event
+    # firing after the element already exists in the DOM.
+    assert 'addEventListener("load"' not in ARIA_LIVE_HEAD
