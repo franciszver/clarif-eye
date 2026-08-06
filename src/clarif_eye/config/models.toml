@@ -93,7 +93,22 @@ keywords = [
     # never load-bearing for the medication safety case - see router.py
     # module docstring and tests/test_router.py.
     "tablet", "tablets", "capsule", "capsules", "dose", "doses", "dosage",
-    "mg", "ml", "prescription", "prescriptions", "refill", "refills",
+    "mg", "mcg", "ml", "prescription", "prescriptions", "refill", "refills",
     "pharmacy", "warning", "exp",
     "expiry", "expiration", "pill", "pills",
 ]
+# Dosage-unit signal (glued-form fix, P1 router heuristic): word-boundary
+# keyword matching (\bmg\b) cannot match "850MG" - there is no boundary
+# between a digit and a letter, and real prescription labels usually
+# print the unit glued to the number, not spaced. This list feeds a
+# separate regex (router.py _dosage_unit_hit_count) over ocr_output that
+# matches a number immediately followed, with or without a space, by one
+# of these units (e.g. "500mg", "850 MG", "75mcg", "10ml", "100IU").
+# Matches count toward keyword_hits alongside ordinary keyword hits, so
+# they can reach keyword_strong_hit_threshold on their own (dosage-unit +
+# one plain keyword, e.g. "capsule").
+# Deliberately EXCLUDES bare "g" and bare "l": "340g" NET WT on a food
+# package and "2L" on a drinks bottle are ordinary product labels, not
+# dosages, and a glued-number regex would otherwise treat every such
+# product as medication.
+dosage_units = ["mg", "mcg", "µg", "ug", "ml", "iu"]

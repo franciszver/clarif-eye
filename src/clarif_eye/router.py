@@ -83,6 +83,7 @@ class RouterConfig(NamedTuple):
     chars_per_word_estimate: int
     currency_symbols: tuple
     keywords: tuple
+    dosage_units: tuple = ()
 
 
 class RouterDecision(NamedTuple):
@@ -136,12 +137,13 @@ def _validate_router_section(section):
             f"(there are 3 signals), got {values['signal_score_threshold']!r}"
         )
 
-    for field in ("currency_symbols", "keywords"):
+    for field in ("currency_symbols", "keywords", "dosage_units"):
         if field not in section:
             raise RouterError(f"router config is missing required field {field!r}")
 
     currency_symbols = _validate_string_list(section["currency_symbols"], "currency_symbols")
     keywords = tuple(k.lower() for k in _validate_string_list(section["keywords"], "keywords"))
+    dosage_units = tuple(u.lower() for u in _validate_string_list(section["dosage_units"], "dosage_units"))
 
     return RouterConfig(
         word_count_threshold=values["word_count_threshold"],
@@ -154,6 +156,7 @@ def _validate_router_section(section):
         chars_per_word_estimate=values["chars_per_word_estimate"],
         currency_symbols=currency_symbols,
         keywords=keywords,
+        dosage_units=dosage_units,
     )
 
 
@@ -204,6 +207,20 @@ def _currency_hit_count(text, currency_symbols):
     return count
 
 
+def _dosage_unit_hit_count(text, dosage_units):
+    # Real prescription labels usually print the unit glued to the number
+    # ("500mg", "850MG"), not spaced - \bmg\b (word-boundary keyword
+    # matching) can never match that, since there is no word boundary
+    # between a digit and a letter. This is a separate regex, run over
+    # ocr_output only, that matches a number optionally followed by a
+    # space and then one of the configured units, e.g. "500mg", "850 MG",
+    # "75mcg", "2.5 mg". Case-insensitive so config casing doesn't matter.
+    if not dosage_units:
+        return 0
+    pattern = r"\d+(?:\.\d+)?\s*(?:" + "|".join(re.escape(u) for u in dosage_units) + r")\b"
+    return len(re.findall(pattern, text, re.IGNORECASE))
+
+
 def _keyword_hit_count(text_lower, keywords):
     # Word-boundary matching, not plain substring `in`: unanchored
     # substrings produce absurd matches ("bill" inside "Billings", "tax"
@@ -248,7 +265,14 @@ def classify_complexity(ocr_output, scene_context, config=None):
     digit_count = sum(ch.isdigit() for ch in ocr_output)
     currency_count = _currency_hit_count(ocr_output, config.currency_symbols)
 
-    keyword_hits = _keyword_hit_count(ocr_output.lower(), config.keywords)
+    word_keyword_hits = _keyword_hit_count(ocr_output.lower(), config.keywords)
+    # Dosage-unit hits (glued or spaced, e.g. "500mg", "850 MG") are run
+    # over the raw (non-lowered) ocr_output - see _dosage_unit_hit_count -
+    # and counted into the same keyword_hits total, so a dosage-unit match
+    # is just another way to reach keyword_hit_threshold/
+    # keyword_strong_hit_threshold; no new top-level signal is added.
+    dosage_unit_hits = _dosage_unit_hit_count(ocr_output, config.dosage_units)
+    keyword_hits = word_keyword_hits + dosage_unit_hits
 
     digit_signal = digit_count >= config.digit_count_threshold
     currency_signal = currency_count >= config.currency_count_threshold
@@ -268,7 +292,8 @@ def classify_complexity(ocr_output, scene_context, config=None):
         f"word_count={word_count} (long_document>={config.word_count_threshold}: {long_document}); "
         f"digits={digit_count} (>={config.digit_count_threshold}: {digit_signal}); "
         f"currency_hits={currency_count} (>={config.currency_count_threshold}: {currency_signal}); "
-        f"keyword_hits={keyword_hits} (>={config.keyword_hit_threshold}: {keyword_signal}, "
+        f"keyword_hits={keyword_hits} (word={word_keyword_hits}, dosage_unit={dosage_unit_hits}; "
+        f">={config.keyword_hit_threshold}: {keyword_signal}, "
         f"strong>={config.keyword_strong_hit_threshold}: {keyword_strong_signal}); "
         f"signal_score={signal_score}/{config.signal_score_threshold} "
         f"-> {'research' if complexity_flag else 'fast_synth'}"

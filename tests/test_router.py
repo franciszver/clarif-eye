@@ -157,6 +157,7 @@ def test_config_loads_from_toml_file(tmp_path):
         chars_per_word_estimate = 2
         currency_symbols = ["$"]
         keywords = ["total", "tax"]
+        dosage_units = ["mg"]
         """,
         encoding="utf-8",
     )
@@ -180,6 +181,7 @@ def test_custom_toml_threshold_flips_routing(tmp_path):
         chars_per_word_estimate = 2
         currency_symbols = ["$"]
         keywords = ["total", "tax"]
+        dosage_units = ["mg"]
         """,
         encoding="utf-8",
     )
@@ -252,6 +254,59 @@ MEDICATION_LABELS = [
 def test_medication_labels_route_to_research(case_id, ocr):
     decision = classify_complexity(ocr, "a small printed label")
     assert decision.complexity_flag is True, f"{case_id}: reason={decision.reason}"
+
+
+# --- FIX 8: dosage units glued to the number ("500mg") must still count ----
+# --- as a keyword hit - \bmg\b can't match a unit with no boundary --------
+# --- between the digit and the letter --------------------------------------
+
+
+GLUED_DOSAGE_MEDICATION_LABELS = [
+    ("amoxicillin_glued", "AMOXICILLIN 500mg CAPSULES"),
+    ("atorvastatin_glued", "ATORVASTATIN 20MG ONE TABLET AT NIGHT"),
+    ("metformin_glued", "METFORMIN HCL 850MG TAKE ONE CAPSULE"),
+    ("levothyroxine_glued_mcg", "LEVOTHYROXINE 75MCG ONE TABLET DAILY"),
+]
+
+
+@pytest.mark.parametrize(
+    "case_id,ocr", GLUED_DOSAGE_MEDICATION_LABELS, ids=[c[0] for c in GLUED_DOSAGE_MEDICATION_LABELS]
+)
+def test_glued_dosage_medication_labels_route_to_research(case_id, ocr):
+    decision = classify_complexity(ocr, "a small printed label")
+    assert decision.complexity_flag is True, f"{case_id}: reason={decision.reason}"
+
+
+def test_spaced_dosage_medication_label_still_routes_to_research():
+    decision = classify_complexity("AMOXICILLIN 500 mg CAPSULES", "a small printed label")
+    assert decision.complexity_flag is True, decision.reason
+
+
+# --- Ordinary products with a glued number+unit must NOT be swept into -----
+# --- the dosage-unit signal (regression guard, pinned) ----------------------
+
+
+ORDINARY_GLUED_UNIT_PRODUCTS = [
+    ("water_bottle_500ml", "SPRING WATER 500ml"),
+    ("soda_can_330ml", "COLA 330ml CAN"),
+    ("cereal_box_340g", "CORN FLAKES NET WT 340g"),
+    ("drinks_bottle_2l", "SPARKLING WATER 2L"),
+    ("distance_sign_100m", "REST AREA 100m"),
+    ("opening_hours_24hr", "OPEN 24HR"),
+    ("time_6pm", "CLOSES AT 6PM"),
+    ("film_35mm", "KODAK 35mm FILM"),
+    ("resolution_1080p", "VIDEO 1080p"),
+    ("file_size_5mb", "PHOTO.JPG 5MB"),
+    ("bulb_60w", "LIGHT BULB 60W"),
+]
+
+
+@pytest.mark.parametrize(
+    "case_id,ocr", ORDINARY_GLUED_UNIT_PRODUCTS, ids=[c[0] for c in ORDINARY_GLUED_UNIT_PRODUCTS]
+)
+def test_ordinary_glued_unit_products_route_to_fast_synth(case_id, ocr):
+    decision = classify_complexity(ocr, "a product photo")
+    assert decision.complexity_flag is False, f"{case_id}: reason={decision.reason}"
 
 
 # --- Regression fix: generic time/frequency words must not send ordinary ---
@@ -374,6 +429,7 @@ def test_zero_digit_count_threshold_rejected(tmp_path):
         chars_per_word_estimate = 2
         currency_symbols = ["$"]
         keywords = ["total", "tax"]
+        dosage_units = ["mg"]
         """,
         encoding="utf-8",
     )
