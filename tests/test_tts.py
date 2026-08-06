@@ -14,7 +14,19 @@ import pytest
 
 from clarif_eye.graph import build_graph, tts_node
 from clarif_eye.state import make_initial_state
-from clarif_eye.tts import MAX_KEPT_FILES, TtsError, run_tts
+from clarif_eye.tts import (
+    DEFAULT_PROVIDER_CHAIN,
+    MAX_KEPT_FILES,
+    OUTCOME_ERROR,
+    OUTCOME_INVALID_AUDIO,
+    OUTCOME_SUCCESS,
+    EdgeTtsProvider,
+    GttsProvider,
+    TtsError,
+    get_last_tts_result,
+    is_chain_exhausted,
+    run_tts,
+)
 
 # Minimal valid-looking mp3 payloads for the "looks like audio" check:
 # an ID3v2 tag header, and a raw MPEG frame sync (0xFF 0xFB...).
@@ -26,10 +38,11 @@ _FRAME_SYNC_AUDIO_BYTES = b"\xff\xfb\x90\x00" + b"\x00" * 64
 
 
 class FakeTtsProvider:
-    def __init__(self, content=_ID3_AUDIO_BYTES, exc=None, write_file=True):
+    def __init__(self, content=_ID3_AUDIO_BYTES, exc=None, write_file=True, name=None):
         self.content = content
         self.exc = exc
         self.write_file = write_file
+        self.name = name
         self.calls = []
 
     def synthesize(self, text, out_path):
@@ -341,3 +354,193 @@ def test_output_filename_is_a_uuid_hex_mp3(tmp_path):
     from pathlib import Path
 
     assert _UUID_HEX_RE.match(Path(result["audio_file_path"]).name)
+
+
+# --- Provider chain (issue #12 / P3.2): try in order, first success wins ----
+
+
+def test_default_provider_chain_has_two_independent_providers():
+    assert DEFAULT_PROVIDER_CHAIN == (EdgeTtsProvider, GttsProvider)
+
+
+def test_chain_tries_next_provider_when_first_fails(tmp_path):
+    first = FakeTtsProvider(exc=TtsError("first provider down"), name="first")
+    second = FakeTtsProvider(content=_ID3_AUDIO_BYTES, name="second")
+
+    result = run_tts("Some text.", providers=[first, second], out_dir=tmp_path)
+
+    assert result["audio_file_path"] != ""
+    assert len(first.calls) == 1
+    assert len(second.calls) == 1
+
+    last = get_last_tts_result()
+    assert last.provider == "second"
+    assert last.audio_file_path == result["audio_file_path"]
+    assert [a.provider for a in last.attempts] == ["first", "second"]
+    assert last.attempts[0].outcome == OUTCOME_ERROR
+    assert last.attempts[1].outcome == OUTCOME_SUCCESS
+
+
+def test_chain_stops_at_first_success_second_provider_never_called(tmp_path):
+    first = FakeTtsProvider(content=_ID3_AUDIO_BYTES, name="first")
+    second = FakeTtsProvider(content=_ID3_AUDIO_BYTES, name="second")
+
+    run_tts("Some text.", providers=[first, second], out_dir=tmp_path)
+
+    assert len(first.calls) == 1
+    assert len(second.calls) == 0
+
+
+def test_chain_all_providers_fail_returns_empty_path_and_is_observably_exhausted(tmp_path):
+    first = FakeTtsProvider(exc=TtsError("first down"), name="first")
+    second = FakeTtsProvider(exc=TtsError("second down"), name="second")
+
+    result = run_tts("Some text.", providers=[first, second], out_dir=tmp_path)
+
+    assert result == {"audio_file_path": ""}
+    last = get_last_tts_result()
+    assert is_chain_exhausted(last) is True
+    assert is_chain_exhausted() is True
+    assert [a.outcome for a in last.attempts] == [OUTCOME_ERROR, OUTCOME_ERROR]
+
+
+def test_chain_continues_past_a_zero_byte_file_from_first_provider(tmp_path):
+    first = FakeTtsProvider(content=b"", name="first")
+    second = FakeTtsProvider(content=_ID3_AUDIO_BYTES, name="second")
+
+    result = run_tts("Some text.", providers=[first, second], out_dir=tmp_path)
+
+    assert result["audio_file_path"] != ""
+    last = get_last_tts_result()
+    assert last.attempts[0].outcome == OUTCOME_INVALID_AUDIO
+    assert last.provider == "second"
+
+
+def test_blank_final_output_is_not_reported_as_chain_exhausted(tmp_path):
+    provider = FakeTtsProvider(content=_ID3_AUDIO_BYTES)
+
+    result = run_tts("", providers=[provider], out_dir=tmp_path)
+
+    assert result == {"audio_file_path": ""}
+    assert is_chain_exhausted() is False
+    assert get_last_tts_result().attempts == ()
+
+
+def test_single_provider_injection_old_api_still_supported(tmp_path):
+    provider = FakeTtsProvider(content=_ID3_AUDIO_BYTES, name="only")
+
+    result = run_tts("Some text.", provider=provider, out_dir=tmp_path)
+
+    assert result["audio_file_path"] != ""
+    last = get_last_tts_result()
+    assert last.provider == "only"
+    assert len(last.attempts) == 1
+
+
+# --- tts_node: chain injection via config -------------------------------------
+
+
+def test_tts_node_accepts_providers_chain_injected_via_config(tmp_path):
+    first = FakeTtsProvider(exc=TtsError("boom"), name="first")
+    second = FakeTtsProvider(content=_ID3_AUDIO_BYTES, name="second")
+    state = {"final_output": "Some spoken text."}
+
+    result = tts_node(
+        state,
+        config={"configurable": {"tts_providers": [first, second], "tts_out_dir": tmp_path}},
+    )
+
+    assert result["audio_file_path"] != ""
+    assert len(first.calls) == 1
+    assert len(second.calls) == 1
+
+
+# --- Full compiled graph: failing-then-succeeding chain, and full exhaustion -
+
+
+def test_full_compiled_graph_falls_through_provider_chain(tmp_path):
+    from clarif_eye.client import CompletionResult
+
+    vision_reply = "OCR_TEXT: Open 9-5\nSCENE: a shop front"
+
+    class FakeVisionThenSynthClient:
+        def __init__(self):
+            self.calls = []
+
+        def complete(self, role, messages, **params):
+            self.calls.append(role)
+            if len(self.calls) == 1:
+                return CompletionResult(content=vision_reply, model="fake-eyes")
+            return CompletionResult(
+                content="The image shows a sign reading Open 9 to 5 on a shop front.",
+                model="fake-eyes",
+            )
+
+        def close(self):
+            pass
+
+    client = FakeVisionThenSynthClient()
+    first = FakeTtsProvider(exc=TtsError("first provider down"), name="first")
+    second = FakeTtsProvider(content=_ID3_AUDIO_BYTES, name="second")
+    graph = build_graph()
+    state = make_initial_state("base64data")
+
+    result = graph.invoke(
+        state,
+        config={
+            "configurable": {
+                "trace": [],
+                "client": client,
+                "tts_providers": [first, second],
+                "tts_out_dir": tmp_path,
+            }
+        },
+    )
+
+    assert result["audio_file_path"] != ""
+    assert len(first.calls) == 1
+    assert len(second.calls) == 1
+
+
+def test_full_compiled_graph_reaches_end_with_text_only_when_chain_exhausted(tmp_path):
+    from clarif_eye.client import CompletionResult
+
+    vision_reply = "OCR_TEXT: Open 9-5\nSCENE: a shop front"
+
+    class FakeVisionThenSynthClient:
+        def __init__(self):
+            self.calls = []
+
+        def complete(self, role, messages, **params):
+            self.calls.append(role)
+            if len(self.calls) == 1:
+                return CompletionResult(content=vision_reply, model="fake-eyes")
+            return CompletionResult(
+                content="The image shows a sign reading Open 9 to 5 on a shop front.",
+                model="fake-eyes",
+            )
+
+        def close(self):
+            pass
+
+    client = FakeVisionThenSynthClient()
+    first = FakeTtsProvider(exc=TtsError("first down"), name="first")
+    second = FakeTtsProvider(exc=TtsError("second down"), name="second")
+    graph = build_graph()
+    state = make_initial_state("base64data")
+
+    result = graph.invoke(
+        state,
+        config={
+            "configurable": {
+                "trace": [],
+                "client": client,
+                "tts_providers": [first, second],
+                "tts_out_dir": tmp_path,
+            }
+        },
+    )
+
+    assert result["audio_file_path"] == ""
+    assert result["final_output"] != ""
+    assert is_chain_exhausted() is True

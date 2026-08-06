@@ -1,28 +1,42 @@
-"""MANUAL-ONLY smoke test for the TTS node's real edge-tts provider.
+"""MANUAL-ONLY smoke test for the TTS node's real providers.
 
-This script makes REAL network calls to Microsoft's edge-tts service. It is
-NOT part of the pytest suite (tests must stay offline) and must NOT be run
-by an automated agent - only by a human, or an orchestrator that has
-explicitly decided to spend a real network call.
+This script makes REAL network calls to Microsoft's edge-tts service and/or
+Google's gTTS endpoint. It is NOT part of the pytest suite (tests must stay
+offline) and must NOT be run by an automated agent - only by a human, or an
+orchestrator that has explicitly decided to spend a real network call.
 
 Synthesises a short text string (default below, or the first CLI argument)
-with the real EdgeTtsProvider, writes an mp3 via clarif_eye.tts.run_tts, and
-prints the resulting path, its size in bytes, and its duration if it can be
-determined without adding a new dependency (falls back to "unknown" rather
-than failing the script).
+and writes an mp3 via clarif_eye.tts.run_tts, then prints the resulting
+path, its size in bytes, which provider served it, and its duration if it
+can be determined without adding a new dependency (falls back to "unknown"
+rather than failing the script).
+
+By default this exercises the FULL provider chain (DEFAULT_PROVIDER_CHAIN -
+edge-tts, then gTTS), so a human running it end to end gets the same
+failover behaviour a real request would see. `--provider` smoke-tests one
+provider in isolation instead - useful for confirming a single provider is
+healthy without invoking the whole chain.
 
 Usage:
     python scripts/tts_smoke.py
     python scripts/tts_smoke.py "Some other sentence to speak aloud."
+    python scripts/tts_smoke.py --provider edge
+    python scripts/tts_smoke.py --provider gtts "Some other sentence."
 """
 
+import argparse
 import sys
 import wave
 from pathlib import Path
 
-from clarif_eye.tts import run_tts
+from clarif_eye.tts import EdgeTtsProvider, GttsProvider, get_last_tts_result, run_tts
 
 DEFAULT_TEXT = "The image shows a coffee cup on a kitchen counter."
+
+# Name -> provider factory, for --provider. Kept as a plain dict here (not
+# reusing tts.DEFAULT_PROVIDER_CHAIN) so this script can smoke-test one
+# provider by name without depending on the chain's internal ordering.
+_PROVIDER_FACTORIES = {"edge": EdgeTtsProvider, "gtts": GttsProvider}
 
 
 def _mp3_duration_seconds(path):
@@ -45,19 +59,36 @@ def _mp3_duration_seconds(path):
 
 
 def main():
-    text = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_TEXT
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("text", nargs="?", default=DEFAULT_TEXT)
+    parser.add_argument(
+        "--provider",
+        choices=sorted(_PROVIDER_FACTORIES),
+        default=None,
+        help="Smoke-test a single provider instead of the full default chain.",
+    )
+    args = parser.parse_args()
 
-    result = run_tts(text)
+    if args.provider is not None:
+        result = run_tts(args.text, provider=_PROVIDER_FACTORIES[args.provider]())
+    else:
+        result = run_tts(args.text)  # exercises the full DEFAULT_PROVIDER_CHAIN
+
     path = result["audio_file_path"]
+    last = get_last_tts_result()
 
     if not path:
         print("TTS failed: audio_file_path is empty.", file=sys.stderr)
+        if last is not None:
+            for attempt in last.attempts:
+                print(f"  {attempt.provider}: {attempt.outcome} - {attempt.detail}", file=sys.stderr)
         raise SystemExit(1)
 
     size_bytes = Path(path).stat().st_size
     duration = _mp3_duration_seconds(path)
 
     print(f"Path: {path}")
+    print(f"Provider: {last.provider if last is not None else 'unknown'}")
     print(f"Size: {size_bytes} bytes")
     print(f"Duration: {duration if duration is not None else 'unknown'}")
 
