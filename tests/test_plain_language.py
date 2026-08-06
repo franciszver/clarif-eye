@@ -148,23 +148,6 @@ def _accessibility_doc_text():
     return {"docs/ACCESSIBILITY.md": path.read_text(encoding="utf-8")}
 
 
-# --- RED-FIRST SCAFFOLD (issue #57 commit 1 only, removed in commit 2) -----
-#
-# The shipped text is already clean, so there is nothing for these checks to
-# catch yet. To make commit 1 genuinely red (not just "written but never
-# proven"), this seeds one violation of each kind into a fixture the SAME
-# checks scan, alongside the real shipped text. Commit 2 deletes this block
-# and its one line of wiring in shipped_texts() below, leaving the checks
-# pointed only at the real files.
-_SEED_RED_FIRST_TEXT = (
-    "Moreover, this description is not merely a caption, it's revolutionary — "
-    "a bold new claim.\n"
-    "The pipeline leverages a robust, seamless workflow.\n"
-    "It is not only fast, but also astonishingly reliable.\n"
-    "Overall, audio is playing right now for every listener.\n"
-)
-
-
 def shipped_texts():
     """Every piece of text in scope for the plain-language guard: the
     user-facing ui.py string constants, the static labels/markdown
@@ -176,7 +159,6 @@ def shipped_texts():
     texts.update(_ui_string_constants())
     texts.update(_ui_interface_strings())
     texts.update(_accessibility_doc_text())
-    texts["RED_FIRST_SEED (temporary, removed in commit 2)"] = _SEED_RED_FIRST_TEXT
     return texts
 
 
