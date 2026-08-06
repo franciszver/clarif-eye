@@ -26,11 +26,30 @@ def _record(config, node_name):
 
 
 def vision_node(state, config=None):
-    """Stub for the vision node (issue #5): OCR + scene description."""
+    """Stub for the vision node (issue #5): OCR + scene description.
+
+    ALSO sets complexity_flag as part of its own state update: routing
+    depends on this key, so it must be documented as this node's
+    responsibility, not something left to the caller. If a future vision
+    node forgets to return this key, LangGraph's partial-update merge means
+    whatever the caller happened to set (or make_initial_state's hardcoded
+    False) silently survives untouched - every request would take the fast
+    path with no exception and no failing test. Issues #5/#6 own the real
+    heuristic and MUST keep returning this key.
+
+    The stub keeps the value simple, deterministic, and derived from the
+    node's own stub OCR pass over the input (a trivial substring check)
+    rather than from any complexity_flag the caller may have set - this
+    also lets both routing branches stay exercisable through the compiled
+    graph in tests, instead of being collapsed to a single hardcoded value.
+    """
     _record(config, "vision")
+    ocr_output = "stub ocr output"
+    complexity_flag = "complex" in state.get("image_data", "").lower()
     return {
-        "ocr_output": "stub ocr output",
+        "ocr_output": ocr_output,
         "scene_context": "stub scene context",
+        "complexity_flag": complexity_flag,
     }
 
 
@@ -59,8 +78,26 @@ def tts_node(state, config=None):
 
 
 def dynamic_router(state):
-    """Route on state["complexity_flag"]: True -> research, False -> fast_synth."""
-    return "research" if state["complexity_flag"] else "fast_synth"
+    """Route on state["complexity_flag"]: True -> research, False -> fast_synth.
+
+    complexity_flag must be an actual bool. TypedDict gives no runtime
+    protection, so `if state["complexity_flag"]` would otherwise route on
+    truthiness - a confidence float or an error string used as a "no"
+    sentinel would silently pick the wrong path, and the two paths differ
+    by a whole model tier and ~17s of budget. Fail loudly instead of
+    routing on a value that merely happens to be truthy or falsy.
+    """
+    if "complexity_flag" not in state:
+        raise KeyError(
+            "dynamic_router: state is missing required key 'complexity_flag'"
+        )
+    flag = state["complexity_flag"]
+    if not isinstance(flag, bool):
+        raise TypeError(
+            "dynamic_router: state['complexity_flag'] must be bool, got "
+            f"{type(flag).__name__} ({flag!r})"
+        )
+    return "research" if flag else "fast_synth"
 
 
 def build_graph():
