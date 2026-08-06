@@ -26,8 +26,31 @@ from pathlib import Path
 
 from clarif_eye.client import OpenRouterClient
 from clarif_eye import vision
+from clarif_eye.router import classify_complexity
 
 FIXTURES_DIR = Path(__file__).parent.parent / "tests" / "fixtures"
+
+
+def build_parsed_fixture(raw_reply):
+    """Parse the raw model reply into a fixture dict, using production logic.
+
+    Pure function: same input always yields the same result, no network call.
+    This is extracted from main() so the fixture-building logic (and its
+    cross-module references, like router.classify_complexity) can be tested
+    offline before a live API call is made.
+
+    Returns a dict with keys: ocr_output, scene_context, complexity_flag.
+    """
+    parsed_fields = vision._parse_reply(raw_reply)
+    if parsed_fields is None:
+        return {"ocr_output": "", "scene_context": "", "complexity_flag": False}
+    else:
+        ocr_output, scene_context = parsed_fields
+        return {
+            "ocr_output": ocr_output,
+            "scene_context": scene_context,
+            "complexity_flag": classify_complexity(ocr_output, scene_context).complexity_flag,
+        }
 
 
 def main():
@@ -51,16 +74,7 @@ def main():
     finally:
         client.close()
 
-    parsed_fields = vision._parse_reply(raw_reply)
-    if parsed_fields is None:
-        parsed = {"ocr_output": "", "scene_context": "", "complexity_flag": False}
-    else:
-        ocr_output, scene_context = parsed_fields
-        parsed = {
-            "ocr_output": ocr_output,
-            "scene_context": scene_context,
-            "complexity_flag": vision._complexity_flag(ocr_output),
-        }
+    parsed = build_parsed_fixture(raw_reply)
 
     FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
     (FIXTURES_DIR / "vision_reply_raw.txt").write_text(raw_reply, encoding="utf-8")
