@@ -254,6 +254,15 @@ def test_api_key_never_leaks_anywhere_it_could_plausibly_surface():
 # --- Timeout is derived from the role's latency budget --------------------
 
 
+def test_role_timeouts_match_measured_budgets_d16():
+    # Owner decision D16: eyes=30.0 (ceiling; rung 1 ~5s, rung 2 up to ~15s),
+    # brain=45.0 (still unmeasured, see issue #9). These are exact values,
+    # not just ceilings on some other computation - a regression to the old
+    # unreachable 8.0/25.0 budgets must fail this test.
+    assert client_module.ROLE_TIMEOUTS["eyes"] == 30.0
+    assert client_module.ROLE_TIMEOUTS["brain"] == 45.0
+
+
 def test_timeout_is_set_for_eyes_role():
     captured = {}
 
@@ -267,7 +276,7 @@ def test_timeout_is_set_for_eyes_role():
     timeout = captured["timeout"]
     assert timeout is not None
     assert all(v is not None for v in timeout.values())
-    assert timeout["read"] <= 8.0
+    assert timeout["read"] <= 30.0
 
 
 def test_timeout_is_set_for_brain_role():
@@ -283,7 +292,7 @@ def test_timeout_is_set_for_brain_role():
     timeout = captured["timeout"]
     assert timeout is not None
     assert all(v is not None for v in timeout.values())
-    assert timeout["read"] <= 25.0
+    assert timeout["read"] <= 45.0
 
 
 # --- Headers: optional app URL / name -------------------------------------
