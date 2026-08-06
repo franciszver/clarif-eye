@@ -63,6 +63,22 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 # below and only gets the format-agnostic assertions, not this fact list.
 GROUND_TRUTH_FACTS_BY_FIXTURE = {
     "vision_reply_raw.txt": GROUND_TRUTH_FACTS,
+    "vision_reply_raw_sentinel_doc.txt": [
+        "4471-2205-88",
+        "$104.95",
+        "$41.20",
+        "$63.75",
+        "22 JULY 2026",
+        "CITY OF RIVERTON",
+    ],
+    "vision_reply_raw_screenplay.txt": [
+        "SCENE: 4",
+        "SCENE: 5",
+        "SCENE: 7",
+        "CALL TIME: 06:30",
+        "WRAP TARGET: 19:00",
+        "OCR_TEXT: verify props list",
+    ],
 }
 
 
