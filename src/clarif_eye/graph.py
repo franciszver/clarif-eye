@@ -17,6 +17,7 @@ schema is exactly the 7 architecture-doc keys, nothing more.
 from langgraph.graph import END, StateGraph
 
 from clarif_eye.analysis import run_analysis
+from clarif_eye.research import run_research
 from clarif_eye.state import ClarifEyeState
 from clarif_eye.synth import run_fast_synth
 from clarif_eye.vision import run_vision
@@ -68,10 +69,28 @@ def fast_synth_node(state, config=None, client=None):
     return run_fast_synth(state["ocr_output"], state["scene_context"], client)
 
 
-def research_node(state, config=None):
-    """Stub for the research node (issue #7): web-lookup on the deep path."""
+def research_node(state, config=None, searcher=None, client=None):
+    """Research node (issue #10/P2.1): web-lookup for the document's subject on the deep path.
+
+    The substantive logic (query derivation, search, bounded fetch,
+    extraction, degradation) lives in clarif_eye.research.run_research so
+    this stays a thin adapter, the same pattern the other nodes use.
+    `searcher`/`client` are injectable directly or via
+    config["configurable"]["searcher"] / ["research_client"]; when neither
+    is supplied, run_research constructs real defaults lazily. Deliberately
+    a DIFFERENT configurable key than "client" (used by vision_node/
+    analysis_node for their OpenRouterClient) - this client is an
+    httpx.Client-like page fetcher, a different type serving a different
+    purpose, and reusing the same key would silently hand the wrong kind of
+    client to whichever node ran second.
+    """
     _record(config, "research")
-    return {"scraper_data": "stub scraper data"}
+    configurable = (config or {}).get("configurable", {})
+    if searcher is None:
+        searcher = configurable.get("searcher")
+    if client is None:
+        client = configurable.get("research_client")
+    return run_research(state["ocr_output"], state["scene_context"], searcher=searcher, client=client)
 
 
 def analysis_node(state, config=None, client=None):
