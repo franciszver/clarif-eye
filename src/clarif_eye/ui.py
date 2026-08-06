@@ -762,6 +762,15 @@ def build_interface(resources):
             # inside this container), instead of any icon glyph elsewhere
             # on the page.
             elem_id=IMAGE_INPUT_ELEM_ID,
+            # issue #59 / P4.5: Gradio mirrors the webcam by default
+            # (WebcamOptions.mirror=True), which suits selfies. This app
+            # has no selfie case - users photograph bills, labels, and
+            # signs so the vision model can read the text, and a blind
+            # user is not looking at the preview to notice a mirrored
+            # frame. Mirroring reversed that text before the model ever
+            # saw it. Do not restore the default thinking it "looks more
+            # natural" - it makes captured text unreadable.
+            webcam_options=gr.WebcamOptions(mirror=False),
         )
         submit_button = gr.Button("Describe this photo", variant="primary")
         status_output = gr.Textbox(
