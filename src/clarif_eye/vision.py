@@ -77,23 +77,60 @@ def _build_messages(image_data):
     ]
 
 
+def _sentinel_line_remainder(line, sentinel):
+    """If `line` STARTS with `sentinel` (after optional leading whitespace),
+    return the remainder of the line as the first line of that section -
+    an optional trailing colon and any whitespace separating the sentinel
+    from its content are stripped. Otherwise return None.
+
+    A sentinel occurring mid-line (not at line start) does not count -
+    that could be photographed text quoting the token - so this only ever
+    matches at the start of a (whitespace-trimmed) line, same as the
+    legacy markers below.
+    """
+    stripped = line.lstrip()
+    if not stripped.startswith(sentinel):
+        return None
+    remainder = stripped[len(sentinel) :]
+    if remainder.startswith(":"):
+        remainder = remainder[1:]
+    return remainder.lstrip(" \t")
+
+
 def _parse_sentinel_reply(reply):
     """Parse a sentinel-delimited reply into (ocr_output, scene_context), or None.
 
-    A line counts as a sentinel ONLY if it is EXACTLY the sentinel token
-    (after stripping whitespace) - the sentinel cannot plausibly occur
-    inside photographed text, so unlike the legacy markers there is no
-    "mid-line occurrence" case to fold into body text. Content between/after
-    the two sentinel lines is taken verbatim, including lines that happen to
-    start with the legacy OCR_TEXT:/SCENE: markers - those are just body
-    text here, not section headers. If either sentinel is missing or
-    repeated, the reply is ambiguous and this returns None so the caller can
-    fall back to the legacy parser rather than guessing.
+    A line counts as a sentinel if it STARTS with the sentinel token (after
+    optional leading whitespace, and tolerating an optional trailing colon
+    and trailing whitespace) - real models don't reliably put the sentinel
+    ALONE on its own line, and requiring that discarded good data (P1.10 /
+    issue #38: a transcribed TOXIC warning emitted as
+    "<<<CLARIF_OCR>>> WARNING: TOXIC..." on one line). The remainder of that
+    line becomes the first line of the section. A sentinel occurring
+    mid-line (not at line start) is NOT treated as a delimiter - that could
+    be photographed text - and stays folded into whichever section it falls
+    in. Content after the sentinel is taken verbatim, including lines that
+    happen to start with the legacy OCR_TEXT:/SCENE: markers - those are
+    just body text here, not section headers. If either sentinel is missing
+    or repeated, the reply is ambiguous and this returns None so the caller
+    can fall back to the legacy parser rather than guessing.
     """
     lines = reply.split("\n")
 
-    ocr_starts = [i for i, line in enumerate(lines) if line.strip() == OCR_SENTINEL]
-    scene_starts = [i for i, line in enumerate(lines) if line.strip() == SCENE_SENTINEL]
+    ocr_starts = []
+    ocr_remainders = {}
+    scene_starts = []
+    scene_remainders = {}
+    for i, line in enumerate(lines):
+        ocr_remainder = _sentinel_line_remainder(line, OCR_SENTINEL)
+        if ocr_remainder is not None:
+            ocr_starts.append(i)
+            ocr_remainders[i] = ocr_remainder
+            continue
+        scene_remainder = _sentinel_line_remainder(line, SCENE_SENTINEL)
+        if scene_remainder is not None:
+            scene_starts.append(i)
+            scene_remainders[i] = scene_remainder
 
     if len(ocr_starts) != 1 or len(scene_starts) != 1:
         return None
@@ -101,16 +138,16 @@ def _parse_sentinel_reply(reply):
     ocr_index = ocr_starts[0]
     scene_index = scene_starts[0]
 
-    def section_text(start_index, end_index):
-        body_lines = lines[start_index + 1 : end_index]
+    def section_text(start_index, remainder, end_index):
+        body_lines = [remainder] + lines[start_index + 1 : end_index]
         return strip_code_fence("\n".join(body_lines).strip())
 
     if ocr_index < scene_index:
-        ocr_text = section_text(ocr_index, scene_index)
-        scene_text = section_text(scene_index, len(lines))
+        ocr_text = section_text(ocr_index, ocr_remainders[ocr_index], scene_index)
+        scene_text = section_text(scene_index, scene_remainders[scene_index], len(lines))
     else:
-        scene_text = section_text(scene_index, ocr_index)
-        ocr_text = section_text(ocr_index, len(lines))
+        scene_text = section_text(scene_index, scene_remainders[scene_index], ocr_index)
+        ocr_text = section_text(ocr_index, ocr_remainders[ocr_index], len(lines))
 
     if not scene_text:
         return None

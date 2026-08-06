@@ -415,6 +415,75 @@ def test_neither_sentinel_nor_legacy_markers_degrades():
     assert _parse_reply(reply) is None
 
 
+# --- Inline sentinels (P1.10 / issue #38) ------------------------------------
+#
+# A real model reply put the sentinel and its content on the SAME line
+# instead of the sentinel alone on its own line. The old parser required an
+# exact line match, so this good reply (a transcribed TOXIC warning) silently
+# degraded into "could not be understood" instead of reaching the user. The
+# fix accepts a sentinel that STARTS a line (after optional leading
+# whitespace), treating the remainder of that line as the first line of that
+# section - but a sentinel occurring MID-LINE (not at line start) must still
+# be ignored, since that could be photographed text.
+
+
+def test_sentinel_format_inline_content_on_same_line_as_both_sentinels():
+    reply = f"{SENTINEL_OCR} SOME TEXT\n{SENTINEL_SCENE} a label"
+
+    parsed = _parse_reply(reply)
+
+    assert parsed == ("SOME TEXT", "a label")
+
+
+def test_sentinel_format_inline_toxic_warning_reaches_ocr_output():
+    """The live bug report: an inline TOXIC warning must not be discarded."""
+    reply = (
+        f"{SENTINEL_OCR} WARNING: TOXIC. DO NOT INGEST. Contains methanol. "
+        "Keep from children.\n"
+        f"{SENTINEL_SCENE} A white rectangular safety label."
+    )
+
+    parsed = _parse_reply(reply)
+
+    assert parsed is not None
+    ocr_output, scene_context = parsed
+    assert "WARNING: TOXIC" in ocr_output
+    assert "DO NOT INGEST" in ocr_output
+    assert "methanol" in ocr_output
+    assert "Keep from children" in ocr_output
+    assert scene_context == "A white rectangular safety label."
+
+    client = FakeVisionClient(content=reply)
+    result = run_vision("base64data", client)
+    assert "WARNING: TOXIC" in result["ocr_output"]
+
+
+def test_sentinel_format_mixed_one_inline_one_own_line():
+    reply = f"{SENTINEL_OCR} inline text\n{SENTINEL_SCENE}\na room on its own line"
+
+    parsed = _parse_reply(reply)
+
+    assert parsed == ("inline text", "a room on its own line")
+
+
+def test_sentinel_format_mid_line_sentinel_is_not_treated_as_a_delimiter():
+    """A sentinel that does not start a line (e.g. photographed text quoting
+    it) must never be treated as a section delimiter."""
+    reply = (
+        f"{SENTINEL_OCR}\n"
+        f"the label reads {SENTINEL_SCENE} in bold letters\n"
+        f"{SENTINEL_SCENE}\n"
+        "a close-up of printed text"
+    )
+
+    parsed = _parse_reply(reply)
+
+    assert parsed is not None
+    ocr_output, scene_context = parsed
+    assert f"the label reads {SENTINEL_SCENE} in bold letters" in ocr_output
+    assert scene_context == "a close-up of printed text"
+
+
 # --- Client lifecycle (FIX 4) --------------------------------------------------
 
 

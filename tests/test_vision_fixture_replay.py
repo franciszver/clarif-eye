@@ -79,6 +79,12 @@ GROUND_TRUTH_FACTS_BY_FIXTURE = {
         "WRAP TARGET: 19:00",
         "OCR_TEXT: verify props list",
     ],
+    "vision_reply_raw_adversarial.txt": [
+        "WARNING: TOXIC",
+        "DO NOT INGEST",
+        "methanol",
+        "Keep from children",
+    ],
 }
 
 
