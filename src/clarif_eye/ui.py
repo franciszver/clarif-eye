@@ -223,10 +223,25 @@ ladder of free models tried in turn if an earlier one fails or times out:
   check does not currently run on the quick-description path.
 """
 
-# How long the deferred-play shim (see ARIA_LIVE_HEAD below) waits after
-# the audio element gets a src before it calls .play() - long enough for
-# a screen reader to finish speaking the (now short) STATUS_SUCCESS_AUDIO
-# announcement before the audio starts (issue #47 / P5.3).
+# How long handle_submit_staged (below) waits, after yielding the
+# completion status + text WITHOUT the audio path, before yielding again
+# WITH the audio path - long enough for a screen reader to finish speaking
+# the (now short) STATUS_SUCCESS_AUDIO announcement before Gradio mounts
+# the autoplaying player (issue #47 / P5.3).
+#
+# HISTORY: the original #47 fix tried to create this same gap with
+# client-side JS instead - autoplay=False on the gr.Audio component, plus
+# a shim that waited for a "loadeddata" event on the <audio> element
+# before calling .play() itself. That was a dead end: a real-browser check
+# (orchestrator) showed that with autoplay=False, Gradio never assigns the
+# element a src at all - preload="auto" ran, but src stayed absent,
+# readyState was 0, and loadeddata/play/error never fired, so audio never
+# played at all despite the full automated suite passing throughout. The
+# fix restores autoplay=True (see build_interface) - the only thing that
+# makes Gradio assign a source and play it - and creates the gap with
+# ordinary Python instead: handle_submit_staged yields the status and text
+# first, sleeps AUDIO_PLAY_DELAY_MS, then yields the audio path in a
+# second update.
 AUDIO_PLAY_DELAY_MS = 1800
 
 # How long the SAME shim delays a USER-INITIATED play (issue #52 / P5.5) -
@@ -294,32 +309,20 @@ STATUS_DEGRADED = "Finished, but with a limited result. See the text below for d
 # fire elsewhere on the page, instead of re-setting three attributes on
 # every single DOM change.
 #
-# AUDIO SEQUENCING FIX (issue #47 / P5.3, reported from real screen-reader
-# use by the owner): the synthesized audio used to start via
+# AUDIO SEQUENCING (issue #47 / P5.3, reported from real screen-reader use
+# by the owner): the synthesized audio used to start via
 # gr.Audio(autoplay=True) at the exact moment the completion status was
 # still being announced, so a screen reader and the spoken audio talked
-# over each other and neither was intelligible. Two changes, together:
-# (1) STATUS_SUCCESS_AUDIO above is now short, so even a slight overlap is
-# brief; (2) autoplay is turned OFF on the component (see build_interface)
-# and this SAME apply()/MutationObserver pair instead starts playback
-# deliberately, after AUDIO_PLAY_DELAY_MS, once it sees the audio element
-# has a src - option (a) from the three sequencing options considered,
-# chosen because it is the only one that also solves "what if playback
-# can't be started programmatically": the delayed .play() call's rejected
-# promise is swallowed (.catch), and because autoplay is off (not merely
-# short), the <audio> control was never hidden or auto-triggered in the
-# first place, so it remains visible/reachable for the user to press
-# manually either way. The check is STRUCTURAL - whether the <audio>
-# element has a src at all - never a match against the status text, same
-# discipline status_for_result already uses. The `deferredPlaySrc` guard
-# compares against the LAST src this shim scheduled, not just "have we
-# ever scheduled anything", so a new audio src on a later run is still
-# picked up even though Gradio reuses the same DOM node.
-#
-# HONESTY: whether the two voices actually stop colliding for a real
-# screen-reader user can only be confirmed by a human screen-reader pass -
-# see docs/ACCESSIBILITY.md's Known defects entry for #47, which is not
-# marked "confirmed fixed" until the owner re-tests.
+# over each other and neither was intelligible. STATUS_SUCCESS_AUDIO above
+# is short, so even a slight overlap is brief, and the gap itself is no
+# longer created here in JS: two attempts at a client-side shim (waiting
+# for a src to appear, then waiting for a `loadeddata` event) both turned
+# out to depend on Gradio actually assigning the <audio> element a source,
+# which never happens with autoplay=False. Gradio's `autoplay` prop is
+# what causes it to assign a source and play it at all - see
+# AUDIO_PLAY_DELAY_MS's comment above for the full history. autoplay=True
+# again (see build_interface) and the gap comes from handle_submit_staged
+# yielding the status/text before the audio path, sleeping in between.
 #
 # IMAGE LABELLING FIX (issue #48 / P5.4, reported from real screen-reader
 # use by the owner, Narrator on Windows): every image on the page - Gradio's
@@ -373,16 +376,13 @@ STATUS_DEGRADED = "Finished, but with a limited result. See the text below for d
 # is never made at all until the delay elapses, so nothing is heard early.
 # audioEl.pause is left completely untouched, so pausing stays immediate.
 #
-# NO DOUBLE-DELAY: the deferred-AUTOPLAY block below (issue #47) must not
-# route through this same wrapper, or its own automatic .play() call would
-# pick up a SECOND, redundant delay on top of AUDIO_PLAY_DELAY_MS (~2.8s of
-# dead air instead of the intended ~1.8s). It instead calls the captured
-# native play function directly. The wrapper separately tracks, via the
-# a11yAutoplayPending flag, whether that automatic attempt is still
-# in-flight for the current src; if a user gesture arrives during that
-# window, the wrapper skips adding ITS OWN delay on top (the pending
-# autoplay timer already guarantees a gap before sound), rather than
-# stacking a second wait after the first.
+# NO OVERLAP WITH THE AUTOPLAY GAP: the AUDIO_PLAY_DELAY_MS gap (#47) is no
+# longer created by this shim at all - it's now created in Python, before
+# Gradio ever mounts the player (see handle_submit_staged). Native browser
+# autoplay does not go through this wrapped audioEl.play(), so there is
+# nothing here to double-delay; this wrapper only ever affects a JS-
+# initiated call to .play(), i.e. a user pressing the widget's own Play
+# button.
 #
 # HONESTY: same as the rest of this shim, this is machine-verified only -
 # see docs/ACCESSIBILITY.md's Known defects entry for #52, not marked
@@ -426,51 +426,27 @@ ARIA_LIVE_HEAD = f"""
       resultEl.readOnly = true;
       resultEl.setAttribute("tabindex", "0");
     }}
-    // Audio sequencing fix (issue #47 / P5.3): the <audio> element has
-    // autoplay=False (see build_interface), so playback never starts on
-    // its own - start it deliberately, after a delay, once this run
-    // actually produced audio (structural: a src is present at all).
-    const audioEl = document.querySelector("#{AUDIO_ELEM_ID} audio");
     // User-gesture play delay (issue #52 / P5.5) - see the module comment
     // above this shim for the full reasoning. Wrap .play() ONCE per
     // element (guard, same pattern as the other checks in this function)
     // so a click on this control's own Play button - which internally
     // calls this same audioEl.play() - is delayed just like every other
     // caller of it, reusing the SAME observer/apply() pair as the rest of
-    // this function rather than a second one.
+    // this function rather than a second one. Native browser autoplay
+    // (issue #47's gap is now created in Python before Gradio mounts the
+    // player - see AUDIO_PLAY_DELAY_MS's comment) does not go through this
+    // wrapped method, so it is never double-delayed by it.
+    const audioEl = document.querySelector("#{AUDIO_ELEM_ID} audio");
     if (audioEl && !audioEl.dataset.a11yPlayDelayWrapped) {{
       audioEl.dataset.a11yPlayDelayWrapped = "1";
       const nativePlay = audioEl.play.bind(audioEl);
-      audioEl._a11yNativePlay = nativePlay;
       audioEl.play = function () {{
-        // No double-delay: if the automatic-autoplay attempt for this src
-        // is still pending, that timer already guarantees a gap before
-        // sound - don't stack a second USER_PLAY_DELAY_MS on top of it.
-        if (audioEl.dataset.a11yAutoplayPending === "1") {{
-          return nativePlay();
-        }}
         return new Promise((resolve, reject) => {{
           setTimeout(() => {{
             nativePlay().then(resolve, reject);
           }}, {USER_PLAY_DELAY_MS});
         }});
       }};
-    }}
-    if (audioEl && audioEl.src && audioEl.dataset.deferredPlaySrc !== audioEl.src) {{
-      audioEl.dataset.deferredPlaySrc = audioEl.src;
-      audioEl.dataset.a11yAutoplayPending = "1";
-      setTimeout(() => {{
-        audioEl.dataset.a11yAutoplayPending = "0";
-        // Calls the captured NATIVE play directly (not the wrapped
-        // audioEl.play above) so this automatic attempt is never
-        // double-delayed by the user-gesture wrapper.
-        //
-        // If the browser blocks programmatic playback (autoplay policies
-        // vary), swallow the rejection: the control stays visible and
-        // reachable so the user can press play manually instead of the
-        // page throwing a silent, uncaught error.
-        (audioEl._a11yNativePlay || audioEl.play)().catch(() => {{}});
-      }}, {AUDIO_PLAY_DELAY_MS});
     }}
     // Image labelling fix (issue #48 / P5.4) - see the comment above this
     // function for the full reasoning. Guard: `a11yImgDone` marks an image
@@ -717,16 +693,32 @@ def handle_submit_staged(image, resources, pipeline_budget_seconds=DEFAULT_PIPEL
     intermediate progress hook (see graph.py), so there is no real
     per-node progress to report without a larger restructure of the graph
     itself - and inventing fake percentages was explicitly ruled out.
-    Instead this yields twice: once immediately with an honest "received
-    and working, up to about 30 seconds" message (submission-received and
-    still-working collapsed into one announcement, since nothing
-    observable happens between them), then once more when the blocking
-    call returns with the final status/audio/text. A screen reader hears
-    both, in order, via aria-live="polite" on the status control.
+    Instead this yields up to three times: once immediately with an honest
+    "received and working, up to about 30 seconds" message
+    (submission-received and still-working collapsed into one
+    announcement, since nothing observable happens between them); once
+    more when the blocking call returns, with the final status AND
+    description text but NO audio yet, so a screen-reader user can read
+    the answer immediately; and, only when audio was actually produced,
+    once more after a short delay with the SAME status/text plus the audio
+    path, so Gradio only mounts the (autoplaying) player once the
+    completion status has had time to be spoken - see AUDIO_PLAY_DELAY_MS's
+    comment for why this replaced an earlier, broken JS-only attempt at the
+    same gap. A screen reader hears each yield in order via
+    aria-live="polite" on the status control.
     """
     yield STATUS_WORKING, None, ""
     audio_path, text = handle_submit(image, resources, pipeline_budget_seconds)
     status = status_for_result(audio_path, is_chain_exhausted())
+    if not audio_path:
+        yield status, audio_path, text
+        return
+    # Status + text land immediately (screen reader can read the answer
+    # right away); the audio path is withheld for one more beat so
+    # Gradio's autoplaying player doesn't mount over the still-being-
+    # spoken completion announcement.
+    yield status, None, text
+    time.sleep(AUDIO_PLAY_DELAY_MS / 1000)
     yield status, audio_path, text
 
 
@@ -779,11 +771,14 @@ def build_interface(resources):
             elem_id=STATUS_ELEM_ID,
             elem_classes=STATUS_ELEM_CLASSES,
         )
-        # autoplay=False (issue #47 / P5.3): ARIA_LIVE_HEAD's shim starts
-        # playback deliberately, after a delay, instead of the browser
-        # firing it the instant a src is set - see ARIA_LIVE_HEAD's "AUDIO
-        # SEQUENCING FIX" comment for why.
-        audio_output = gr.Audio(label="Spoken description", autoplay=False, elem_id=AUDIO_ELEM_ID)
+        # autoplay=True (issue #47 / P5.3): Gradio only assigns the <audio>
+        # element a source at all when autoplay is on - with it off, no
+        # src is ever set and playback can never start by any means (see
+        # AUDIO_PLAY_DELAY_MS's comment for how that was diagnosed). The
+        # gap between the completion announcement and audio starting is
+        # created instead by handle_submit_staged withholding the audio
+        # path for one extra yield, not by JS here.
+        audio_output = gr.Audio(label="Spoken description", autoplay=True, elem_id=AUDIO_ELEM_ID)
         text_output = gr.Textbox(label="Description (text)", lines=6, elem_id=RESULT_ELEM_ID)
 
         # issue #49 / P4.3: placed AFTER the result area (never before it),
