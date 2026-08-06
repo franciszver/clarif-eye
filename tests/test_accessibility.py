@@ -850,3 +850,149 @@ def test_how_it_works_is_not_mistaken_for_an_interactive_control():
         assert not isinstance(section, (gr.Image, gr.Button, gr.Audio, gr.Textbox))
     finally:
         demo.close()
+
+
+# --- P4.4 / issue #56: an accessible diagram for "How this works" ----------
+#
+# The owner asked for a graphic after #48 was fixed (P4.3 deliberately
+# shipped text only, since an unlabelled diagram would have announced as a
+# bare "graphic" - see the section above). This adds an inline SVG diagram
+# of the pipeline, alongside (never instead of) the existing ordered list.
+#
+# THE TRAP THIS GUARDS AGAINST: ARIA_LIVE_HEAD's image-labelling pass
+# (issue #48) marks every img/svg/[role="img"] it finds as aria-hidden
+# UNLESS it is structurally exempted, the same way #photo-input's uploaded-
+# photo <img> is exempted. A new diagram added without an equivalent,
+# structural (id/container-based, never string/content-matched) exemption
+# would be silenced by our own code.
+#
+# STATIC/SOURCE-LEVEL CHECK ONLY (same discipline as the rest of this
+# file): whether the diagram actually announces correctly can only be
+# confirmed in a real accessibility tree - that is the orchestrator's job,
+# not this suite's.
+#
+# RED-FIRST: written to FAIL against pre-#56 ui.py, which has no diagram at
+# all.
+
+
+def test_pipeline_diagram_exists_with_role_img_and_a_nonempty_label():
+    from clarif_eye.ui import DIAGRAM_ELEM_ID, PIPELINE_DIAGRAM_LABEL
+
+    assert PIPELINE_DIAGRAM_LABEL
+
+    resources = _resources(FakeGraph())
+    demo = build_interface(resources)
+    try:
+        matches = [c for c in _components(demo) if getattr(c, "elem_id", None) == DIAGRAM_ELEM_ID]
+        assert len(matches) == 1
+        diagram = matches[0]
+        assert isinstance(diagram, gr.HTML)
+        html_value = diagram.value if isinstance(diagram.value, str) else ""
+        assert "<svg" in html_value.lower()
+        assert 'role="img"' in html_value
+        assert f'aria-label="{PIPELINE_DIAGRAM_LABEL}"' in html_value
+    finally:
+        demo.close()
+
+
+def test_pipeline_diagram_has_an_associated_text_description():
+    from clarif_eye.ui import DIAGRAM_DESC_ELEM_ID, PIPELINE_DIAGRAM_DESCRIPTION
+
+    assert PIPELINE_DIAGRAM_DESCRIPTION
+
+    resources = _resources(FakeGraph())
+    demo = build_interface(resources)
+    try:
+        diagram = next(c for c in _components(demo) if getattr(c, "elem_id", None) == DIAGRAM_ELEM_ID)
+        html_value = diagram.value
+        assert f'aria-describedby="{DIAGRAM_DESC_ELEM_ID}"' in html_value
+        assert f'id="{DIAGRAM_DESC_ELEM_ID}"' in html_value
+        assert PIPELINE_DIAGRAM_DESCRIPTION in html_value
+    finally:
+        demo.close()
+
+
+def test_pipeline_diagram_content_matches_graph_py_as_built():
+    # graph.py's build_graph(): vision -> dynamic_router (a locally-
+    # evaluated conditional edge on complexity_flag) -> fast_synth, OR
+    # research -> analysis -> tts. No "router" node exists (dynamic_router
+    # is a plain conditional edge function, not a registered node) and no
+    # invented node should appear either.
+    from clarif_eye.ui import PIPELINE_DIAGRAM_DESCRIPTION
+
+    resources = _resources(FakeGraph())
+    demo = build_interface(resources)
+    try:
+        diagram = next(c for c in _components(demo) if getattr(c, "elem_id", None) == "how-it-works-diagram")
+        html_value = diagram.value
+        for term in ("Vision", "fast", "Research", "Analysis", "speech"):
+            assert term.lower() in html_value.lower(), f"{term!r} missing from diagram markup"
+        assert "complexity" in (html_value + PIPELINE_DIAGRAM_DESCRIPTION).lower()
+    finally:
+        demo.close()
+
+
+def test_silencing_pass_exempts_the_diagram_structurally_by_container():
+    # The #48 image-labelling pass in ARIA_LIVE_HEAD must exempt the
+    # diagram the SAME way it already exempts the uploaded-photo <img>: by
+    # checking whether the element lives inside the diagram's own
+    # container (DIAGRAM_ELEM_ID), via .closest(), never by matching a
+    # string/class name on the SVG's content or aria-label text.
+    from clarif_eye.ui import DIAGRAM_ELEM_ID, PIPELINE_DIAGRAM_LABEL
+
+    assert f'closest("#{DIAGRAM_ELEM_ID}")' in ARIA_LIVE_HEAD or f"closest('#{DIAGRAM_ELEM_ID}')" in ARIA_LIVE_HEAD
+    # The exemption must not be a content/string match against the label or
+    # description text - that would be the exact anti-pattern the issue
+    # warns against.
+    assert PIPELINE_DIAGRAM_LABEL not in ARIA_LIVE_HEAD
+
+    # And the exempted element must NOT end up marked aria-hidden by this
+    # same pass: reuses the existing guard/dataset pattern, so this is a
+    # single combined "is this meaningful" branch, not a second observer or
+    # a second pass.
+    assert ARIA_LIVE_HEAD.count("MutationObserver") == 1
+
+
+def test_diagram_does_not_introduce_a_second_mutation_observer():
+    assert ARIA_LIVE_HEAD.count("MutationObserver") == 1
+
+
+def test_diagram_introduces_no_positive_tabindex():
+    injected = ARIA_LIVE_HEAD + FOCUS_RESULT_JS
+    for value in re.findall(r'tabindex["\'\s:=,]+["\']?(\d+)', injected, re.IGNORECASE):
+        assert int(value) == 0, f"positive tabindex found: {value}"
+
+    resources = _resources(FakeGraph())
+    demo = build_interface(resources)
+    try:
+        diagram = next(c for c in _components(demo) if getattr(c, "elem_id", None) == "how-it-works-diagram")
+        # A non-interactive image should not be a tab stop at all - not
+        # tabindex="0" either. No tabindex attribute should be present on
+        # the svg itself.
+        assert "tabindex" not in diagram.value.lower()
+    finally:
+        demo.close()
+
+
+def test_ordered_list_is_still_present_alongside_the_diagram():
+    # The diagram is additive - the ordered list remains the accessible
+    # source of truth (a listener gets the list; a sighted reader gets
+    # both). This must keep passing exactly like
+    # test_how_it_works_introduces_no_unlabelled_image above: the list
+    # itself never becomes an image.
+    from clarif_eye.ui import HOW_IT_WORKS_ELEM_ID, HOW_IT_WORKS_MARKDOWN
+
+    assert "1. You take or upload a photo." in HOW_IT_WORKS_MARKDOWN
+    assert "![" not in HOW_IT_WORKS_MARKDOWN
+    assert "<svg" not in HOW_IT_WORKS_MARKDOWN.lower()
+
+    resources = _resources(FakeGraph())
+    demo = build_interface(resources)
+    try:
+        components = _components(demo)
+        how_it_works = next(c for c in components if getattr(c, "elem_id", None) == HOW_IT_WORKS_ELEM_ID)
+        diagram = next(c for c in components if getattr(c, "elem_id", None) == "how-it-works-diagram")
+        assert isinstance(how_it_works, gr.Markdown)
+        assert isinstance(diagram, gr.HTML)
+    finally:
+        demo.close()
