@@ -51,7 +51,26 @@ from clarif_eye.vision import is_degraded_scene
 # failure this node exists to avoid. ocr_output is NOT capped: it is the
 # primary evidence the anti-hallucination check below verifies numbers
 # against, so cutting it would remove genuine facts, not just noise.
-_SCRAPER_DATA_CAP = 4000
+#
+# DEFAULT (issue #17 / P6.1): an earlier single-sample probe of this exact
+# node reported 4000 chars of scraped context costing 82.6s vs 7.6s with
+# none, which looked like a latency effect - but a proper n=5 sweep
+# (median of 5 runs per configuration, scripts/benchmark_pipeline.py,
+# accuracy scored with the production verifier) found NO reliable latency
+# difference between cap=0 (median 30.6s), cap=1000 (median 20.9s) and
+# cap=4000 (median 23.7s): min/max spans 19-60s across all three, i.e.
+# free-tier queue noise dominates and the earlier 82.6s-vs-7.6s reading was
+# a single-sample queue spike, not causation. Accuracy was verified 5/5 at
+# every cap tested, including cap=0. The cap is kept at 1000 anyway (and
+# kept fully overridable - see `scraper_data_cap` below and
+# config["configurable"]["scraper_data_cap"] in graph.py) because it bounds
+# prompt size and token usage on a rate-limited free tier, not because it
+# was shown to save time. Whether the research path (the extra scrape,
+# the analysis node) earns its cost at all versus the fast path is still
+# open - the sweep so far covers one document type and one image - and is
+# left to a future evaluation; this comment is not a claim either way on
+# that question.
+_SCRAPER_DATA_CAP = 1000
 
 # Number-like tokens (amounts, dates-as-digits, identifiers) that a spoken
 # script must be able to trace back to the source material. Deliberately
@@ -150,20 +169,23 @@ def _default_client():
     return OpenRouterClient()
 
 
-def _cap_scraper_data(scraper_data):
-    """Truncate scraper_data to _SCRAPER_DATA_CAP chars at a word boundary.
+def _cap_scraper_data(scraper_data, cap=_SCRAPER_DATA_CAP):
+    """Truncate scraper_data to `cap` chars at a word boundary.
 
     A silent cut mid-word (or, worse, mid-number) looks like real evidence;
     the "[context truncated]" marker instead makes it visible in the prompt
-    body that this isn't the whole scrape.
+    body that this isn't the whole scrape. `cap` defaults to
+    _SCRAPER_DATA_CAP but is overridable (issue #17 / P6.1) so the caller
+    (run_analysis, or scripts/benchmark_pipeline.py directly) can control
+    it without a code change.
     """
-    if len(scraper_data) <= _SCRAPER_DATA_CAP:
+    if len(scraper_data) <= cap:
         return scraper_data
-    truncated = scraper_data[:_SCRAPER_DATA_CAP].rsplit(" ", 1)[0]
+    truncated = scraper_data[:cap].rsplit(" ", 1)[0]
     return f"{truncated} [context truncated]"
 
 
-def _build_messages(ocr_output, scene_context, scraper_data):
+def _build_messages(ocr_output, scene_context, scraper_data, cap=_SCRAPER_DATA_CAP):
     if ocr_output:
         body = (
             f"Text found in the photo:\n{fence_untrusted(ocr_output)}"
@@ -172,7 +194,7 @@ def _build_messages(ocr_output, scene_context, scraper_data):
     else:
         body = f"No text was found in the photo.\n\nScene description: {scene_context}"
     if scraper_data:
-        capped = _cap_scraper_data(scraper_data)
+        capped = _cap_scraper_data(scraper_data, cap)
         body += f"\n\nAdditional context from a web lookup:\n{fence_untrusted(capped)}"
     return [{"role": "user", "content": [{"type": "text", "text": f"{ANALYSIS_PROMPT}\n\n{body}"}]}]
 
@@ -181,7 +203,24 @@ def _degraded(message):
     return {"final_output": _to_spoken_text(message)}
 
 
-def run_analysis(ocr_output, scene_context, scraper_data, client=None):
+def _degrade_from_known(ocr_output, scene_context):
+    """Build final_output directly from ocr_output/scene_context, no brain
+    model call - used when the pipeline's total deadline (graph.py) is
+    already exhausted by the time this node runs. Deliberately excludes
+    scraper_data: it is unverified web text that _numbers_verified never
+    gets a chance to check here, and reading it aloud unfiltered would be
+    exactly the "invented-sounding" risk this module's docstring calls out
+    ("THE CENTRAL RISK"). ocr_output/scene_context are the photographed
+    document's own captured text - real, known state, not a guess - the
+    same "degrade to what is known" pattern synth._degrade_from_known
+    uses.
+    """
+    if ocr_output.strip():
+        return _degraded(f"{scene_context} The following text was found in the photo: {ocr_output}")
+    return _degraded(scene_context)
+
+
+def run_analysis(ocr_output, scene_context, scraper_data, client=None, scraper_data_cap=None, deadline_exceeded=False):
     """Call the brain ladder to turn (ocr_output, scene_context, scraper_data) into final_output.
 
     `client` is injectable (tests pass a fake); when omitted, a real
@@ -190,10 +229,23 @@ def run_analysis(ocr_output, scene_context, scraper_data, client=None):
     is owned by the caller and is never closed here. Mirrors
     synth.run_fast_synth's structure exactly, with role "brain" instead of
     "eyes" and scraper_data folded into the request.
+
+    `scraper_data_cap` (issue #17 / P6.1): overrides _SCRAPER_DATA_CAP for
+    this call when given (graph.py reads it from
+    config["configurable"]["scraper_data_cap"]); None keeps the module
+    default.
+
+    `deadline_exceeded`: True means the pipeline's total budget is already
+    spent by the time this node runs (checked by graph.py at node entry).
+    ocr_output/scene_context are already known at this point (vision, and
+    possibly research, already ran), so the brain call is skipped and
+    final_output is built straight from them instead - see
+    _degrade_from_known.
     """
     ocr_output = ocr_output or ""
     scene_context = scene_context or ""
     scraper_data = scraper_data or ""
+    cap = scraper_data_cap if scraper_data_cap is not None else _SCRAPER_DATA_CAP
 
     if is_degraded_scene(scene_context):
         # Same deliberate choice as synth.py (FIX 8b): a vision failure
@@ -210,6 +262,9 @@ def run_analysis(ocr_output, scene_context, scraper_data, client=None):
     if not scene_context.strip():
         return _degraded("No description is available for this photo.")
 
+    if deadline_exceeded:
+        return _degrade_from_known(ocr_output, scene_context)
+
     owns_client = client is None
     if owns_client:
         try:
@@ -222,7 +277,7 @@ def run_analysis(ocr_output, scene_context, scraper_data, client=None):
             )
     try:
         try:
-            result = client.complete("brain", _build_messages(ocr_output, scene_context, scraper_data))
+            result = client.complete("brain", _build_messages(ocr_output, scene_context, scraper_data, cap))
         except LadderExhaustedError:
             return _degraded(
                 "The spoken description could not be prepared right now: "

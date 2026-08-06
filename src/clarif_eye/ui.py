@@ -41,10 +41,11 @@ discipline vision.is_degraded_scene already established.
 
 import base64
 import io
+import time
 from dataclasses import dataclass
 
 from clarif_eye.client import OpenRouterClient, OpenRouterError
-from clarif_eye.graph import build_graph
+from clarif_eye.graph import DEFAULT_PIPELINE_BUDGET_SECONDS, build_graph
 from clarif_eye.state import make_initial_state
 from clarif_eye.tts import DEFAULT_PROVIDER_CHAIN, is_chain_exhausted
 
@@ -142,7 +143,7 @@ def _encode_image(image):
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def handle_submit(image, resources):
+def handle_submit(image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUDGET_SECONDS):
     """Run one photo through the graph; return (audio_path_or_None, text).
 
     NEVER raises (except KeyboardInterrupt/SystemExit) - every failure
@@ -150,6 +151,15 @@ def handle_submit(image, resources):
     `resources` is an AppResources built once by build_resources() and
     passed through unchanged on every call, so the shared client/provider
     chain/searcher are injected identically on every request.
+
+    `pipeline_budget_seconds` (issue #17 / P6.1) sets the total-pipeline
+    deadline (see clarif_eye.graph's module docstring "Total-pipeline
+    deadline"): an absolute time.monotonic() timestamp computed fresh for
+    THIS request, `time.monotonic() + pipeline_budget_seconds`, and passed
+    through config["configurable"]["deadline"] - never a shared/reused
+    value, since each request needs its own clock start. Defaults to
+    graph.DEFAULT_PIPELINE_BUDGET_SECONDS but is overridable per call
+    (e.g. by scripts/benchmark_pipeline.py sweeping it).
     """
     if image is None:
         return None, NO_IMAGE_MESSAGE
@@ -170,6 +180,7 @@ def handle_submit(image, resources):
                 "tts_providers": resources.tts_providers,
                 "searcher": resources.searcher,
                 "research_client": resources.research_client,
+                "deadline": time.monotonic() + pipeline_budget_seconds,
             }
         }
         result = resources.graph.invoke(state, config=config)

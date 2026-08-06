@@ -251,6 +251,10 @@ DEGRADED_UNEXPECTED_ERROR = (
 )
 DEGRADED_EMPTY_REPLY = "The vision model returned an empty response."
 DEGRADED_UNPARSEABLE_REPLY = "The vision model's response could not be understood."
+DEGRADED_DEADLINE_EXCEEDED = (
+    "The photo could not be described in time, so nothing could be read "
+    "from it yet. Please try again."
+)
 
 
 def is_degraded_scene(text):
@@ -270,6 +274,7 @@ def is_degraded_scene(text):
         DEGRADED_UNEXPECTED_ERROR,
         DEGRADED_EMPTY_REPLY,
         DEGRADED_UNPARSEABLE_REPLY,
+        DEGRADED_DEADLINE_EXCEEDED,
     )
 
 
@@ -285,7 +290,7 @@ def _degraded(message):
     }
 
 
-def run_vision(image_data, client=None):
+def run_vision(image_data, client=None, deadline_exceeded=False):
     """Call the eyes ladder for `image_data` and return a vision_node state update.
 
     `client` is injectable (tests pass a fake); when omitted, a real
@@ -295,7 +300,17 @@ def run_vision(image_data, client=None):
     here (not injected) is closed in a `finally` before returning, so its
     httpx connection pool doesn't leak; an injected client is owned by the
     caller and is never closed here.
+
+    `deadline_exceeded` (issue #17 / P6.1): True means the pipeline's total
+    budget (checked by graph.py at node entry, see its module docstring)
+    is already spent. Vision is the FIRST node, so there is no "known
+    state" to build from yet - the model call is skipped entirely (not
+    even a client is constructed) and this degrades exactly like any other
+    vision failure, routing to the fast path with complexity_flag=False.
     """
+    if deadline_exceeded:
+        return _degraded(DEGRADED_DEADLINE_EXCEEDED)
+
     owns_client = client is None
     if owns_client:
         try:
