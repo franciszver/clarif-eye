@@ -49,17 +49,19 @@ from clarif_eye.vision import run_vision
 # "deadline" key means unbounded, i.e. today's behavior unchanged (every
 # pre-existing caller/test that never sets one).
 #
-# DEFAULT justification: 60.0s. Generous enough for the typical fast path
-# (vision ~5s + fast_synth ~5s + tts ~2s, per the #17 live measurement) and
-# the typical research path with a reduced scraper cap (vision ~5s +
-# research ~2-3s + analysis ~8s without a large scrape + tts ~2s), while
-# still meaningfully tighter than the worst-case sum of the per-role
-# ceilings alone (eyes 30s + brain 45s = 75s, before research/tts are even
-# counted) - a run that is actually stuck in ladder failover gets cut off
-# and degrades rather than running past a minute, closing exactly the gap
-# the #17 measurement (99.0s) exposed. Provisional, like the scraper cap
-# in analysis.py - the orchestrator can retune it after running
-# scripts/benchmark_pipeline.py.
+# DEFAULT justification: 60.0s. Measured research-path medians are ~21-31s
+# depending on scraper configuration, with an observed maximum of 60.3s
+# across runs (n=5 per config, scripts/benchmark_pipeline.py). The 99.0s
+# from #17 was a single-run outlier from a live UI session, not typical
+# behavior. The deadline's real structural purpose: per-role ceilings
+# (eyes 30s + brain 45s) bound individual model calls, but nothing bounded
+# a whole-pipeline run until this mechanism - the tail was theoretically
+# unbounded. The 60s default knowingly fires on roughly 1 in 15 measured
+# runs, gracefully degrading otherwise-fine-but-slow runs rather than
+# allowing latency to exceed 75s+. This is deliberate: a user who cannot
+# see a spinner is better served by degraded speech at 60s than by full
+# quality at 75s or beyond. Provisional, like the scraper cap in analysis.py
+# - retune via scripts/benchmark_pipeline.py.
 DEFAULT_PIPELINE_BUDGET_SECONDS = 60.0
 
 
