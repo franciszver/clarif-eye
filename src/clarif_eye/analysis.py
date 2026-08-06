@@ -52,21 +52,24 @@ from clarif_eye.vision import is_degraded_scene
 # primary evidence the anti-hallucination check below verifies numbers
 # against, so cutting it would remove genuine facts, not just noise.
 #
-# PROVISIONAL DEFAULT (issue #17 / P6.1): the original 4000-char default
-# was picked without measurement. A live measurement of this exact node
-# found 4000 chars of scraped context taking 82.6s vs 7.6s with none, for
-# near-identical output (396 vs 410 chars) - the extra context was barely
-# changing the answer but massively inflating latency. A same-issue
-# free-tier sweep (noisy, single samples, NOT trustworthy on its own - see
-# scripts/benchmark_pipeline.py's module docstring) saw cap=1000 come back
-# in 12.7s vs cap=500 at 53.4s, which is queue noise, not evidence that
-# smaller is always faster. Given that noise, this value is lowered from
-# 4000 to 1000 as a provisional, conservative default - closer to the one
-# data point that was both fast and cheap - not a tuned constant. It is
-# also now fully overridable (see `scraper_data_cap` below and
-# config["configurable"]["scraper_data_cap"] in graph.py), specifically so
-# scripts/benchmark_pipeline.py can sweep it with n>=5 samples and let the
-# orchestrator set a properly measured value afterwards.
+# DEFAULT (issue #17 / P6.1): an earlier single-sample probe of this exact
+# node reported 4000 chars of scraped context costing 82.6s vs 7.6s with
+# none, which looked like a latency effect - but a proper n=5 sweep
+# (median of 5 runs per configuration, scripts/benchmark_pipeline.py,
+# accuracy scored with the production verifier) found NO reliable latency
+# difference between cap=0 (median 30.6s), cap=1000 (median 20.9s) and
+# cap=4000 (median 23.7s): min/max spans 19-60s across all three, i.e.
+# free-tier queue noise dominates and the earlier 82.6s-vs-7.6s reading was
+# a single-sample queue spike, not causation. Accuracy was verified 5/5 at
+# every cap tested, including cap=0. The cap is kept at 1000 anyway (and
+# kept fully overridable - see `scraper_data_cap` below and
+# config["configurable"]["scraper_data_cap"] in graph.py) because it bounds
+# prompt size and token usage on a rate-limited free tier, not because it
+# was shown to save time. Whether the research path (the extra scrape,
+# the analysis node) earns its cost at all versus the fast path is still
+# open - the sweep so far covers one document type and one image - and is
+# left to a future evaluation; this comment is not a claim either way on
+# that question.
 _SCRAPER_DATA_CAP = 1000
 
 # Number-like tokens (amounts, dates-as-digits, identifiers) that a spoken

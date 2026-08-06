@@ -11,6 +11,16 @@ scraper-cap=500 come back slower (53.4s) than scraper-cap=1000 (12.7s),
 which is noise, not a real relationship between cap size and latency.
 Single samples proved nothing then and prove nothing here either.
 
+A follow-up n=5 sweep (median of 5 runs per configuration, this script,
+production verifier) confirmed exactly that: the 99.0s figure was an
+OUTLIER, not a typical run - the measured median for the research path is
+~21-31s across cap=0/1000/4000 (min/max spans 19-60s, queue noise
+dominates), and accuracy was verified 5/5 at every cap tested, including
+cap=0. See analysis.py's _SCRAPER_DATA_CAP comment for the corrected
+justification. The lesson from the single-sample era stands regardless:
+single samples against this noisy free-tier backend prove nothing -
+always sweep n>=5 and report median/min/max.
+
 This script exists so that question can be answered properly: it drives
 the REAL compiled graph (clarif_eye.graph.build_graph()) end to end -
 real OpenRouter calls for vision/fast_synth/analysis, a real DuckDuckGo
@@ -56,10 +66,13 @@ PER-STAGE TIMING
 config["configurable"]["trace"] is normally just a list of node-name
 strings (see graph._record) - a caller only appends to it, never reads
 its shape, so subclassing list to also stamp time.monotonic() on every
-append is a drop-in fit for that seam, not a change to graph.py. Stage
-duration is the gap between consecutive timestamps (and between graph
-start and the first one), giving vision/research/analysis/fast_synth/tts
-timings from a single instrumented run, not separate re-runs.
+append is a drop-in fit for that seam, not a change to graph.py. graph.
+_record is called at each node's ENTRY, so a trace timestamp marks WHEN a
+node started, not when it finished - stage duration is therefore the gap
+until the NEXT node's timestamp (or, for the last node, until `end`, the
+wall-clock moment right after graph.invoke returns), giving
+vision/research/analysis/fast_synth/tts timings from a single
+instrumented run, not separate re-runs.
 
 Usage:
     OPENROUTER_API_KEY=... python scripts/benchmark_pipeline.py \\
@@ -109,22 +122,23 @@ class RunResult:
     deadline_hit: bool = False
 
 
-def _stage_durations(trace, start, end):
+def _stage_durations(trace, end):
     """Turn a TimestampedTrace into {node_name: duration_seconds}.
 
-    Each node's duration is the gap since the PREVIOUS timestamp (or
-    `start`, the moment right before graph.invoke was called, for the
-    first node) - not wall-clock-since-start, so stages are additive and
-    sum to `end - start`.
+    graph._record(config, name) stamps a node's timestamp at ENTRY (see
+    graph.py), i.e. trace[i] is WHEN node i started, not when it finished.
+    So the time node i actually spent is the gap until the NEXT timestamp -
+    trace[i+1] for all but the last node, and `end` (the wall-clock moment
+    right after graph.invoke returned, passed in by the caller) for the
+    last one - not the gap since the previous timestamp, which attributes
+    each node's own duration to whichever node runs after it (e.g. tts's
+    duration would otherwise never be measured at all, since nothing is
+    recorded after it starts).
     """
     durations = {}
-    previous = start
-    for node_name, timestamp in trace:
-        durations[node_name] = timestamp - previous
-        previous = timestamp
-    # Whatever time elapsed after the last recorded node (e.g. LangGraph's
-    # own bookkeeping) is folded into total_s implicitly via `end`, not
-    # attributed to any single stage here.
+    for i, (node_name, timestamp) in enumerate(trace):
+        next_timestamp = trace[i + 1][1] if i + 1 < len(trace) else end
+        durations[node_name] = next_timestamp - timestamp
     return durations
 
 
@@ -188,7 +202,7 @@ def run_once(graph, image_b64, *, label, run_index, client, searcher, research_c
         label=label,
         run_index=run_index,
         total_s=end - start,
-        stage_s=_stage_durations(trace, start, end),
+        stage_s=_stage_durations(trace, end),
         verified=verified,
         final_output_len=len(result.get("final_output", "")),
         deadline_hit=time.monotonic() >= configurable["deadline"],
