@@ -17,6 +17,7 @@ only thing that can be wrong with an entry.
 
 import tomllib
 from importlib import resources
+from pathlib import Path
 from types import MappingProxyType
 
 ROLES = ("eyes", "brain")
@@ -31,8 +32,8 @@ def _validate_ladders(ladders):
 
     Shared by ModelRegistry.__init__ and load_registry so the D10 free-only
     policy (and the other ladder rules) can't be bypassed by constructing a
-    ModelRegistry directly. Expects each ladder to already be a tuple (TOML
-    list-shape checks are the caller's responsibility).
+    ModelRegistry directly. Accepts each ladder as a list or tuple and
+    coerces it to a tuple.
     """
     cleaned_ladders = {}
     for role in ROLES:
@@ -40,8 +41,9 @@ def _validate_ladders(ladders):
             raise RegistryError(f"model config is missing required role section [{role}]")
 
         raw_ladder = ladders[role]
-        if not isinstance(raw_ladder, tuple):
-            raise RegistryError(f"role {role!r} must have a 'ladder' that is a list of model IDs")
+        if not isinstance(raw_ladder, (list, tuple)):
+            raise RegistryError(f"role {role!r} must have a 'ladder' that is a list or tuple of model IDs")
+        raw_ladder = tuple(raw_ladder)
 
         if len(raw_ladder) == 0:
             raise RegistryError(f"role {role!r} has an empty ladder; at least one model ID is required")
@@ -80,8 +82,13 @@ def _validate_ladders(ladders):
 class ModelRegistry:
     """Holds validated, ordered model ladders for each role."""
 
+    __slots__ = ("_ladders",)
+
     def __init__(self, ladders):
-        self._ladders = MappingProxyType(_validate_ladders(ladders))
+        object.__setattr__(self, "_ladders", MappingProxyType(_validate_ladders(ladders)))
+
+    def __setattr__(self, name, value):
+        raise RegistryError(f"ModelRegistry is immutable; cannot set {name!r}")
 
     def ladder(self, role):
         """Return the ordered, immutable ladder of model IDs for a role."""
@@ -99,24 +106,16 @@ def load_registry(path=None):
     importlib.resources so it works identically editable and installed),
     never relative to the current working directory.
     """
-    if path is not None:
-        config_path = path
-        try:
-            with open(config_path, "rb") as f:
-                data = tomllib.load(f)
-        except FileNotFoundError as e:
-            raise RegistryError(f"model config file not found: {config_path}") from e
-        except tomllib.TOMLDecodeError as e:
-            raise RegistryError(f"model config file is not valid TOML: {config_path}") from e
-    else:
-        traversable = resources.files("clarif_eye").joinpath("config", "models.toml")
-        try:
-            with traversable.open("rb") as f:
-                data = tomllib.load(f)
-        except FileNotFoundError as e:
-            raise RegistryError(f"model config file not found: {traversable}") from e
-        except tomllib.TOMLDecodeError as e:
-            raise RegistryError(f"model config file is not valid TOML: {traversable}") from e
+    source = Path(path) if path is not None else resources.files("clarif_eye").joinpath("config", "models.toml")
+    try:
+        with source.open("rb") as f:
+            data = tomllib.load(f)
+    except FileNotFoundError as e:
+        raise RegistryError(f"model config file not found: {source}") from e
+    except tomllib.TOMLDecodeError as e:
+        raise RegistryError(f"model config file is not valid TOML: {source}") from e
+    except OSError as e:
+        raise RegistryError(f"could not read model config file: {source}") from e
 
     raw_ladders = {}
     for role in ROLES:

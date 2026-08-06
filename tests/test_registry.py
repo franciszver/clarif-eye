@@ -219,6 +219,44 @@ def test_ladders_mapping_cannot_be_mutated():
         registry._ladders["eyes"] = ("paid-model",)
 
 
+def test_ladders_attribute_cannot_be_rebound():
+    registry = load_registry()
+    with pytest.raises(RegistryError):
+        registry._ladders = {"eyes": ("paid/model-not-free",), "brain": ("paid/y:free",)}
+
+    # The original, validated ladder must still be in effect.
+    assert registry.ladder("eyes") == (
+        "google/gemma-4-26b-a4b-it:free",
+        "nvidia/nemotron-nano-12b-v2-vl:free",
+        "google/gemma-4-31b-it:free",
+    )
+
+
+# --- Direct construction: list ladders accepted, other shapes rejected ----
+
+
+def test_direct_construction_with_list_ladders_succeeds():
+    registry = ModelRegistry({"eyes": ["a/model:free"], "brain": ["b/model:free"]})
+
+    assert registry.ladder("eyes") == ("a/model:free",)
+    assert registry.ladder("brain") == ("b/model:free",)
+
+
+def test_direct_construction_with_set_ladder_raises():
+    with pytest.raises(RegistryError, match="eyes"):
+        ModelRegistry({"eyes": {"a/model:free"}, "brain": ("b/model:free",)})
+
+
+def test_direct_construction_with_generator_ladder_raises():
+    with pytest.raises(RegistryError, match="eyes"):
+        ModelRegistry({"eyes": (x for x in ["a/model:free"]), "brain": ("b/model:free",)})
+
+
+def test_direct_construction_with_string_ladder_raises():
+    with pytest.raises(RegistryError, match="eyes"):
+        ModelRegistry({"eyes": "a/model:free", "brain": ("b/model:free",)})
+
+
 # --- Validation: whitespace in entries -------------------------------------
 
 
@@ -265,3 +303,8 @@ def test_malformed_toml_raises_registry_error(tmp_path):
     path = write_config(tmp_path, "this is not [valid toml")
     with pytest.raises(RegistryError):
         load_registry(path)
+
+
+def test_directory_as_path_raises_registry_error(tmp_path):
+    with pytest.raises(RegistryError):
+        load_registry(tmp_path)
