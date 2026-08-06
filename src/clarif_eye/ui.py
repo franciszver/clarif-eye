@@ -102,6 +102,26 @@ UPLOADED_PHOTO_ALT = "The photo you submitted"
 # announcement before the audio starts (issue #47 / P5.3).
 AUDIO_PLAY_DELAY_MS = 1800
 
+# How long the SAME shim delays a USER-INITIATED play (issue #52 / P5.5) -
+# a different collision from AUDIO_PLAY_DELAY_MS above:
+#   - AUDIO_PLAY_DELAY_MS (#47) is this APP's OWN status announcement vs
+#     AUTOMATIC playback. The app controls both sides, so it can afford a
+#     longer, deliberately-chosen gap (1800ms) tuned against the wording of
+#     STATUS_SUCCESS_AUDIO.
+#   - USER_PLAY_DELAY_MS (#52) is the SCREEN READER'S OWN announcement of
+#     the Play control being activated (its name, and/or the state change
+#     to "Pause") vs playback the user just started by pressing it. This
+#     app neither controls nor can suppress that announcement - and per
+#     the issue, must NOT try to detect whether a screen reader is even
+#     running (no reliable heuristic exists, and a wrong guess is worse
+#     than a small fixed delay for everyone). A short, fixed delay is
+#     tolerable for every user: sighted users experience it as an
+#     imperceptibly late button response (well under the ~1s where a UI
+#     starts to feel unresponsive), while it reliably closes the window
+#     the collision is reported in. Chosen mid-range within the ~0.8-1.2s
+#     the issue calls for.
+USER_PLAY_DELAY_MS = 1000
+
 STATUS_IDLE = 'Ready. Choose or take a photo, then activate "Describe this photo".'
 STATUS_WORKING = (
     "Photo received. Describing it now; this can take up to about 30 seconds."
@@ -205,6 +225,42 @@ STATUS_DEGRADED = "Finished, but with a limited result. See the text below for d
 # see docs/ACCESSIBILITY.md's Known defects entry for #48, not marked
 # "confirmed fixed" until a human screen-reader pass confirms it.
 #
+# USER-GESTURE PLAY COLLISION FIX (issue #52 / P5.5, reported from real
+# screen-reader use by the owner, Narrator on Windows): pressing the audio
+# widget's own Play control (to replay, or because the browser blocked the
+# automatic attempt above) makes the screen reader announce the control's
+# activation/state change at the exact same instant this shim used to call
+# .play() - so the opening seconds of the description, often the most
+# important part, were lost under that announcement. Distinct from #47:
+# #47 was this app's OWN status text colliding with AUTOMATIC playback;
+# this is the SCREEN READER'S OWN announcement (which this app cannot
+# detect or suppress - see USER_PLAY_DELAY_MS's comment on why detecting a
+# screen reader isn't attempted) colliding with a USER GESTURE.
+#
+# FIX: audioEl.play is wrapped ONCE (guarded by a11yPlayDelayWrapped, same
+# guard discipline as the rest of apply()) so that ANY call to it - in
+# particular the one Gradio's own Play button makes internally when
+# clicked - goes through a setTimeout of USER_PLAY_DELAY_MS before the
+# real (native) play() actually runs. This is NOT "start playback then
+# pause/resume it" (a stutter, explicitly ruled out): the real play() call
+# is never made at all until the delay elapses, so nothing is heard early.
+# audioEl.pause is left completely untouched, so pausing stays immediate.
+#
+# NO DOUBLE-DELAY: the deferred-AUTOPLAY block below (issue #47) must not
+# route through this same wrapper, or its own automatic .play() call would
+# pick up a SECOND, redundant delay on top of AUDIO_PLAY_DELAY_MS (~2.8s of
+# dead air instead of the intended ~1.8s). It instead calls the captured
+# native play function directly. The wrapper separately tracks, via the
+# a11yAutoplayPending flag, whether that automatic attempt is still
+# in-flight for the current src; if a user gesture arrives during that
+# window, the wrapper skips adding ITS OWN delay on top (the pending
+# autoplay timer already guarantees a gap before sound), rather than
+# stacking a second wait after the first.
+#
+# HONESTY: same as the rest of this shim, this is machine-verified only -
+# see docs/ACCESSIBILITY.md's Known defects entry for #52, not marked
+# "confirmed fixed" until a human screen-reader pass confirms it.
+#
 # KEYBOARD-REACHABILITY FIX (found via real-browser Chrome DevTools check,
 # same follow-up to issue #15): Gradio 6.22 renders an output-only Textbox
 # with a `disabled` <textarea>. A disabled form control cannot receive
@@ -248,14 +304,45 @@ ARIA_LIVE_HEAD = f"""
     // its own - start it deliberately, after a delay, once this run
     // actually produced audio (structural: a src is present at all).
     const audioEl = document.querySelector("#{AUDIO_ELEM_ID} audio");
+    // User-gesture play delay (issue #52 / P5.5) - see the module comment
+    // above this shim for the full reasoning. Wrap .play() ONCE per
+    // element (guard, same pattern as the other checks in this function)
+    // so a click on this control's own Play button - which internally
+    // calls this same audioEl.play() - is delayed just like every other
+    // caller of it, reusing the SAME observer/apply() pair as the rest of
+    // this function rather than a second one.
+    if (audioEl && !audioEl.dataset.a11yPlayDelayWrapped) {{
+      audioEl.dataset.a11yPlayDelayWrapped = "1";
+      const nativePlay = audioEl.play.bind(audioEl);
+      audioEl._a11yNativePlay = nativePlay;
+      audioEl.play = function () {{
+        // No double-delay: if the automatic-autoplay attempt for this src
+        // is still pending, that timer already guarantees a gap before
+        // sound - don't stack a second USER_PLAY_DELAY_MS on top of it.
+        if (audioEl.dataset.a11yAutoplayPending === "1") {{
+          return nativePlay();
+        }}
+        return new Promise((resolve, reject) => {{
+          setTimeout(() => {{
+            nativePlay().then(resolve, reject);
+          }}, {USER_PLAY_DELAY_MS});
+        }});
+      }};
+    }}
     if (audioEl && audioEl.src && audioEl.dataset.deferredPlaySrc !== audioEl.src) {{
       audioEl.dataset.deferredPlaySrc = audioEl.src;
+      audioEl.dataset.a11yAutoplayPending = "1";
       setTimeout(() => {{
+        audioEl.dataset.a11yAutoplayPending = "0";
+        // Calls the captured NATIVE play directly (not the wrapped
+        // audioEl.play above) so this automatic attempt is never
+        // double-delayed by the user-gesture wrapper.
+        //
         // If the browser blocks programmatic playback (autoplay policies
         // vary), swallow the rejection: the control stays visible and
         // reachable so the user can press play manually instead of the
         // page throwing a silent, uncaught error.
-        audioEl.play().catch(() => {{}});
+        (audioEl._a11yNativePlay || audioEl.play)().catch(() => {{}});
       }}, {AUDIO_PLAY_DELAY_MS});
     }}
     // Image labelling fix (issue #48 / P5.4) - see the comment above this
