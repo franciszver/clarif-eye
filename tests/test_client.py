@@ -254,6 +254,15 @@ def test_api_key_never_leaks_anywhere_it_could_plausibly_surface():
 # --- Timeout is derived from the role's latency budget --------------------
 
 
+def test_role_timeouts_match_measured_budgets_d16():
+    # Owner decision D16: eyes=30.0 (ceiling; rung 1 ~5s, rung 2 up to ~15s),
+    # brain=45.0 (still unmeasured, see issue #9). These are exact values,
+    # not just ceilings on some other computation - a regression to the old
+    # unreachable 8.0/25.0 budgets must fail this test.
+    assert client_module.ROLE_TIMEOUTS["eyes"] == 30.0
+    assert client_module.ROLE_TIMEOUTS["brain"] == 45.0
+
+
 def test_timeout_is_set_for_eyes_role():
     captured = {}
 
@@ -267,7 +276,7 @@ def test_timeout_is_set_for_eyes_role():
     timeout = captured["timeout"]
     assert timeout is not None
     assert all(v is not None for v in timeout.values())
-    assert timeout["read"] <= 8.0
+    assert timeout["read"] <= 30.0
 
 
 def test_timeout_is_set_for_brain_role():
@@ -283,7 +292,7 @@ def test_timeout_is_set_for_brain_role():
     timeout = captured["timeout"]
     assert timeout is not None
     assert all(v is not None for v in timeout.values())
-    assert timeout["read"] <= 25.0
+    assert timeout["read"] <= 45.0
 
 
 # --- Headers: optional app URL / name -------------------------------------
@@ -310,9 +319,11 @@ def test_optional_app_headers_are_sent():
 
 def test_total_budget_is_enforced_across_all_attempts_not_per_attempt(monkeypatch):
     # Patch the role budget small so the test stays fast, and make every
-    # rung slow (but each individually well under the real 8s/25s budgets
-    # to prove this isn't relying on httpx's own timeout).
-    monkeypatch.setitem(client_module.ROLE_TIMEOUTS, "eyes", 0.3)
+    # rung slow (but each individually well under the real 30s/45s budgets
+    # to prove this isn't relying on httpx's own timeout). The budget is
+    # smaller than a single rung's sleep so the first attempt alone exhausts
+    # it, leaving the second (of two) rungs untried.
+    monkeypatch.setitem(client_module.ROLE_TIMEOUTS, "eyes", 0.15)
     calls = []
 
     def handler(request):
@@ -327,9 +338,9 @@ def test_total_budget_is_enforced_across_all_attempts_not_per_attempt(monkeypatc
         client.complete("eyes", [{"role": "user", "content": "hi"}])
     elapsed = time.monotonic() - start
 
-    # N x per-attempt budget would be 3 x 0.3s = 0.9s; the total budget is
-    # 0.3s, so wall-clock must stay well under both N x budget and a small
-    # margin above the budget itself.
+    # N x per-attempt budget would be 2 x 0.15s = 0.3s; a single slow rung
+    # (0.2s) already exceeds the 0.15s total budget, so wall-clock must stay
+    # well under both N x budget and a small margin above the budget itself.
     assert elapsed < 0.6
     assert len(calls) < len(EYES_LADDER)  # at least one rung never attempted
 
@@ -520,11 +531,12 @@ def test_connect_error_fails_over_and_is_categorized():
 
 
 def test_all_transport_failure_kinds_produce_the_expected_attempt_categories():
-    # One call per exception kind so the ladder exhausts; asserts the exact
-    # category recorded for each, per FIX 2's fixed category set.
+    # One call per exception kind so the (now two-rung) ladder exhausts;
+    # asserts the exact category recorded for each, per FIX 2's fixed
+    # category set. Covers both distinct transport-failure categories
+    # (timeout and transport_error).
     exceptions = [
         httpx.ConnectTimeout("connect timed out"),
-        httpx.ReadTimeout("read timed out"),
         httpx.ConnectError("connection refused"),
     ]
     calls = []
@@ -538,7 +550,7 @@ def test_all_transport_failure_kinds_produce_the_expected_attempt_categories():
         client.complete("eyes", [{"role": "user", "content": "hi"}])
 
     categories = [a.category for a in exc_info.value.attempts]
-    assert categories == ["timeout", "timeout", "transport_error"]
+    assert categories == ["timeout", "transport_error"]
 
 
 # --- Mutation proof that the timeout/transport-error branches matter -------

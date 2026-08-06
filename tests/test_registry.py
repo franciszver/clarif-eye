@@ -18,9 +18,8 @@ def test_default_config_loads_both_ladders_in_order():
     registry = load_registry()
 
     assert registry.ladder("eyes") == (
+        "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
         "google/gemma-4-26b-a4b-it:free",
-        "nvidia/nemotron-nano-12b-v2-vl:free",
-        "google/gemma-4-31b-it:free",
     )
     assert registry.ladder("brain") == (
         "nvidia/nemotron-3-ultra-550b-a55b:free",
@@ -226,9 +225,8 @@ def test_ladders_attribute_cannot_be_rebound():
 
     # The original, validated ladder must still be in effect.
     assert registry.ladder("eyes") == (
+        "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
         "google/gemma-4-26b-a4b-it:free",
-        "nvidia/nemotron-nano-12b-v2-vl:free",
-        "google/gemma-4-31b-it:free",
     )
 
 
