@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from clarif_eye.registry import load_registry
+from clarif_eye.registry import RegistryError, load_registry
 
 API_BASE_URL = "https://openrouter.ai/api/v1"
 
@@ -60,17 +60,51 @@ class OpenRouterError(Exception):
     """Base error for OpenRouter client configuration and usage failures."""
 
 
+@dataclass(frozen=True)
+class Attempt:
+    """One ladder rung's outcome - machine-readable, for issue #18.
+
+    `category` is drawn from a fixed, documented set so a caller can build a
+    spoken message (e.g. "everything was rate-limited" vs "configuration is
+    broken, do not retry") without substring-matching upstream prose:
+
+    - "rate_limited"     - HTTP 429
+    - "server_error"     - HTTP 5xx
+    - "model_unavailable" - model not found / no endpoints (404, or 400
+      matching a known model-availability signature)
+    - "timeout"          - the attempt raised httpx.TimeoutException
+    - "transport_error"  - any other httpx.HTTPError (connection failure etc.)
+    - "bad_response"     - HTTP 200 with a malformed/empty body
+    - "budget_exhausted" - the role's total time budget ran out before this
+      rung could be tried
+    - "unexpected_status" - any other HTTP status not covered above
+
+    `detail` keeps the human/upstream text for logs and debugging.
+    """
+
+    model: str
+    category: str
+    status_code: int | None
+    detail: str
+
+
 class LadderExhaustedError(OpenRouterError):
     """Raised when every model in a role's ladder failed.
 
-    Carries the role and, for each model tried, why it failed - enough
-    detail for a caller to build a spoken error message (issue #18).
+    Carries the role and, for each model tried (or never reached because the
+    budget ran out), a structured Attempt - enough detail for a caller to
+    build a spoken error message (issue #18) without parsing English prose.
     """
 
     def __init__(self, role, attempts):
         self.role = role
-        self.attempts = attempts  # tuple of (model_id, reason) pairs
-        tried = "; ".join(f"{model}: {reason}" for model, reason in attempts)
+        self.attempts = attempts  # tuple of Attempt
+        tried = "; ".join(
+            f"{a.model} [{a.category}"
+            + (f" HTTP {a.status_code}" if a.status_code is not None else "")
+            + f"]: {a.detail}"
+            for a in attempts
+        )
         super().__init__(
             f"OpenRouter ladder exhausted for role {role!r} "
             f"({len(attempts)} model(s) tried): {tried}"
@@ -88,7 +122,9 @@ class CompletionResult:
 class OpenRouterClient:
     """Chat-completion client that fails over across a role's model ladder."""
 
-    def __init__(self, *, api_key=None, app_url=None, app_name=None, transport=None):
+    def __init__(
+        self, *, api_key=None, app_url=None, app_name=None, transport=None, registry=None
+    ):
         if api_key is None:
             api_key = os.environ.get("OPENROUTER_API_KEY")
         if not api_key or not api_key.strip():
@@ -106,6 +142,10 @@ class OpenRouterClient:
             headers["X-Title"] = app_name
 
         self._client = httpx.Client(base_url=API_BASE_URL, headers=headers, transport=transport)
+        # Loaded once here (not per-request): a request-time re-read was
+        # 4 disk reads + TOML parses for 4 requests, and ran outside the
+        # role's time budget. `registry` is injectable for tests.
+        self._registry = registry if registry is not None else load_registry()
 
     def __repr__(self):
         return f"{self.__class__.__name__}()"
@@ -129,48 +169,62 @@ class OpenRouterClient:
         in the OpenAI-compatible chat completions request body.
 
         The role's latency budget (ROLE_TIMEOUTS) is a TOTAL deadline for
-        this call, not a per-attempt timeout: elapsed time is tracked with
-        time.monotonic() and each attempt gets only what's left of the
-        budget. Once the budget is exhausted, remaining rungs are skipped
-        immediately.
+        this call, not a per-attempt timeout: the clock starts at the very
+        top of this method (before the registry lookup or anything else),
+        elapsed time is tracked with time.monotonic(), and each attempt gets
+        only what's left of the budget. Once the budget is exhausted,
+        remaining rungs are recorded as skipped and never tried.
 
         Returns a CompletionResult. Raises LadderExhaustedError if every
         rung fails (or the budget runs out), or OpenRouterError immediately
-        for a terminal failure (auth/credit/payload) or a malformed request
-        (a caller bug, not a ladder failure).
+        for a terminal failure (auth/credit/payload), an unknown role, or a
+        malformed request (a caller bug, not a ladder failure).
         """
-        ladder = load_registry().ladder(role)
         budget = ROLE_TIMEOUTS.get(role, DEFAULT_TIMEOUT)
         deadline = time.monotonic() + budget
+
+        try:
+            ladder = self._registry.ladder(role)
+        except RegistryError as e:
+            raise OpenRouterError(f"invalid role {role!r}: {e}") from e
 
         attempts = []
         for index, model in enumerate(ladder):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                skipped = len(ladder) - index
-                attempts.append(
-                    (
-                        model,
-                        f"budget exhausted ({budget}s role budget used up); "
-                        f"{skipped} rung(s) never tried",
+                for untried_model in ladder[index:]:
+                    attempts.append(
+                        Attempt(
+                            untried_model,
+                            "budget_exhausted",
+                            None,
+                            f"role budget of {budget}s exhausted before this rung could be tried",
+                        )
                     )
-                )
                 break
 
             payload = {"model": model, "messages": messages, **params}
             try:
-                response = self._client.post("/chat/completions", json=payload, timeout=remaining)
+                response = self._client.post(
+                    "/chat/completions", json=payload, timeout=self._build_timeout(remaining)
+                )
             except httpx.TimeoutException:
-                attempts.append((model, "request timed out"))
+                attempts.append(Attempt(model, "timeout", None, "request timed out"))
                 continue
             except httpx.HTTPError as exc:
-                attempts.append((model, f"transport error: {type(exc).__name__}"))
+                attempts.append(
+                    Attempt(
+                        model, "transport_error", None, f"transport error: {type(exc).__name__}"
+                    )
+                )
                 continue
 
             if response.status_code == 200:
                 result = self._parse_success(response, model)
                 if result is None:
-                    attempts.append((model, "malformed or empty response body"))
+                    attempts.append(
+                        Attempt(model, "bad_response", 200, "malformed or empty response body")
+                    )
                     continue
                 return result
 
@@ -184,10 +238,12 @@ class OpenRouterClient:
                 )
 
             if response.status_code == 429:
-                attempts.append((model, f"rate limited (429): {reason}"))
+                attempts.append(Attempt(model, "rate_limited", 429, reason))
                 continue
             if response.status_code >= 500:
-                attempts.append((model, f"server error ({response.status_code}): {reason}"))
+                attempts.append(
+                    Attempt(model, "server_error", response.status_code, reason)
+                )
                 continue
             # OpenRouter has been observed to return 400 (not 404) for an
             # unknown model - see prd/openrouter-error-shapes.md. This 404
@@ -195,19 +251,47 @@ class OpenRouterClient:
             # as defensive failover since other OpenAI-compatible proxies
             # do use 404 for the same condition.
             if response.status_code == 404:
-                attempts.append((model, f"model not found (404): {reason}"))
+                attempts.append(Attempt(model, "model_unavailable", 404, reason))
                 continue
             if response.status_code == 400:
                 if self._is_model_not_found(response):
-                    attempts.append((model, f"model not found (400): {reason}"))
+                    attempts.append(Attempt(model, "model_unavailable", 400, reason))
                     continue
                 raise OpenRouterError(
                     f"OpenRouter rejected the request as malformed (HTTP 400) "
                     f"for model {model!r}: {reason}"
                 )
-            attempts.append((model, f"unexpected status {response.status_code}: {reason}"))
+            attempts.append(
+                Attempt(model, "unexpected_status", response.status_code, reason)
+            )
 
         raise LadderExhaustedError(role, tuple(attempts))
+
+    @staticmethod
+    def _build_timeout(remaining):
+        """Build a per-phase httpx.Timeout whose phases sum to <= `remaining`.
+
+        A bare float (e.g. `timeout=remaining`) is NOT a total deadline in
+        httpx: it expands to Timeout(connect=remaining, read=remaining,
+        write=remaining, pool=remaining) - every phase gets its OWN
+        full-length timer. Verified: httpx.Timeout(8.0) has connect=read=
+        write=pool=8.0, so a single attempt's worst case (connect+write+
+        read) could be ~3x the role's total budget. Do NOT "simplify" this
+        back to a bare float - it silently breaks the total-budget contract
+        this module documents and tests (test_total_budget_is_enforced...).
+
+        `remaining` is always > 0 here (callers check remaining <= 0 before
+        calling this). connect and pool share a cap (a stuck TCP handshake
+        and a stuck pool-checkout are the same class of failure); write gets
+        a smaller slice since our request bodies are small; read gets
+        whatever is left, since waiting on the model's response is the
+        expected dominant cost.
+        """
+        connect = min(remaining * 0.3, 5.0)
+        write = remaining * 0.2
+        read = max(remaining - connect - write, 0.001)
+        pool = connect
+        return httpx.Timeout(connect=connect, read=read, write=write, pool=pool)
 
     @staticmethod
     def _parse_success(response, model):

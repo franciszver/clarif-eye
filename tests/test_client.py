@@ -17,6 +17,7 @@ from clarif_eye.client import (
     OpenRouterError,
 )
 from clarif_eye.registry import load_registry
+from clarif_eye import registry as registry_module
 
 EYES_LADDER = load_registry().ladder("eyes")
 BRAIN_LADDER = load_registry().ladder("brain")
@@ -334,8 +335,9 @@ def test_total_budget_is_enforced_across_all_attempts_not_per_attempt(monkeypatc
 
     attempts = exc_info.value.attempts
     assert len(attempts) == len(EYES_LADDER)
-    last_model, last_reason = attempts[-1]
-    assert "budget" in last_reason.lower()
+    last_attempt = attempts[-1]
+    assert last_attempt.category == "budget_exhausted"
+    assert "budget" in last_attempt.detail.lower()
 
 
 # --- Terminal failures: no failover, exactly one request -------------------
@@ -464,3 +466,157 @@ def test_client_works_as_a_context_manager():
         assert result.model == EYES_LADDER[0]
 
     assert client._client.is_closed
+
+
+# --- Transport failures: timeout / connection error failover ---------------
+
+
+def test_connect_timeout_fails_over_and_is_categorized():
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            raise httpx.ConnectTimeout("connect timed out", request=request)
+        return json_response(200)
+
+    client = make_client(handler)
+    result = client.complete("eyes", [{"role": "user", "content": "hi"}])
+
+    assert len(calls) == 2
+    assert result.model == EYES_LADDER[1]
+
+
+def test_read_timeout_fails_over_and_is_categorized():
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            raise httpx.ReadTimeout("read timed out", request=request)
+        return json_response(200)
+
+    client = make_client(handler)
+    result = client.complete("eyes", [{"role": "user", "content": "hi"}])
+
+    assert len(calls) == 2
+    assert result.model == EYES_LADDER[1]
+
+
+def test_connect_error_fails_over_and_is_categorized():
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            raise httpx.ConnectError("connection refused", request=request)
+        return json_response(200)
+
+    client = make_client(handler)
+    result = client.complete("eyes", [{"role": "user", "content": "hi"}])
+
+    assert len(calls) == 2
+    assert result.model == EYES_LADDER[1]
+
+
+def test_all_transport_failure_kinds_produce_the_expected_attempt_categories():
+    # One call per exception kind so the ladder exhausts; asserts the exact
+    # category recorded for each, per FIX 2's fixed category set.
+    exceptions = [
+        httpx.ConnectTimeout("connect timed out"),
+        httpx.ReadTimeout("read timed out"),
+        httpx.ConnectError("connection refused"),
+    ]
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        raise exceptions[len(calls) - 1]
+
+    client = make_client(handler)
+    with pytest.raises(LadderExhaustedError) as exc_info:
+        client.complete("eyes", [{"role": "user", "content": "hi"}])
+
+    categories = [a.category for a in exc_info.value.attempts]
+    assert categories == ["timeout", "timeout", "transport_error"]
+
+
+# --- Mutation proof that the timeout/transport-error branches matter -------
+#
+# See report: these branches were manually patched to `raise` and the new
+# tests above were confirmed to fail, then restored. Documented here rather
+# than automated, since automating "edit source, rerun, edit back" inside
+# the suite itself would be its own source of flakiness.
+
+
+# --- Structured attempts: mixed exhaustion (429, 500, budget cut) ----------
+
+
+def test_mixed_exhaustion_produces_structured_attempts_with_categories(monkeypatch):
+    monkeypatch.setitem(client_module.ROLE_TIMEOUTS, "eyes", 0.25)
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return json_response(429, message="rate limited")
+        if len(calls) == 2:
+            time.sleep(0.3)  # eats the rest of the (patched) budget
+            return json_response(500, message="upstream down")
+        return json_response(200)  # should never be reached
+
+    client = make_client(handler)
+    with pytest.raises(LadderExhaustedError) as exc_info:
+        client.complete("eyes", [{"role": "user", "content": "hi"}])
+
+    attempts = exc_info.value.attempts
+    assert len(attempts) == len(EYES_LADDER)
+    assert attempts[0].category == "rate_limited"
+    assert attempts[0].status_code == 429
+    assert attempts[1].category == "server_error"
+    assert attempts[1].status_code == 500
+    for untried in attempts[2:]:
+        assert untried.category == "budget_exhausted"
+        assert untried.status_code is None
+    assert len(calls) == 2  # remaining rung(s) never attempted
+
+
+# --- Unknown role: RegistryError must not leak past the documented contract
+
+
+def test_unknown_role_raises_openrouter_error_not_registry_error():
+    def handler(request):
+        return json_response(200)
+
+    client = make_client(handler)
+    with pytest.raises(OpenRouterError) as exc_info:
+        client.complete("nonsense", [{"role": "user", "content": "hi"}])
+
+    assert not isinstance(exc_info.value, registry_module.RegistryError)
+    assert exc_info.value.__cause__ is not None
+    assert isinstance(exc_info.value.__cause__, registry_module.RegistryError)
+
+
+# --- Registry is loaded once, not once per request --------------------------
+
+
+def test_registry_is_loaded_exactly_once_across_multiple_requests(monkeypatch):
+    load_calls = []
+    real_load_registry = registry_module.load_registry
+
+    def counting_load_registry(*args, **kwargs):
+        load_calls.append(1)
+        return real_load_registry(*args, **kwargs)
+
+    monkeypatch.setattr(client_module, "load_registry", counting_load_registry)
+
+    def handler(request):
+        return json_response(200)
+
+    client = OpenRouterClient(api_key=SENTINEL_KEY, transport=httpx.MockTransport(handler))
+    assert len(load_calls) == 1  # loaded at construction
+
+    for _ in range(4):
+        client.complete("eyes", [{"role": "user", "content": "hi"}])
+
+    assert len(load_calls) == 1  # never re-read from disk per request
