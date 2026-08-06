@@ -90,6 +90,11 @@ STATUS_ELEM_ID = "status-live-region"
 STATUS_ELEM_CLASSES = ["live-status"]
 RESULT_ELEM_ID = "description-output"
 AUDIO_ELEM_ID = "audio-output"
+IMAGE_INPUT_ELEM_ID = "photo-input"
+
+# Accessible name given to the user's own uploaded/captured photo preview
+# (issue #48 / P5.4 - see ARIA_LIVE_HEAD's image-labelling comment below).
+UPLOADED_PHOTO_ALT = "The photo you submitted"
 
 # How long the deferred-play shim (see ARIA_LIVE_HEAD below) waits after
 # the audio element gets a src before it calls .play() - long enough for
@@ -169,6 +174,37 @@ STATUS_DEGRADED = "Finished, but with a limited result. See the text below for d
 # see docs/ACCESSIBILITY.md's Known defects entry for #47, which is not
 # marked "confirmed fixed" until the owner re-tests.
 #
+# IMAGE LABELLING FIX (issue #48 / P5.4, reported from real screen-reader
+# use by the owner, Narrator on Windows): every image on the page - Gradio's
+# own chrome (footer "Built with Gradio" logo, the "Use via API" button's
+# logo, button glyphs for upload/camera/fullscreen/remove/download/share/
+# volume/playback controls) AND the user's own uploaded photo preview - was
+# announcing as a bare, unlabelled "graphic": noise for the chrome, and
+# useless for the photo, which is the one image that actually matters to a
+# blind user. Every image must end up either MEANINGFUL (a real accessible
+# name) or DECORATIVE (`alt=""` + `aria-hidden="true"`, and removed from the
+# tab order if it was somehow focusable) - never silently unlabelled.
+#
+# IDENTIFYING THE UPLOADED PHOTO, STRUCTURALLY: the ONLY image treated as
+# meaningful is an <img> element that lives inside the photo-input
+# component's own container (#{IMAGE_INPUT_ELEM_ID}, set on the gr.Image in
+# build_interface) - that is where Gradio renders the uploaded/captured
+# photo preview once one exists. The upload/camera icon glyphs in that SAME
+# container are <svg> elements on buttons that already carry their own
+# accessible name (the button's aria-label, per the real accessibility-tree
+# dump this issue was filed from), never <img> tags, so this can't
+# mislabel them. This is a structural check (tag + container), never a
+# string/URL match against image src, same discipline the rest of this
+# module uses elsewhere.
+#
+# Everything else - any other img/svg/[role="img"] anywhere on the page -
+# is Gradio chrome with no information for the user and is marked
+# decorative so a screen reader skips it entirely.
+#
+# HONESTY: same as the rest of this shim, this is machine-verified only -
+# see docs/ACCESSIBILITY.md's Known defects entry for #48, not marked
+# "confirmed fixed" until a human screen-reader pass confirms it.
+#
 # KEYBOARD-REACHABILITY FIX (found via real-browser Chrome DevTools check,
 # same follow-up to issue #15): Gradio 6.22 renders an output-only Textbox
 # with a `disabled` <textarea>. A disabled form control cannot receive
@@ -222,6 +258,57 @@ ARIA_LIVE_HEAD = f"""
         audioEl.play().catch(() => {{}});
       }}, {AUDIO_PLAY_DELAY_MS});
     }}
+    // Image labelling fix (issue #48 / P5.4) - see the comment above this
+    // function for the full reasoning. Guard: `a11yImgDone` marks an image
+    // as already classified so it isn't re-processed on every unrelated
+    // mutation, same pattern as the guards above.
+    document.querySelectorAll('img, svg, [role="img"]').forEach((img) => {{
+      if (img.dataset.a11yImgDone) {{
+        return;
+      }}
+      img.dataset.a11yImgDone = "1";
+      const isUploadedPhoto =
+        img.tagName === "IMG" && img.closest("#{IMAGE_INPUT_ELEM_ID}");
+      if (isUploadedPhoto) {{
+        // MEANINGFUL: the user's own submitted photo, not chrome.
+        img.setAttribute("alt", "{UPLOADED_PHOTO_ALT}");
+        img.setAttribute("aria-label", "{UPLOADED_PHOTO_ALT}");
+        img.removeAttribute("aria-hidden");
+      }} else {{
+        // DECORATIVE: Gradio chrome (footer logo, API logo, button
+        // glyphs) - carries no information, so a screen reader should
+        // skip it entirely rather than announce a bare "graphic".
+        //
+        // CORRECTION from real screen-reader testing: the reported
+        // behaviour was REPEATED "graphic, graphic, graphic" while
+        // navigating, so these nodes must become genuinely ABSENT from
+        // the accessibility tree, not merely unnamed. `alt=""` only
+        // applies to <img> - it is MEANINGLESS on inline <svg>, and
+        // Gradio's chrome is largely inline SVG - so alt="" alone would
+        // leave the svg glyphs announcing exactly as before. Handle each
+        // element type explicitly:
+        const tag = img.tagName.toLowerCase();
+        if (tag === "img") {{
+          img.setAttribute("alt", "");
+        }}
+        if (tag === "svg") {{
+          // aria-hidden alone can still leave inline SVG reachable/
+          // focusable in some engines, so also explicitly mark it
+          // non-focusable - this is the load-bearing pair for SVG, not
+          // alt (which does nothing here).
+          img.setAttribute("focusable", "false");
+        }}
+        // Covers [role="img"] on any element too: aria-hidden is what
+        // actually removes it from the accessibility tree - simply
+        // dropping the role would not be sufficient.
+        img.setAttribute("aria-hidden", "true");
+        // Only ever drive tabindex to -1 (out of the tab order); never
+        // introduce a positive one.
+        if (img.hasAttribute("tabindex")) {{
+          img.setAttribute("tabindex", "-1");
+        }}
+      }}
+    }});
   }}
   apply(); // covers the element already being present
   // Covers the element appearing later (Gradio's SPA render) or being
@@ -464,6 +551,11 @@ def build_interface(resources):
             label="Photo to describe",
             sources=["upload", "webcam"],
             type="pil",
+            # issue #48 / P5.4: lets ARIA_LIVE_HEAD's image-labelling shim
+            # find the uploaded-photo preview structurally (it's the <img>
+            # inside this container), instead of any icon glyph elsewhere
+            # on the page.
+            elem_id=IMAGE_INPUT_ELEM_ID,
         )
         submit_button = gr.Button("Describe this photo", variant="primary")
         status_output = gr.Textbox(

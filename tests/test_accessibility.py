@@ -538,6 +538,27 @@ def test_image_labelling_shim_guards_against_reprocessing_already_marked_images(
     assert "a11yImgDone" in ARIA_LIVE_HEAD or "a11y-img-done" in ARIA_LIVE_HEAD
 
 
+def test_shim_marks_decorative_svg_non_focusable_not_just_alt_empty():
+    # CORRECTION from real screen-reader testing (owner): the reported
+    # behaviour is REPEATED "graphic, graphic, graphic" while navigating,
+    # not one stray empty announcement - so decorative nodes must become
+    # genuinely ABSENT from the accessibility tree, not merely unnamed.
+    # `alt=""` only applies to <img> - it is MEANINGLESS on inline <svg>,
+    # and Gradio's chrome (footer logo, button glyphs, API logo) is
+    # largely inline SVG. Silencing an SVG requires `aria-hidden="true"`
+    # AND `focusable="false"` (SVG can otherwise land in the tab order in
+    # some engines) - alt="" alone changes nothing for it.
+    #
+    # Written to FAIL if the shim only ever sets alt="" for decorative
+    # images and never explicitly marks svg non-focusable - a bug that
+    # would look correct in code review and change nothing for a real
+    # screen-reader user.
+    assert 'focusable", "false"' in ARIA_LIVE_HEAD or "focusable', 'false'" in ARIA_LIVE_HEAD
+    # Must be conditioned on the element actually being an svg (not a
+    # blanket attribute unrelated to tag type).
+    assert "svg" in ARIA_LIVE_HEAD.lower()
+
+
 def test_image_labelling_never_introduces_a_positive_tabindex():
     # Removing a decorative image from the tab order must only ever drive
     # tabindex to "-1" (or leave it alone) - never introduce a positive

@@ -113,9 +113,28 @@ These are being fixed:
   fact, since that may not be true. Whether the two voices actually stop
   colliding is something only a human screen-reader pass can confirm; that
   has not happened yet.
-- **Images announce as "graphic" (#48)**: Images in the interface are not
-  labelled, so a screen reader announces an unhelpful bare "graphic" instead
-  of a meaningful description.
+- **Images announce as "graphic" (#48)**: A real screen-reader pass (owner,
+  Narrator on Windows) found every image on the page announcing as an
+  unlabelled "graphic" - repeatedly, once per image, while navigating
+  ("graphic, graphic, graphic") - both Gradio's own chrome (footer logo,
+  "Use via API" logo, button glyphs) and the user's own uploaded photo.
+  **Fix attempted, not yet confirmed by a human screen-reader pass:** the
+  aria-live shim now classifies every `img`/`svg`/`[role="img"]` it finds.
+  The uploaded photo preview (identified structurally - it's the `<img>`
+  inside the photo-input component's own container, never a string/URL
+  match) is given a real accessible name ("The photo you submitted").
+  Everything else - Gradio's chrome - is marked decorative and handled
+  per element type, since a screen reader continuing to announce
+  "graphic" means the node was still present in the accessibility tree,
+  not just unnamed: `<img>` gets `alt=""` plus `aria-hidden="true"`;
+  inline `<svg>` gets `aria-hidden="true"` plus `focusable="false"`
+  (`alt=""` does nothing on `<svg>` - it only applies to `<img>` - so
+  setting it alone would have changed nothing); any `[role="img"]`
+  element gets `aria-hidden="true"`. Decorative nodes are also taken out
+  of the tab order if they were somehow focusable. Whether this actually
+  goes quiet for the chrome and actually reads out the photo's name in a
+  real screen reader is something only a human screen-reader pass can
+  confirm; that has not happened yet.
 
 ## Known limitations a user should know
 
