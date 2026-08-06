@@ -1,0 +1,23 @@
+# Model registry for Clarif-Eye.
+#
+# Each role's ladder is tried in order: the first model is attempted first,
+# and later entries are fallbacks used only if an earlier one fails.
+#
+# The order below is a starting hypothesis, not a measured ranking. Issue
+# P1.6 will re-order these ladders based on observed latency.
+#
+# Policy (owner decision D10): every model ID must end in ":free". This is
+# enforced at load time in src/clarif_eye/registry.py.
+
+[eyes]
+ladder = [
+    "google/gemma-4-26b-a4b-it:free",
+    "nvidia/nemotron-nano-12b-v2-vl:free",
+    "google/gemma-4-31b-it:free",
+]
+
+[brain]
+ladder = [
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+]
