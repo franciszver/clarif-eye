@@ -16,6 +16,7 @@ schema is exactly the 7 architecture-doc keys, nothing more.
 
 from langgraph.graph import END, StateGraph
 
+from clarif_eye.analysis import run_analysis
 from clarif_eye.state import ClarifEyeState
 from clarif_eye.synth import run_fast_synth
 from clarif_eye.vision import run_vision
@@ -73,10 +74,20 @@ def research_node(state, config=None):
     return {"scraper_data": "stub scraper data"}
 
 
-def analysis_node(state, config=None):
-    """Stub for the deep-analysis node (issue #7/#8)."""
+def analysis_node(state, config=None, client=None):
+    """Deep-analysis node (issue #8/P1.5): turns dense-document input into spoken text.
+
+    The substantive logic (prompt building, sanitisation, degradation)
+    lives in clarif_eye.analysis.run_analysis so this stays a thin adapter,
+    the same pattern vision_node/fast_synth_node already use. `client` is
+    injectable directly or via config["configurable"]["client"]; when
+    neither is supplied, run_analysis constructs a real OpenRouterClient
+    lazily.
+    """
     _record(config, "analysis")
-    return {"final_output": "stub analysis output"}
+    if client is None:
+        client = (config or {}).get("configurable", {}).get("client")
+    return run_analysis(state["ocr_output"], state["scene_context"], state["scraper_data"], client)
 
 
 def tts_node(state, config=None):
