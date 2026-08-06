@@ -176,7 +176,7 @@ def test_build_interface_returns_blocks_without_launching():
         # No server has been started: launch()'s local_url is only set
         # once a server actually starts listening.
         assert demo.local_url is None
-        assert demo.server is None
+        assert demo.is_running is False
     finally:
         demo.close()
 

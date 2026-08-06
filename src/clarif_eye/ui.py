@@ -44,6 +44,8 @@ import io
 import time
 from dataclasses import dataclass
 
+import gradio as gr
+
 from clarif_eye.client import OpenRouterClient, OpenRouterError
 from clarif_eye.graph import DEFAULT_PIPELINE_BUDGET_SECONDS, build_graph
 from clarif_eye.state import make_initial_state
@@ -69,6 +71,89 @@ UNEXPECTED_ERROR_MESSAGE = (
 AUDIO_UNAVAILABLE_NOTE = (
     "Audio isn't available right now, so here is the description as text."
 )
+
+# --- Accessibility (issue #15 / P5.1) ---------------------------------------
+#
+# THE PROBLEM: every user of this product is visually impaired (see this
+# module's top-level docstring / app.py). They cannot see Gradio's spinner
+# during the ~15-30s the pipeline typically takes (measured in issue #17;
+# observed max 60.3s against a 60s pipeline deadline). A screen reader only
+# hears something if it is told to, via an ARIA live region - hence
+# STATUS_* below, a short spoken-style status distinct from the description
+# text itself.
+#
+# Owner decision D13: this phase is verified by AUTOMATED checks only (see
+# tests/test_accessibility.py) - no manual screen-reader pass happens, so
+# nothing here or in that test file may claim "screen-reader tested"; the
+# accurate claim is "machine-verified".
+STATUS_ELEM_ID = "status-live-region"
+STATUS_ELEM_CLASSES = ["live-status"]
+RESULT_ELEM_ID = "description-output"
+
+STATUS_IDLE = 'Ready. Choose or take a photo, then activate "Describe this photo".'
+STATUS_WORKING = (
+    "Photo received. Describing it now; this can take up to about 30 seconds."
+)
+STATUS_SUCCESS_AUDIO = "Description ready. Audio is playing; the text is below too."
+STATUS_SUCCESS_TEXT_ONLY = f"Description ready as text. {AUDIO_UNAVAILABLE_NOTE}"
+STATUS_DEGRADED = "Finished, but with a limited result. See the text below for details."
+
+# Gradio has no native aria-live prop (as of 6.22.0), so a minimal,
+# commented JS shim marks the status control's wrapper as a polite live
+# region by hand. Passed to demo.launch(head=...) - NOT the Blocks
+# constructor (deprecated there since Gradio 6.0) - so it only takes effect
+# when app.py actually launches a real server, never during
+# build_interface() itself (see that function's docstring: it never
+# launches). Runs once on page load; only the status text changes
+# afterward, not the element itself, so a single pass is enough.
+ARIA_LIVE_HEAD = f"""
+<script>
+// Minimal aria-live shim for the status control (issue #15 / P5.1).
+// Gradio doesn't expose an aria-live prop, so mark the element by hand:
+// "polite" means a screen reader announces the change without
+// interrupting whatever the user is doing, and never steals focus.
+window.addEventListener("load", () => {{
+  const el = document.getElementById("{STATUS_ELEM_ID}");
+  if (el) {{
+    el.setAttribute("aria-live", "polite");
+    el.setAttribute("aria-atomic", "true");
+    el.setAttribute("role", "status");
+  }}
+}});
+</script>
+"""
+
+# Client-side focus management (issue #15 / P5.1 scope item 4): once the
+# result is ready, move focus to the description text so a screen-reader
+# user is told the answer without hunting for it, instead of leaving focus
+# wherever it was (typically the submit button). Wired via .then(js=...)
+# on the submit click AFTER the handler's fn resolves, so it only ever
+# runs once a result exists - never while the user is still interacting
+# with the image input.
+FOCUS_RESULT_JS = f"""
+() => {{
+  const el = document.querySelector('#{RESULT_ELEM_ID} textarea');
+  if (el) {{ el.focus(); }}
+}}
+"""
+
+
+def status_for_result(audio_path, chain_exhausted):
+    """Derive the live-region status text for a finished run.
+
+    STRUCTURAL, same three-way split handle_submit already uses (see this
+    module's top-level "THE THREE OUTCOMES" docstring): audio_path
+    truthiness and the tts.is_chain_exhausted() bool, never a string match
+    against the description text. `chain_exhausted` is passed in rather
+    than read here so callers control exactly when it's sampled (it must
+    be read right after the graph call that produced audio_path, before
+    any other run_tts() call could overwrite the module-level result).
+    """
+    if audio_path:
+        return STATUS_SUCCESS_AUDIO
+    if chain_exhausted:
+        return STATUS_SUCCESS_TEXT_ONLY
+    return STATUS_DEGRADED
 
 
 @dataclass
@@ -199,3 +284,88 @@ def handle_submit(image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUD
         return None, AUDIO_UNAVAILABLE_NOTE
 
     return None, final_output or UNEXPECTED_ERROR_MESSAGE
+
+
+def handle_submit_staged(image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUDGET_SECONDS):
+    """Generator version of handle_submit that also drives the live-region
+    status text (issue #15 / P5.1 scope item 3).
+
+    Yields (status_text, audio_path_or_None, description_text) tuples;
+    Gradio streams each yield straight to the UI as it's produced, which is
+    what lets the live region announce progress at all.
+
+    STAGING: graph.invoke() is one synchronous, blocking call with no
+    intermediate progress hook (see graph.py), so there is no real
+    per-node progress to report without a larger restructure of the graph
+    itself - and inventing fake percentages was explicitly ruled out.
+    Instead this yields twice: once immediately with an honest "received
+    and working, up to about 30 seconds" message (submission-received and
+    still-working collapsed into one announcement, since nothing
+    observable happens between them), then once more when the blocking
+    call returns with the final status/audio/text. A screen reader hears
+    both, in order, via aria-live="polite" on the status control.
+    """
+    yield STATUS_WORKING, None, ""
+    audio_path, text = handle_submit(image, resources, pipeline_budget_seconds)
+    status = status_for_result(audio_path, is_chain_exhausted())
+    yield status, audio_path, text
+
+
+def build_interface(resources):
+    """Build the Clarif-Eye gr.Blocks UI, wired to `resources`.
+
+    NEVER launches a server or touches the network - this only constructs
+    the Blocks object (see tests/test_accessibility.py, which builds it
+    and walks the component tree, and this module's top-level docstring's
+    "TESTABLE without launching a server" discipline, the same reasoning
+    build_resources()/handle_submit already follow). app.py is the only
+    caller that calls .launch() on the result, and only inside its
+    `if __name__ == "__main__":` guard.
+
+    ACCESSIBILITY (issue #15 / P5.1): every interactive control below
+    carries a real label (its accessible name); the status control is a
+    read-only (non-focusable, so it never steals focus) live region wired
+    to aria-live via ARIA_LIVE_HEAD (passed to .launch(head=...) by
+    app.py, since Gradio 6.0 moved `head` off the Blocks constructor);
+    and FOCUS_RESULT_JS moves focus to the description text once (and
+    only once) a result is ready, via .then(js=...) chained after the
+    submit click's fn resolves.
+    """
+
+    def _submit(image):
+        yield from handle_submit_staged(image, resources)
+
+    with gr.Blocks(title="Clarif-Eye") as demo:
+        gr.Markdown(
+            "# Clarif-Eye\n"
+            "Clarif-Eye describes a photo aloud for visually impaired users. "
+            "Take or upload a photo below. This can take up to about 30 "
+            "seconds, especially for photos with dense text."
+        )
+        image_input = gr.Image(
+            label="Photo to describe",
+            sources=["upload", "webcam"],
+            type="pil",
+        )
+        submit_button = gr.Button("Describe this photo", variant="primary")
+        status_output = gr.Textbox(
+            value=STATUS_IDLE,
+            label="Status",
+            interactive=False,
+            elem_id=STATUS_ELEM_ID,
+            elem_classes=STATUS_ELEM_CLASSES,
+        )
+        audio_output = gr.Audio(label="Spoken description", autoplay=True)
+        text_output = gr.Textbox(label="Description (text)", lines=6, elem_id=RESULT_ELEM_ID)
+
+        submit_event = submit_button.click(
+            fn=_submit,
+            inputs=image_input,
+            outputs=[status_output, audio_output, text_output],
+        )
+        # Runs client-side only after the handler above has produced its
+        # final yield - see FOCUS_RESULT_JS's docstring for why that
+        # timing matters (never steals focus mid-interaction).
+        submit_event.then(fn=None, inputs=None, outputs=None, js=FOCUS_RESULT_JS)
+
+    return demo
