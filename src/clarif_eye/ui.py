@@ -134,17 +134,26 @@ UPLOADED_PHOTO_ALT = "The photo you submitted"
 # ACCESSIBILITY (issue #49, learning from #48's mistake): real Markdown
 # heading syntax ("## "/"### "), which gr.Markdown renders as genuine
 # <h2>/<h3> elements a screen reader can navigate by heading - not
-# visually-styled prose. The flow is a plain numbered list, never a
-# diagram/image: a diagram that announces as a bare "graphic" (#48) is
-# worse than no diagram, and a text list carries the same information with
-# no such risk, so no image is used here at all (see
-# test_how_it_works_introduces_no_unlabelled_image). Always visible, no
-# collapsible toggle: simpler, and it avoids needing to get
-# aria-expanded/keyboard-toggle wiring right for a chunk of content that
-# costs a screen-reader/keyboard user nothing extra to skip past by
-# navigating to the next heading. Placed after the result textbox in
-# build_interface() below, so it never delays someone using the tool and
-# never sits between the live region and the result it announces.
+# visually-styled prose. The flow is a plain numbered list, which stays
+# text-only in THIS string (see test_how_it_works_introduces_no_unlabelled_image
+# - no img/svg markup is ever added here). Always visible, no collapsible
+# toggle: simpler, and it avoids needing to get aria-expanded/keyboard-toggle
+# wiring right for a chunk of content that costs a screen-reader/keyboard
+# user nothing extra to skip past by navigating to the next heading. Placed
+# after the result textbox in build_interface() below, so it never delays
+# someone using the tool and never sits between the live region and the
+# result it announces.
+#
+# THE DIAGRAM (issue #56 / P4.4): the owner later asked for a graphic. P4.3
+# deliberately shipped text-only because #48 had JUST been fixed and an
+# unlabelled diagram would have announced as a bare "graphic" - worse than
+# no diagram. Now that a labelling mechanism exists, PIPELINE_DIAGRAM_HTML
+# below adds an inline SVG as a SEPARATE gr.HTML component, alongside (never
+# instead of) the ordered list above - the list stays the accessible source
+# of truth; the diagram is for sighted readers, with its own name and text
+# description for anyone who lands on it. See PIPELINE_DIAGRAM_HTML's
+# docstring for the exemption mechanism that keeps ARIA_LIVE_HEAD's #48 pass
+# from silencing it.
 HOW_IT_WORKS_ELEM_ID = "how-it-works"
 HOW_IT_WORKS_MARKDOWN = """## How this works
 
@@ -222,6 +231,103 @@ ladder of free models tried in turn if an earlier one fails or times out:
   against the photographed text before being read, as described above; this
   check does not currently run on the quick-description path.
 """
+
+# --- Pipeline diagram (issue #56 / P4.4) ------------------------------------
+#
+# Adds a sighted-friendly diagram of the pipeline next to the ordered list
+# above, WITHOUT replacing it - the list stays the accessible source of
+# truth for a screen-reader user; the diagram is additional, not a
+# substitute (a listener gets the list; a sighted reader gets both).
+#
+# CONTENT, checked against graph.py's build_graph() as built, not against
+# memory or the older architecture doc: vision runs first; dynamic_router
+# is a locally-evaluated conditional edge on complexity_flag (no model or
+# network call, plain Python) that sends the run to fast_synth, or to
+# research then analysis; every path ends at tts. "Router" names that
+# conditional edge for a reader of the diagram - it is not a claim that a
+# sixth node named "router" is registered in the graph.
+#
+# WHY INLINE SVG, PLAIN CURRENTCOLOR: no new dependency, no build step, no
+# raster asset to keep in sync with a theme. currentColor on every stroke
+# and text fill means the diagram inherits whatever text color the page
+# already uses, so it reads correctly in both light and dark themes without
+# any separate dark-mode markup.
+#
+# THE #48 TRAP: ARIA_LIVE_HEAD's image-labelling pass marks every
+# img/svg/[role="img"] it finds as aria-hidden="true" UNLESS it is
+# structurally exempted - exactly like #photo-input's uploaded-photo <img>
+# already is. Without an equivalent exemption here, this new diagram would
+# be silenced by our own accessibility code. DIAGRAM_ELEM_ID is the
+# structural anchor: ARIA_LIVE_HEAD checks whether an element lives inside
+# `#{DIAGRAM_ELEM_ID}` via `.closest()`, the same mechanism (id/container,
+# never a string/content match) IMAGE_INPUT_ELEM_ID already uses. See
+# ARIA_LIVE_HEAD's own comment for the combined check.
+#
+# NAME VS. DESCRIPTION: aria-label gives the SVG a short accessible name
+# (what it is); aria-describedby points at DIAGRAM_DESC_ELEM_ID, a visible
+# paragraph carrying the flow in full sentences, so a screen-reader user who
+# lands on the diagram gets the content, not just a name.
+#
+# KEYBOARD (issue #56 scope item 6): the SVG carries no tabindex attribute
+# at all, so it is not a tab stop. It is a non-interactive image - nothing
+# happens when it receives focus, and adding tabindex="0" would present it
+# as a stopping point that implies interactivity it doesn't have. Its
+# content still reaches a screen-reader user in the normal document reading
+# order via its name/description, exactly like the uploaded-photo <img>
+# neither needs nor gets a tabindex either.
+DIAGRAM_ELEM_ID = "how-it-works-diagram"
+DIAGRAM_DESC_ELEM_ID = "how-it-works-diagram-desc"
+
+PIPELINE_DIAGRAM_LABEL = "Diagram of the Clarif-Eye pipeline, from photo to spoken description"
+
+PIPELINE_DIAGRAM_DESCRIPTION = (
+    "A photo goes to the vision step, which reads any text and describes the "
+    "scene. A router then checks how complex the result is, using plain "
+    "Python with no model call. If the result is simple, fast synthesis "
+    "writes the script right away. If the result is complex, the app runs a "
+    "web search first, then a stronger writing model: a research step "
+    "followed by an analysis step. Both paths end at text to speech, which "
+    "turns the final script into spoken audio."
+)
+
+PIPELINE_DIAGRAM_SVG = f"""<svg viewBox="0 0 800 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="{PIPELINE_DIAGRAM_LABEL}" aria-describedby="{DIAGRAM_DESC_ELEM_ID}" style="max-width:100%;height:auto;color:inherit;">
+<title>{PIPELINE_DIAGRAM_LABEL}</title>
+<defs>
+<marker id="how-it-works-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+</marker>
+</defs>
+<g fill="none" stroke="currentColor" stroke-width="2">
+<rect x="10" y="115" width="110" height="50" rx="6" />
+<rect x="170" y="115" width="140" height="50" rx="6" />
+<rect x="380" y="30" width="150" height="50" rx="6" />
+<rect x="380" y="215" width="120" height="50" rx="6" />
+<rect x="530" y="215" width="110" height="50" rx="6" />
+<rect x="660" y="115" width="120" height="50" rx="6" />
+<line x1="120" y1="140" x2="164" y2="140" marker-end="url(#how-it-works-arrow)" />
+<line x1="310" y1="122" x2="378" y2="58" marker-end="url(#how-it-works-arrow)" />
+<line x1="310" y1="158" x2="378" y2="235" marker-end="url(#how-it-works-arrow)" />
+<line x1="500" y1="240" x2="524" y2="240" marker-end="url(#how-it-works-arrow)" />
+<line x1="524" y1="58" x2="654" y2="128" marker-end="url(#how-it-works-arrow)" />
+<line x1="636" y1="234" x2="656" y2="155" marker-end="url(#how-it-works-arrow)" />
+</g>
+<g fill="currentColor" stroke="none" font-family="sans-serif" font-size="14" text-anchor="middle">
+<text x="65" y="145">Vision</text>
+<text x="240" y="135">Router</text>
+<text x="240" y="152" font-size="11">checks complexity</text>
+<text x="455" y="60">Fast synthesis</text>
+<text x="440" y="245">Research</text>
+<text x="585" y="245">Analysis</text>
+<text x="720" y="145">Text to speech</text>
+<text x="335" y="82" font-size="11">simple</text>
+<text x="335" y="205" font-size="11">complex</text>
+</g>
+</svg>"""
+
+PIPELINE_DIAGRAM_HTML = f"""<div>
+{PIPELINE_DIAGRAM_SVG}
+<p id="{DIAGRAM_DESC_ELEM_ID}">{PIPELINE_DIAGRAM_DESCRIPTION}</p>
+</div>"""
 
 # How long handle_submit_staged (below) waits, after yielding the
 # completion status + text WITHOUT the audio path, before yielding again
@@ -400,6 +506,17 @@ STATUS_DEGRADED = "Finished, but with a limited result. See the text below for d
 # must) also strips `disabled` off that textarea and swaps in `readOnly` +
 # `tabindex="0"` instead: readonly text inputs remain non-editable but,
 # unlike disabled ones, ARE focusable and part of the tab order.
+#
+# PIPELINE DIAGRAM EXEMPTION (issue #56 / P4.4): the image-labelling pass
+# below would otherwise mark the new pipeline diagram (see
+# PIPELINE_DIAGRAM_SVG's module comment) as decorative and hide it, exactly
+# the trap the issue warns about. The SAME apply()/img-classification loop
+# now also checks `img.closest("#{DIAGRAM_ELEM_ID}")` - structural,
+# by container, the same mechanism `isUploadedPhoto` already uses for
+# #photo-input - and leaves anything inside that container alone rather
+# than marking it aria-hidden. The diagram's own markup already carries
+# role="img", aria-label, and aria-describedby, so nothing further needs
+# setting here; this only needs to NOT undo them.
 ARIA_LIVE_HEAD = f"""
 <script>
 // Aria-live shim for the status control (issue #15 / P5.1).
@@ -459,10 +576,24 @@ ARIA_LIVE_HEAD = f"""
       img.dataset.a11yImgDone = "1";
       const isUploadedPhoto =
         img.tagName === "IMG" && img.closest("#{IMAGE_INPUT_ELEM_ID}");
-      if (isUploadedPhoto) {{
-        // MEANINGFUL: the user's own submitted photo, not chrome.
-        img.setAttribute("alt", "{UPLOADED_PHOTO_ALT}");
-        img.setAttribute("aria-label", "{UPLOADED_PHOTO_ALT}");
+      // STRUCTURAL exemption for the "How this works" pipeline diagram
+      // (issue #56 / P4.4): true only for an element living inside the
+      // diagram's OWN container (#{DIAGRAM_ELEM_ID}), the same closest()-
+      // by-container check isUploadedPhoto already uses for #photo-input -
+      // never a string/class-name match against the SVG's label or
+      // content. This is what stops this very pass from silencing the
+      // diagram it would otherwise treat as decorative chrome.
+      const isDiagram = img.closest("#{DIAGRAM_ELEM_ID}");
+      if (isUploadedPhoto || isDiagram) {{
+        // MEANINGFUL: the user's own submitted photo, or the pipeline
+        // diagram - both already carry their own real accessible name
+        // (alt/aria-label set here for the photo; role="img"+aria-label+
+        // aria-describedby set directly in the diagram's own markup), so
+        // leave them alone rather than silencing them as chrome.
+        if (isUploadedPhoto) {{
+          img.setAttribute("alt", "{UPLOADED_PHOTO_ALT}");
+          img.setAttribute("aria-label", "{UPLOADED_PHOTO_ALT}");
+        }}
         img.removeAttribute("aria-hidden");
       }} else {{
         // DECORATIVE: Gradio chrome (footer logo, API logo, button
@@ -794,9 +925,16 @@ def build_interface(resources):
         # so it never delays someone who came to use the tool and never
         # sits between the live region and the result it announces. See
         # HOW_IT_WORKS_MARKDOWN's module-level docstring for content
-        # sourcing and the accessibility reasoning behind a text-only
-        # section with no image/diagram.
+        # sourcing; the ordered list here stays text-only and is the
+        # accessible source of truth for a screen-reader user.
         gr.Markdown(HOW_IT_WORKS_MARKDOWN, elem_id=HOW_IT_WORKS_ELEM_ID)
+        # issue #56 / P4.4: a sighted-friendly diagram alongside (never
+        # instead of) the list above. gr.HTML, not gr.Markdown, because the
+        # diagram is raw inline SVG with its own role/aria-label/
+        # aria-describedby wiring - see PIPELINE_DIAGRAM_SVG's module
+        # comment for the exemption that keeps ARIA_LIVE_HEAD's #48 pass
+        # from silencing it.
+        gr.HTML(PIPELINE_DIAGRAM_HTML, elem_id=DIAGRAM_ELEM_ID)
 
         submit_event = submit_button.click(
             fn=_submit,
