@@ -444,6 +444,19 @@ def test_audio_component_has_elem_id_the_sequencing_shim_can_target():
         demo.close()
 
 
+def test_image_input_declares_the_elem_id_the_image_labelling_shim_targets():
+    from clarif_eye.ui import IMAGE_INPUT_ELEM_ID
+
+    resources = _resources(FakeGraph())
+    demo = build_interface(resources)
+    try:
+        image_components = [c for c in _components(demo) if getattr(c, "elem_id", None) == IMAGE_INPUT_ELEM_ID]
+        assert len(image_components) == 1
+        assert isinstance(image_components[0], gr.Image)
+    finally:
+        demo.close()
+
+
 def test_sequencing_shim_defers_audio_playback_after_a_delay():
     # STATIC/SOURCE-LEVEL CHECK ONLY (same discipline as the rest of this
     # file): asserts the deferred-play mechanism is present in the injected
@@ -467,3 +480,71 @@ def test_sequencing_shim_defers_audio_playback_after_a_delay():
     # (autoplay=False never hides it) so it remains reachable to play
     # manually.
     assert ".catch(" in ARIA_LIVE_HEAD
+
+
+# --- P5.4 / issue #48: images announce as bare "graphic" -------------------
+#
+# Real screen-reader use (owner, Narrator on Windows - see
+# docs/ACCESSIBILITY.md's Known defects entry for #48) found every image on
+# the page - Gradio's own chrome (footer logo, "Use via API" logo, button
+# glyphs) AND the user's own uploaded photo preview - announced as an
+# unlabelled "graphic". That is pure noise for the chrome and useless for
+# the photo.
+#
+# STATIC/SOURCE-LEVEL CHECK ONLY (same discipline as the rest of this file):
+# the rendered DOM is not visible to pytest, so these assert the shim's
+# SOURCE contains the mechanism that would fix this, never that a real
+# screen reader actually goes quiet on the chrome or actually reads out the
+# photo's name in a live browser - that can only be confirmed by a human
+# screen-reader pass (see docs/ACCESSIBILITY.md, not yet marked "confirmed
+# fixed" for #48).
+#
+# RED-FIRST: written to FAIL against the pre-fix shim, which never looked
+# at any image/svg/[role="img"] element at all.
+
+
+def test_shim_marks_decorative_images_alt_empty_and_aria_hidden():
+    assert 'alt", ""' in ARIA_LIVE_HEAD or "alt = \"\"" in ARIA_LIVE_HEAD
+    assert 'aria-hidden", "true"' in ARIA_LIVE_HEAD or 'aria-hidden" , "true"' in ARIA_LIVE_HEAD
+    assert "querySelectorAll" in ARIA_LIVE_HEAD
+    assert "img" in ARIA_LIVE_HEAD and "svg" in ARIA_LIVE_HEAD
+    assert 'role="img"' in ARIA_LIVE_HEAD
+
+
+def test_shim_gives_the_uploaded_photo_preview_a_non_empty_accessible_name():
+    from clarif_eye.ui import IMAGE_INPUT_ELEM_ID, UPLOADED_PHOTO_ALT
+
+    assert UPLOADED_PHOTO_ALT
+    assert UPLOADED_PHOTO_ALT in ARIA_LIVE_HEAD
+    # The uploaded photo must be identified STRUCTURALLY (by living inside
+    # the photo-input component's own container), not by any string/URL
+    # match, so this asserts the shim actually looks inside that container.
+    assert IMAGE_INPUT_ELEM_ID in ARIA_LIVE_HEAD
+
+
+def test_image_labelling_shim_reuses_the_existing_apply_observer_not_a_second_one():
+    # The SAME apply()/MutationObserver pair that already tags the live
+    # region and the description output must also do the image labelling -
+    # not a second observer (see this module's other MutationObserver
+    # regression tests for why: it must survive Gradio re-rendering these
+    # components on every run).
+    assert ARIA_LIVE_HEAD.count("MutationObserver") == 1
+
+
+def test_image_labelling_shim_guards_against_reprocessing_already_marked_images():
+    # Same guard discipline as the rest of apply() (e.g. the aria-live and
+    # deferredPlaySrc checks above): once an image has been classified it
+    # must not be re-processed on every unrelated DOM mutation.
+    assert "a11yImgDone" in ARIA_LIVE_HEAD or "a11y-img-done" in ARIA_LIVE_HEAD
+
+
+def test_image_labelling_never_introduces_a_positive_tabindex():
+    # Removing a decorative image from the tab order must only ever drive
+    # tabindex to "-1" (or leave it alone) - never introduce a positive
+    # value. Reuses the same regex discipline as
+    # test_no_positive_tabindex_anywhere_in_injected_markup above, scoped
+    # to just the image-handling addition so this test is meaningful on its
+    # own even before that broader test is inspected.
+    injected = ARIA_LIVE_HEAD + FOCUS_RESULT_JS
+    for value in re.findall(r'tabindex["\'\s:=,]+["\']?(\d+)', injected, re.IGNORECASE):
+        assert int(value) == 0, f"positive tabindex found: {value}"
