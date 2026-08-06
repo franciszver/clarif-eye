@@ -17,6 +17,7 @@ schema is exactly the 7 architecture-doc keys, nothing more.
 from langgraph.graph import END, StateGraph
 
 from clarif_eye.state import ClarifEyeState
+from clarif_eye.vision import run_vision
 
 
 def _record(config, node_name):
@@ -25,8 +26,8 @@ def _record(config, node_name):
         trace.append(node_name)
 
 
-def vision_node(state, config=None):
-    """Stub for the vision node (issue #5): OCR + scene description.
+def vision_node(state, config=None, client=None):
+    """Vision node (issue #5/P1.2): calls the eyes ladder for OCR + scene description.
 
     ALSO sets complexity_flag as part of its own state update: routing
     depends on this key, so it must be documented as this node's
@@ -34,23 +35,20 @@ def vision_node(state, config=None):
     node forgets to return this key, LangGraph's partial-update merge means
     whatever the caller happened to set (or make_initial_state's hardcoded
     False) silently survives untouched - every request would take the fast
-    path with no exception and no failing test. Issues #5/#6 own the real
-    heuristic and MUST keep returning this key.
+    path with no exception and no failing test. Issue #6 (P1.3) owns the
+    real complexity heuristic and MUST keep returning this key.
 
-    The stub keeps the value simple, deterministic, and derived from the
-    node's own stub OCR pass over the input (a trivial substring check)
-    rather than from any complexity_flag the caller may have set - this
-    also lets both routing branches stay exercisable through the compiled
-    graph in tests, instead of being collapsed to a single hardcoded value.
+    The substantive logic (request building, parsing, degradation) lives in
+    clarif_eye.vision.run_vision so this stays a thin adapter. `client` is
+    injectable directly (for unit tests calling this function) or via
+    config["configurable"]["client"] (for tests driving the compiled
+    graph, the same pattern already used for `trace`); when neither is
+    supplied, run_vision constructs a real OpenRouterClient lazily.
     """
     _record(config, "vision")
-    ocr_output = "stub ocr output"
-    complexity_flag = "complex" in state.get("image_data", "").lower()
-    return {
-        "ocr_output": ocr_output,
-        "scene_context": "stub scene context",
-        "complexity_flag": complexity_flag,
-    }
+    if client is None:
+        client = (config or {}).get("configurable", {}).get("client")
+    return run_vision(state["image_data"], client)
 
 
 def fast_synth_node(state, config=None):

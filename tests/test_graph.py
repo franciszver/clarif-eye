@@ -12,13 +12,35 @@ must contain exactly the 7 architecture-doc keys - see state.py).
 
 import pytest
 
+from clarif_eye.client import CompletionResult
 from clarif_eye.graph import build_graph, dynamic_router, vision_node
 from clarif_eye.state import ClarifEyeState, make_initial_state
 
+# vision_node now calls the real "eyes" ladder (see tests/test_vision.py for
+# the vision-specific behavior). The graph-shape tests below only care about
+# routing and key presence, so they inject this no-network fake client
+# rather than exercising vision parsing/degradation logic themselves.
+LONG_OCR_TEXT = "x" * 250  # over the placeholder complexity threshold
 
-def run(graph, state):
+
+class FakeVisionClient:
+    def __init__(self, content):
+        self.content = content
+
+    def complete(self, role, messages, **params):
+        return CompletionResult(content=self.content, model="fake-eyes-model:free")
+
+
+def _reply(ocr, scene):
+    return f"OCR_TEXT: {ocr}\nSCENE: {scene}"
+
+
+def run(graph, state, client=None):
     trace = []
-    result = graph.invoke(state, config={"configurable": {"trace": trace}})
+    configurable = {"trace": trace}
+    if client is not None:
+        configurable["client"] = client
+    result = graph.invoke(state, config={"configurable": configurable})
     return result, trace
 
 
@@ -102,22 +124,24 @@ def test_dynamic_router_raises_on_non_bool_complexity_flag():
 def test_vision_node_returns_complexity_flag_key():
     # Direct call, no graph: proves the key is part of THIS node's return
     # value, not something it happens to inherit unchanged from the caller.
-    result = vision_node({"image_data": "base64imagedata"})
+    client = FakeVisionClient(_reply("some text", "a room"))
+    result = vision_node({"image_data": "base64imagedata"}, client=client)
     assert "complexity_flag" in result
     assert isinstance(result["complexity_flag"], bool)
 
 
 def test_full_graph_routes_using_node_owned_complexity_flag_not_caller_value():
-    # image_data contains "complex", so vision_node's stub heuristic
-    # computes complexity_flag=True - the OPPOSITE of what we set below on
-    # the initial state. If a future vision node stops returning
-    # complexity_flag, LangGraph's partial-update merge would silently
-    # leave the caller's False in place and this test would fail.
+    # The fake reply's OCR text is long enough to trip the placeholder
+    # complexity heuristic, computing complexity_flag=True - the OPPOSITE of
+    # what we set below on the initial state. If a future vision node stops
+    # returning complexity_flag, LangGraph's partial-update merge would
+    # silently leave the caller's False in place and this test would fail.
     graph = build_graph()
-    state = make_initial_state("a very complex base64imagedata payload")
+    state = make_initial_state("base64imagedata payload")
     state["complexity_flag"] = False
+    client = FakeVisionClient(_reply(LONG_OCR_TEXT, "a busy scene"))
 
-    result, trace = run(graph, state)
+    result, trace = run(graph, state, client=client)
 
     assert result["complexity_flag"] is True
     assert trace == ["vision", "research", "analysis", "tts"]
@@ -130,8 +154,9 @@ def test_full_graph_routes_using_node_owned_complexity_flag_not_caller_value():
 def test_compiled_graph_runs_end_to_end_and_returns_every_state_key():
     graph = build_graph()
     state = make_initial_state("base64imagedata")
+    client = FakeVisionClient(_reply("some text", "a room"))
 
-    result, _ = run(graph, state)
+    result, _ = run(graph, state, client=client)
 
     for key in ClarifEyeState.__annotations__.keys():
         assert key in result
@@ -140,8 +165,9 @@ def test_compiled_graph_runs_end_to_end_and_returns_every_state_key():
 def test_fast_path_populates_every_key_it_touches_scraper_data_stays_empty():
     graph = build_graph()
     state = make_initial_state("base64imagedata")
+    client = FakeVisionClient(_reply("some text", "a room"))
 
-    result, _ = run(graph, state)
+    result, _ = run(graph, state, client=client)
 
     assert result["ocr_output"] != ""
     assert result["scene_context"] != ""
@@ -157,12 +183,14 @@ def test_fast_path_populates_every_key_it_touches_scraper_data_stays_empty():
 
 
 def test_fast_path_visits_vision_fast_synth_tts_only():
-    # image_data has no "complex" substring, so vision_node's stub
-    # heuristic computes complexity_flag=False and the fast path is taken.
+    # Short OCR text keeps vision_node's placeholder heuristic under the
+    # complexity threshold, so complexity_flag=False and the fast path is
+    # taken.
     graph = build_graph()
     state = make_initial_state("base64imagedata")
+    client = FakeVisionClient(_reply("short text", "a room"))
 
-    _, trace = run(graph, state)
+    _, trace = run(graph, state, client=client)
 
     assert trace == ["vision", "fast_synth", "tts"]
     assert "research" not in trace
@@ -173,12 +201,13 @@ def test_fast_path_visits_vision_fast_synth_tts_only():
 
 
 def test_research_path_visits_vision_research_analysis_tts_only():
-    # image_data contains "complex", so vision_node's stub heuristic
-    # computes complexity_flag=True and the research path is taken.
+    # Long OCR text trips vision_node's placeholder complexity heuristic,
+    # so complexity_flag=True and the research path is taken.
     graph = build_graph()
-    state = make_initial_state("a complex base64imagedata payload")
+    state = make_initial_state("base64imagedata")
+    client = FakeVisionClient(_reply(LONG_OCR_TEXT, "a busy scene"))
 
-    _, trace = run(graph, state)
+    _, trace = run(graph, state, client=client)
 
     assert trace == ["vision", "research", "analysis", "tts"]
     assert "fast_synth" not in trace
