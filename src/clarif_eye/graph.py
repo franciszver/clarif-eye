@@ -14,6 +14,8 @@ supplied by the caller), not into the state schema itself - the state
 schema is exactly the 7 architecture-doc keys, nothing more.
 """
 
+import time
+
 from langgraph.graph import END, StateGraph
 
 from clarif_eye.analysis import run_analysis
@@ -23,11 +25,61 @@ from clarif_eye.synth import run_fast_synth
 from clarif_eye.tts import run_tts
 from clarif_eye.vision import run_vision
 
+# Total-pipeline deadline (issue #17 / P6.1). D16 gave "eyes"/"brain" their
+# own per-role ceilings inside client.complete (30s/45s), but nothing
+# bounded the whole graph run - a live measurement found a research-path
+# request taking 99.0s end to end even though 30+45=75s from ceilings
+# alone should already have been close to the worst case (research + tts
+# fill the rest). This closes that gap.
+#
+# MECHANISM: config["configurable"]["deadline"], an ABSOLUTE
+# time.monotonic() timestamp, set once by the caller before invoking the
+# graph (see clarif_eye.ui.handle_submit) - not a new 8th state key (the
+# schema stays at exactly the 7 architecture-doc keys, see state.py). Every
+# node that makes a model or network call reads it via _deadline_exceeded
+# below and, if it has already passed, skips that call and asks its
+# module's run_* function to degrade from whatever state is already known
+# instead (see vision.py/synth.py/analysis.py/research.py's
+# `deadline_exceeded` parameter and *._degrade_from_known). tts_node is
+# deliberately NEVER gated on the deadline: it produces the actual spoken
+# deliverable and is the one node whose own latency (not blowing the
+# budget further) matters more than respecting a budget that's already
+# gone - skipping it would turn "degraded but spoken" into "silent",
+# exactly the failure this issue exists to avoid. Absence of the
+# "deadline" key means unbounded, i.e. today's behavior unchanged (every
+# pre-existing caller/test that never sets one).
+#
+# DEFAULT justification: 60.0s. Generous enough for the typical fast path
+# (vision ~5s + fast_synth ~5s + tts ~2s, per the #17 live measurement) and
+# the typical research path with a reduced scraper cap (vision ~5s +
+# research ~2-3s + analysis ~8s without a large scrape + tts ~2s), while
+# still meaningfully tighter than the worst-case sum of the per-role
+# ceilings alone (eyes 30s + brain 45s = 75s, before research/tts are even
+# counted) - a run that is actually stuck in ladder failover gets cut off
+# and degrades rather than running past a minute, closing exactly the gap
+# the #17 measurement (99.0s) exposed. Provisional, like the scraper cap
+# in analysis.py - the orchestrator can retune it after running
+# scripts/benchmark_pipeline.py.
+DEFAULT_PIPELINE_BUDGET_SECONDS = 60.0
+
 
 def _record(config, node_name):
     trace = config.get("configurable", {}).get("trace") if config else None
     if trace is not None:
         trace.append(node_name)
+
+
+def _deadline_exceeded(config):
+    """True if config["configurable"]["deadline"] (an absolute
+    time.monotonic() timestamp) is set and has already passed.
+
+    No "deadline" key at all means unbounded - always False - so every
+    caller/test that never sets one keeps exactly today's behavior.
+    """
+    deadline = (config or {}).get("configurable", {}).get("deadline")
+    if deadline is None:
+        return False
+    return time.monotonic() >= deadline
 
 
 def vision_node(state, config=None, client=None):
@@ -48,11 +100,16 @@ def vision_node(state, config=None, client=None):
     config["configurable"]["client"] (for tests driving the compiled
     graph, the same pattern already used for `trace`); when neither is
     supplied, run_vision constructs a real OpenRouterClient lazily.
+
+    Checks the total-pipeline deadline (see _deadline_exceeded above) and
+    passes the result to run_vision, which skips the eyes-ladder call
+    entirely if it has already passed - see this module's top-level
+    "Total-pipeline deadline" docstring block.
     """
     _record(config, "vision")
     if client is None:
         client = (config or {}).get("configurable", {}).get("client")
-    return run_vision(state["image_data"], client)
+    return run_vision(state["image_data"], client, deadline_exceeded=_deadline_exceeded(config))
 
 
 def fast_synth_node(state, config=None, client=None):
@@ -63,11 +120,19 @@ def fast_synth_node(state, config=None, client=None):
     the same pattern vision_node already uses. `client` is injectable
     directly or via config["configurable"]["client"]; when neither is
     supplied, run_fast_synth constructs a real OpenRouterClient lazily.
+
+    Checks the total-pipeline deadline (see this module's top-level
+    "Total-pipeline deadline" docstring block) and passes the result to
+    run_fast_synth, which skips the eyes-ladder call and builds
+    final_output straight from ocr_output/scene_context if it has already
+    passed.
     """
     _record(config, "fast_synth")
     if client is None:
         client = (config or {}).get("configurable", {}).get("client")
-    return run_fast_synth(state["ocr_output"], state["scene_context"], client)
+    return run_fast_synth(
+        state["ocr_output"], state["scene_context"], client, deadline_exceeded=_deadline_exceeded(config)
+    )
 
 
 def research_node(state, config=None, searcher=None, client=None):
@@ -84,6 +149,11 @@ def research_node(state, config=None, searcher=None, client=None):
     httpx.Client-like page fetcher, a different type serving a different
     purpose, and reusing the same key would silently hand the wrong kind of
     client to whichever node ran second.
+
+    Checks the total-pipeline deadline (see this module's top-level
+    "Total-pipeline deadline" docstring block) and passes the result to
+    run_research, which skips the search+fetch entirely if it has already
+    passed.
     """
     _record(config, "research")
     configurable = (config or {}).get("configurable", {})
@@ -91,7 +161,13 @@ def research_node(state, config=None, searcher=None, client=None):
         searcher = configurable.get("searcher")
     if client is None:
         client = configurable.get("research_client")
-    return run_research(state["ocr_output"], state["scene_context"], searcher=searcher, client=client)
+    return run_research(
+        state["ocr_output"],
+        state["scene_context"],
+        searcher=searcher,
+        client=client,
+        deadline_exceeded=_deadline_exceeded(config),
+    )
 
 
 def analysis_node(state, config=None, client=None):
@@ -102,12 +178,28 @@ def analysis_node(state, config=None, client=None):
     the same pattern vision_node/fast_synth_node already use. `client` is
     injectable directly or via config["configurable"]["client"]; when
     neither is supplied, run_analysis constructs a real OpenRouterClient
-    lazily.
+    lazily. The scraped-context cap is injectable via
+    config["configurable"]["scraper_data_cap"] (issue #17 / P6.1; see
+    analysis._SCRAPER_DATA_CAP for why 4000 wasn't earning its latency).
+
+    Checks the total-pipeline deadline (see this module's top-level
+    "Total-pipeline deadline" docstring block) and passes the result to
+    run_analysis, which skips the brain-ladder call and builds
+    final_output straight from ocr_output/scene_context if it has already
+    passed.
     """
     _record(config, "analysis")
+    configurable = (config or {}).get("configurable", {})
     if client is None:
-        client = (config or {}).get("configurable", {}).get("client")
-    return run_analysis(state["ocr_output"], state["scene_context"], state["scraper_data"], client)
+        client = configurable.get("client")
+    return run_analysis(
+        state["ocr_output"],
+        state["scene_context"],
+        state["scraper_data"],
+        client,
+        scraper_data_cap=configurable.get("scraper_data_cap"),
+        deadline_exceeded=_deadline_exceeded(config),
+    )
 
 
 def tts_node(state, config=None, provider=None, providers=None):
@@ -129,6 +221,13 @@ def tts_node(state, config=None, provider=None, providers=None):
     different purpose, and reusing the same key would silently hand the
     wrong kind of object to whichever node ran second, the same reasoning
     research_node's "research_client" key documents.
+
+    Deliberately NEVER gated on the total-pipeline deadline (issue #17 /
+    P6.1, see this module's top-level "Total-pipeline deadline" docstring
+    block): tts is what turns final_output into the actual spoken
+    deliverable, so skipping it on a blown deadline would turn "degraded
+    but spoken" into total silence - exactly the failure this pipeline
+    exists to avoid.
     """
     _record(config, "tts")
     configurable = (config or {}).get("configurable", {})

@@ -82,7 +82,24 @@ def _degraded(message):
     return {"final_output": _to_spoken_text(message)}
 
 
-def run_fast_synth(ocr_output, scene_context, client=None):
+def _degrade_from_known(ocr_output, scene_context):
+    """Build final_output directly from ocr_output/scene_context, no model
+    call - used when the pipeline's total deadline (graph.py) is already
+    exhausted by the time this node runs. Deliberately NOT one of the
+    generic "-could not be prepared-" error messages: those describe a
+    failure, whereas vision already succeeded here and its real output is
+    known - issue #17 asks for the run to degrade to what IS known rather
+    than an error placeholder. Same wording pattern as the
+    is_degraded_scene branch just below (scene_context plus any OCR text
+    appended), because that's already this module's established way to
+    speak real, already-known state without a model call.
+    """
+    if ocr_output.strip():
+        return _degraded(f"{scene_context} The following text was found in the photo: {ocr_output}")
+    return _degraded(scene_context)
+
+
+def run_fast_synth(ocr_output, scene_context, client=None, deadline_exceeded=False):
     """Call the eyes ladder to turn (ocr_output, scene_context) into final_output.
 
     `client` is injectable (tests pass a fake); when omitted, a real
@@ -90,6 +107,13 @@ def run_fast_synth(ocr_output, scene_context, client=None):
     injected) is closed in a `finally` before returning; an injected client
     is owned by the caller and is never closed here. See vision.run_vision
     for the identical pattern this mirrors.
+
+    `deadline_exceeded` (issue #17 / P6.1): True means the pipeline's total
+    budget is already spent by the time this node runs (checked by
+    graph.py at node entry). ocr_output/scene_context are already known at
+    this point (vision already ran), so the model call is skipped and
+    final_output is built straight from them instead - see
+    _degrade_from_known.
     """
     ocr_output = ocr_output or ""
     scene_context = scene_context or ""
@@ -114,6 +138,9 @@ def run_fast_synth(ocr_output, scene_context, client=None):
 
     if not scene_context.strip():
         return _degraded("No description is available for this photo.")
+
+    if deadline_exceeded:
+        return _degrade_from_known(ocr_output, scene_context)
 
     owns_client = client is None
     if owns_client:

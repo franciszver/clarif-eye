@@ -324,7 +324,7 @@ def _fetch_and_extract(client, url):
     return None
 
 
-def run_research(ocr_output, scene_context, searcher=None, client=None):
+def run_research(ocr_output, scene_context, searcher=None, client=None, deadline_exceeded=False):
     """Look up external context for the document's subject; return a research_node state update.
 
     Always returns {"scraper_data": <str>} - never raises (except
@@ -333,7 +333,19 @@ def run_research(ocr_output, scene_context, searcher=None, client=None):
     client built here (not injected) is closed in a `finally`; an injected
     client is owned by the caller and never closed here - same pattern as
     vision.run_vision/synth.run_fast_synth's OpenRouterClient handling.
+
+    `deadline_exceeded` (issue #17 / P6.1): True means the pipeline's total
+    budget is already spent by the time this node runs (checked by
+    graph.py at node entry) - the search+fetch is skipped entirely, before
+    any network call. Costs nothing downstream can't already handle:
+    analysis.py already treats "" as "no external context available"
+    regardless of why (see this module's "THE #10 CONTRACT DECISION"), and
+    skipping here frees the remaining budget for analysis/tts to still
+    produce a spoken result.
     """
+    if deadline_exceeded:
+        return {"scraper_data": ""}
+
     query = _derive_query(ocr_output, scene_context)
     if not query:
         return {"scraper_data": ""}
