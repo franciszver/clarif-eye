@@ -377,3 +377,93 @@ def test_audit_js_payload_checks_for_positive_tabindex_and_missing_names():
     # The payload must inspect accessible names (aria-label / innerText /
     # label text), not just presence of elements.
     assert "aria-label" in payload or "getAccessibleName" in payload
+
+
+# --- P5.3 / issue #47: audio autoplay talks over the screen reader --------
+#
+# Real screen-reader use (owner, Narrator on Windows - see
+# docs/ACCESSIBILITY.md's "Human screen-reader verified" section) found the
+# synthesized audio starting at the same moment the completion status was
+# still being spoken, so neither was intelligible. Two changes close this:
+# (1) the with-audio announcement is made SHORT, since the audio itself is
+# the completion signal and a long announcement is redundant *and* actively
+# collides with it; (2) playback is deliberately sequenced to start after a
+# delay instead of relying on brevity alone. Both are checked here
+# STRUCTURALLY, same discipline as the rest of this file - no string-
+# matching the description text, no browser/screen-reader claims.
+#
+# RED-FIRST: written to fail against the pre-fix code, where
+# STATUS_SUCCESS_AUDIO was the long "Description ready. Audio is playing;
+# the text is below too." and gr.Audio had no elem_id / used autoplay=True
+# with no deferred-play shim at all.
+
+
+def test_with_audio_status_is_short_while_without_audio_stays_full():
+    # The with-audio announcement must be short enough to be "over in about
+    # a second" even if it still overlaps slightly with audio starting.
+    # The without-audio statuses have no audio to collide with and must
+    # stay full, since they are the ONLY signal the user gets.
+    assert len(STATUS_SUCCESS_AUDIO) <= 40
+    assert len(STATUS_SUCCESS_TEXT_ONLY) > len(STATUS_SUCCESS_AUDIO)
+    assert len(STATUS_DEGRADED) > len(STATUS_SUCCESS_AUDIO)
+
+
+def test_with_audio_status_no_longer_asserts_audio_is_playing_as_fact():
+    # "Audio is playing" may be FALSE if the browser blocks programmatic
+    # playback (see the sequencing mechanism below) - the wording must be
+    # true either way, so it must not claim playback as an accomplished
+    # fact.
+    assert "is playing" not in STATUS_SUCCESS_AUDIO
+    assert "playing" not in STATUS_SUCCESS_AUDIO.lower()
+
+
+def test_audio_component_does_not_autoplay():
+    # Sequencing option (a): autoplay is turned OFF on the component itself
+    # so audio never starts the instant a src is set - a JS shim (checked
+    # below) starts it deliberately, after a delay, instead.
+    resources = _resources(FakeGraph())
+    demo = build_interface(resources)
+    try:
+        audio_components = [c for c in _components(demo) if isinstance(c, gr.Audio)]
+        assert len(audio_components) == 1
+        assert audio_components[0].autoplay is False
+    finally:
+        demo.close()
+
+
+def test_audio_component_has_elem_id_the_sequencing_shim_can_target():
+    from clarif_eye.ui import AUDIO_ELEM_ID
+
+    resources = _resources(FakeGraph())
+    demo = build_interface(resources)
+    try:
+        audio_components = [c for c in _components(demo) if getattr(c, "elem_id", None) == AUDIO_ELEM_ID]
+        assert len(audio_components) == 1
+        assert isinstance(audio_components[0], gr.Audio)
+    finally:
+        demo.close()
+
+
+def test_sequencing_shim_defers_audio_playback_after_a_delay():
+    # STATIC/SOURCE-LEVEL CHECK ONLY (same discipline as the rest of this
+    # file): asserts the deferred-play mechanism is present in the injected
+    # markup, not that two voices actually stop colliding in a real
+    # screen reader - only a human screen-reader pass by the owner can
+    # confirm that (see docs/ACCESSIBILITY.md's Known defects entry for
+    # #47, which is updated to say "awaiting confirmation", never
+    # "confirmed fixed").
+    from clarif_eye.ui import AUDIO_ELEM_ID, AUDIO_PLAY_DELAY_MS
+
+    assert AUDIO_ELEM_ID in ARIA_LIVE_HEAD
+    assert "setTimeout" in ARIA_LIVE_HEAD
+    assert str(AUDIO_PLAY_DELAY_MS) in ARIA_LIVE_HEAD
+    assert ".play()" in ARIA_LIVE_HEAD
+    # Structural check (audio.src truthiness), never a text/string match
+    # against the status wording - same discipline status_for_result uses.
+    assert "audioEl.src" in ARIA_LIVE_HEAD
+    # Must not leave the user stuck in silence if the browser blocks
+    # programmatic playback: the rejected play() promise is swallowed, not
+    # left to throw, and the <audio> control itself stays present/visible
+    # (autoplay=False never hides it) so it remains reachable to play
+    # manually.
+    assert ".catch(" in ARIA_LIVE_HEAD
