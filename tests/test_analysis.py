@@ -14,6 +14,7 @@ coverage, this file pins:
 """
 
 import re
+from pathlib import Path
 
 import pytest
 
@@ -154,7 +155,12 @@ def test_empty_scraper_data_still_produces_useful_script():
         content="This is a water utility bill. The amount due is $104.95, due by 22 July 2026."
     )
 
-    result = run_analysis("Account Number: 4471-2205-88", "a utility bill", "", client)
+    result = run_analysis(
+        "Account Number: 4471-2205-88 AMOUNT DUE $104.95 PAYMENT DUE BY: 22 July 2026",
+        "a utility bill",
+        "",
+        client,
+    )
 
     assert len(client.calls) == 1
     assert_tts_safe(result["final_output"])
@@ -323,6 +329,160 @@ def test_reply_that_sanitises_to_blank_degrades_without_raising():
     result = run_analysis("some text", "a scene", "", client)
 
     _assert_reasonable_message(result["final_output"], mentions="empty")
+    assert_tts_safe(result["final_output"])
+
+
+# --- FIX 1: numeric fidelity enforced in code, not just the prompt ----------
+#
+# THE CENTRAL RISK (module docstring): a blind user cannot check the spoken
+# script against the source document, so an invented amount/date/identifier
+# is the worst output this node can produce. The prompt asks the model not
+# to do this, but a prompt is not enforcement - these tests pin the
+# code-level backstop in run_analysis.
+
+
+def test_invented_amount_with_transposed_digit_degrades():
+    ocr_output = (
+        "CITY OF RIVERTON WATER UTILITY STATEMENT Account Number: 4471-2205-88 "
+        "AMOUNT DUE $104.95 PAYMENT DUE BY: 22 JULY 2026"
+    )
+    scene_context = "a water utility statement"
+    # $1,045.95 never appears anywhere in the inputs - only $104.95 does.
+    client = FakeAnalysisClient(
+        content="This is a water utility bill. The amount due is $1,045.95."
+    )
+
+    result = run_analysis(ocr_output, scene_context, "", client)
+
+    final_output = result["final_output"]
+    assert_tts_safe(final_output)
+    assert "1,045.95" not in final_output and "1045.95" not in final_output
+    assert "verified" in final_output.lower() or "not safe" in final_output.lower()
+
+
+def test_invented_date_degrades():
+    ocr_output = (
+        "CITY OF RIVERTON WATER UTILITY STATEMENT Account Number: 4471-2205-88 "
+        "AMOUNT DUE $104.95 PAYMENT DUE BY: 22 JULY 2026"
+    )
+    scene_context = "a water utility statement"
+    # "23" never appears anywhere in the inputs - only "22 JULY 2026" does.
+    client = FakeAnalysisClient(
+        content="This is a water utility bill. Payment is due by 23 July 2026."
+    )
+
+    result = run_analysis(ocr_output, scene_context, "", client)
+
+    final_output = result["final_output"]
+    assert_tts_safe(final_output)
+    assert "23 July" not in final_output
+    assert "verified" in final_output.lower() or "not safe" in final_output.lower()
+
+
+def test_legitimate_reply_with_numbers_traceable_to_inputs_passes():
+    ocr_output = (
+        "CITY OF RIVERTON WATER UTILITY STATEMENT Account Number: 4471-2205-88 "
+        "AMOUNT DUE $104.95 PAYMENT DUE BY: 22 JULY 2026"
+    )
+    scene_context = "a water utility statement"
+    client = FakeAnalysisClient(
+        content="This is a water utility bill. Amount due is $104.95, due by 22 JULY 2026."
+    )
+
+    result = run_analysis(ocr_output, scene_context, "", client)
+
+    final_output = result["final_output"]
+    assert_tts_safe(final_output)
+    assert "$104.95" in final_output
+    assert "22 JULY 2026" in final_output
+
+
+def test_reply_with_no_numbers_at_all_passes_with_nothing_to_verify():
+    client = FakeAnalysisClient(
+        content="This appears to be a plain letter with no figures on it."
+    )
+
+    result = run_analysis("some prose with no digits", "a letter", "", client)
+
+    assert_tts_safe(result["final_output"])
+    assert "letter" in result["final_output"].lower()
+
+
+def test_real_fixture_reply_passes_number_verification():
+    """PROVE IT: the actual recorded brain reply must pass the check."""
+    fixtures_dir = Path(__file__).parent / "fixtures"
+    raw_path = fixtures_dir / "analysis_reply_raw.txt"
+    if not raw_path.exists():
+        pytest.skip(f"Fixture not found: {raw_path.name}")
+    raw_reply = raw_path.read_text()
+    ocr_output = (
+        "CITY OF RIVERTON WATER UTILITY STATEMENT Account Number: 4471-2205-88 "
+        "Billing Period: 01 Jun 2026 to 30 Jun 2026 Service Address: 1188 Kestrel "
+        "Lane, Apt 4B Previous Balance $41.20 Current Charges $63.75 Late Fee "
+        "$0.00 AMOUNT DUE $104.95 PAYMENT DUE BY: 22 JULY 2026 Pay online at "
+        "riverton.gov/water"
+    )
+    scene_context = (
+        "A rectangular water utility statement from the City of Riverton showing "
+        "account details, billing period, charges, amount due, and payment deadline."
+    )
+    client = FakeAnalysisClient(content=raw_reply)
+
+    result = run_analysis(ocr_output, scene_context, "", client)
+
+    final_output = result["final_output"]
+    assert_tts_safe(final_output)
+    assert "4471-2205-88" in final_output
+    assert "$104.95" in final_output
+    assert "$41.20" in final_output
+    assert "$63.75" in final_output
+    assert "22 JULY 2026" in final_output
+
+
+# --- FIX 4: scraper_data is capped so a huge scrape cannot silently -------
+# --- truncate ocr_output/scene_context out of the model's context window --
+
+
+def test_scraper_data_is_capped_with_truncation_marker():
+    huge_scrape = "word " * 20000  # far larger than the cap
+    messages = analysis._build_messages("some ocr text", "a scene", huge_scrape)
+
+    text = messages[0]["content"][0]["text"]
+
+    assert "[context truncated]" in text
+    assert len(text) < len(huge_scrape)
+
+
+def test_scraper_data_under_cap_is_not_truncated():
+    small_scrape = "Ibuprofen is an NSAID pain reliever."
+    messages = analysis._build_messages("some ocr text", "a scene", small_scrape)
+
+    text = messages[0]["content"][0]["text"]
+
+    assert small_scrape in text
+    assert "[context truncated]" not in text
+
+
+# --- FIX 5: pin empty-input and empty-scene-context-only behaviors ----------
+
+
+def test_all_empty_inputs_degrades_with_no_description_message():
+    client = FakeAnalysisClient(content="This should never be used.")
+
+    result = run_analysis("", "", "", client)
+
+    assert len(client.calls) == 0
+    assert_tts_safe(result["final_output"])
+    assert result["final_output"] == "No description is available for this photo."
+
+
+def test_real_scene_with_empty_ocr_and_empty_scraper_calls_the_model():
+    client = FakeAnalysisClient(content="This is a plain letter with no visible figures.")
+
+    result = run_analysis("", "a handwritten letter", "", client)
+
+    assert len(client.calls) == 1
+    assert client.calls[0]["role"] == "brain"
     assert_tts_safe(result["final_output"])
 
 

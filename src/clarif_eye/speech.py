@@ -73,6 +73,18 @@ _ITALIC_UNDERSCORE_RE = re.compile(r"(?<!\w)_(?!\s)([^_\n]+?)(?<!\s)_(?!\w)")
 _TABLE_SEPARATOR_CHARS_RE = re.compile(r"^[|:\-\s]*$")
 
 _URL_RE = re.compile(r"\b(?:https?://|www\.)\S+", re.IGNORECASE)
+# Bare domains with no scheme/www prefix (e.g. "riverton.gov/water"): a
+# label made of letters/digits/hyphens, a dot, one of a small set of common
+# TLDs, then an optional /path with no whitespace. Anchored on a real TLD
+# list rather than "any word.word" so it does NOT match decimals (3.14),
+# version strings (v2.5.1 - digits either side of the dot, not letters),
+# filenames (photo.jpg, my_file_name.txt - "jpg"/"txt" aren't in the list),
+# or abbreviations (e.g., i.e. - single-letter labels are excluded by the
+# label needing 2+ characters, and "e"/"i" aren't in the TLD list anyway).
+_BARE_DOMAIN_RE = re.compile(
+    r"\b[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.(?:gov|com|org|net|edu|io)(?:/\S*)?\b",
+    re.IGNORECASE,
+)
 _EMOJI_RE = re.compile(
     "["
     "\U0001f300-\U0001faff"
@@ -145,6 +157,7 @@ def to_spoken_text(text):
     text = _ITALIC_UNDERSCORE_RE.sub(r"\1", text)
     text = text.replace("|", ", ")
     text = _URL_RE.sub("a web link", text)
+    text = _BARE_DOMAIN_RE.sub("a web link", text)
     text = _EMOJI_RE.sub("", text)
     text = _PUNCT_RUN_RE.sub(r"\1", text)
     # Flatten to a single line of flowing prose: a list turned into

@@ -109,6 +109,52 @@ def test_genuine_less_than_sign_is_preserved():
     assert to_spoken_text("5 < 10") == "5 < 10"
 
 
+# --- Bare-domain URLs (review fix, proven by the real analysis fixture) -----
+#
+# The real recorded brain reply ends "...payment can be made online at
+# riverton.gov/water." - _URL_RE only catches https://... and www.... , so a
+# bare domain/path like this was spoken raw by the sanitiser (awkward for a
+# screen reader, and the prompt promises no URLs). These tests pin the fix
+# AND the non-URL strings it must never touch: decimals, version strings,
+# filenames, abbreviations, and times.
+
+
+def test_bare_domain_with_path_becomes_a_web_link():
+    result = to_spoken_text("Payment can be made online at riverton.gov/water.")
+    assert result == "Payment can be made online at a web link."
+    assert "riverton.gov" not in result
+
+
+def test_bare_domain_without_path_becomes_a_web_link():
+    result = to_spoken_text("Visit example.com for details.")
+    assert result == "Visit a web link for details."
+
+
+def test_decimal_number_is_preserved():
+    assert to_spoken_text("The value is 3.14 exactly.") == "The value is 3.14 exactly."
+
+
+def test_version_string_is_preserved():
+    assert to_spoken_text("Running v2.5.1 now.") == "Running v2.5.1 now."
+
+
+def test_filename_with_extension_is_preserved():
+    assert to_spoken_text("See photo.jpg for details.") == "See photo.jpg for details."
+
+
+def test_text_filename_extension_is_preserved():
+    assert to_spoken_text("Check my_file_name.txt please.") == "Check my_file_name.txt please."
+
+
+def test_abbreviations_are_preserved():
+    text = "Bring ID, e.g. a passport, i.e. something with a photo."
+    assert to_spoken_text(text) == text
+
+
+def test_time_of_day_is_preserved():
+    assert to_spoken_text("The meeting is at 3.30pm.") == "The meeting is at 3.30pm."
+
+
 # --- Already-clean prose is untouched ---------------------------------------
 
 

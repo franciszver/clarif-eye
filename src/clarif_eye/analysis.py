@@ -37,9 +37,51 @@ before being returned - never trust the model to actually follow the
 "no markup" instruction in the prompt.
 """
 
+import re
+
 from clarif_eye.client import LadderExhaustedError, OpenRouterClient, OpenRouterError
 from clarif_eye.speech import to_spoken_text as _to_spoken_text
 from clarif_eye.vision import is_degraded_scene
+
+# scraper_data can grow unboundedly (issue #10's web lookups); a large scrape
+# folded whole into the prompt risks silently truncating ocr_output/
+# scene_context out of the model's context window on models that truncate
+# rather than error - the exact "partial reproduction dressed as success"
+# failure this node exists to avoid. ocr_output is NOT capped: it is the
+# primary evidence the anti-hallucination check below verifies numbers
+# against, so cutting it would remove genuine facts, not just noise.
+_SCRAPER_DATA_CAP = 4000
+
+# Number-like tokens (amounts, dates-as-digits, identifiers) that a spoken
+# script must be able to trace back to the source material. Deliberately
+# loose - it is a substring-presence check, not a parser - because the goal
+# is to catch INVENTED numbers, not to validate formatting.
+_NUMBER_TOKEN_RE = re.compile(r"\$?\d[\d,\-./:]*\d|\d")
+
+
+def _strip_currency_punct(text):
+    return text.replace("$", "").replace(",", "")
+
+
+def _numbers_verified(spoken_output, ocr_output, scene_context, scraper_data):
+    """Check that every number-like token spoken aloud traces back to the input text.
+
+    THE CENTRAL RISK (see module docstring) is a model inventing a
+    plausible-sounding amount, date, or identifier that a blind user cannot
+    check. The prompt asks the model not to do this, but a prompt is not
+    enforcement - this is the code-level backstop: every numeric token found
+    in `spoken_output` must appear, as a substring, somewhere in the
+    combined inputs the model was actually given. Comparison is lenient
+    (currency symbols and commas stripped from both sides) so "$104.95" in
+    the output matches "104.95" in the OCR text. A reply with no numeric
+    tokens at all has nothing to verify and trivially passes.
+    """
+    tokens = _NUMBER_TOKEN_RE.findall(spoken_output)
+    if not tokens:
+        return True
+    haystack = _strip_currency_punct(f"{ocr_output} {scene_context} {scraper_data}")
+    return all(_strip_currency_punct(token) in haystack for token in tokens)
+
 
 ANALYSIS_PROMPT = (
     "You are the final stage of an assistant that describes photos aloud "
@@ -68,13 +110,26 @@ def _default_client():
     return OpenRouterClient()
 
 
+def _cap_scraper_data(scraper_data):
+    """Truncate scraper_data to _SCRAPER_DATA_CAP chars at a word boundary.
+
+    A silent cut mid-word (or, worse, mid-number) looks like real evidence;
+    the "[context truncated]" marker instead makes it visible in the prompt
+    body that this isn't the whole scrape.
+    """
+    if len(scraper_data) <= _SCRAPER_DATA_CAP:
+        return scraper_data
+    truncated = scraper_data[:_SCRAPER_DATA_CAP].rsplit(" ", 1)[0]
+    return f"{truncated} [context truncated]"
+
+
 def _build_messages(ocr_output, scene_context, scraper_data):
     if ocr_output:
         body = f"Text found in the photo: {ocr_output}\n\nScene description: {scene_context}"
     else:
         body = f"No text was found in the photo.\n\nScene description: {scene_context}"
     if scraper_data:
-        body += f"\n\nAdditional context from a web lookup: {scraper_data}"
+        body += f"\n\nAdditional context from a web lookup: {_cap_scraper_data(scraper_data)}"
     return [{"role": "user", "content": [{"type": "text", "text": f"{ANALYSIS_PROMPT}\n\n{body}"}]}]
 
 
@@ -157,5 +212,11 @@ def run_analysis(ocr_output, scene_context, scraper_data, client=None):
     spoken = _to_spoken_text(reply)
     if not spoken:
         return _degraded("The analysis model returned an empty response.")
+
+    if not _numbers_verified(spoken, ocr_output, scene_context, scraper_data):
+        return _degraded(
+            "This description could not be verified against the photographed "
+            "text, so it is not safe to read aloud as fact. Please try again."
+        )
 
     return {"final_output": spoken}
