@@ -135,6 +135,27 @@ These are being fixed:
   goes quiet for the chrome and actually reads out the photo's name in a
   real screen reader is something only a human screen-reader pass can
   confirm; that has not happened yet.
+- **Pressing Play collides with the control announcement (#52)**: A real
+  screen-reader pass (owner, Narrator on Windows) found that pressing the
+  audio widget's own Play button - to replay the description, or because
+  the browser had blocked the automatic playback from #47 - made the
+  screen reader announce the control's activation/state change at the same
+  instant the audio started, so the opening seconds of the description
+  (often the most important part) were lost under that announcement. This
+  is distinct from #47: #47 was this app's OWN status text colliding with
+  AUTOMATIC playback; #52 is the SCREEN READER'S OWN announcement, which
+  this app cannot detect or suppress, colliding with a USER GESTURE. **Fix
+  attempted, not yet confirmed by a human screen-reader pass:** the same
+  aria-live shim now delays the actual start of any user-initiated play by
+  about a second (`USER_PLAY_DELAY_MS`), separately from the ~1.8s
+  automatic-playback delay from #47 (`AUDIO_PLAY_DELAY_MS`) - the two
+  delays are structured so a user gesture arriving while the automatic
+  attempt is still pending does not stack into a longer wait. Playback is
+  never started early and then paused again (that would produce an
+  audible stutter); the real start is simply deferred. Pausing is not
+  delayed. Whether this actually gives the announcement enough room to
+  finish before a real screen reader is something only a human
+  screen-reader pass can confirm; that has not happened yet.
 
 ## Known limitations a user should know
 
