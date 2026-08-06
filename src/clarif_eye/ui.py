@@ -104,22 +104,50 @@ STATUS_DEGRADED = "Finished, but with a limited result. See the text below for d
 # constructor (deprecated there since Gradio 6.0) - so it only takes effect
 # when app.py actually launches a real server, never during
 # build_interface() itself (see that function's docstring: it never
-# launches). Runs once on page load; only the status text changes
-# afterward, not the element itself, so a single pass is enough.
+# launches).
+#
+# BUG FOUND VIA REAL-BROWSER CHECK (Chrome DevTools): the original shim ran
+# on window "load", which fires BEFORE Gradio's client-side SPA renders its
+# components. getElementById returned null and the shim silently did
+# nothing - #status-live-region existed in the final DOM but carried none
+# of aria-live/aria-atomic/role, so a screen reader announced no progress
+# at all during the ~15-30s wait.
+#
+# FIX: apply immediately in case the element is already there (harmless
+# no-op otherwise), and also watch the DOM with a MutationObserver so the
+# attributes get applied as soon as Gradio actually renders the element -
+# whenever that happens to be. The observer is never disconnected because
+# Gradio re-renders this output component's DOM node on every run (it's a
+# graph output that updates every submit); apply() re-tags it each time
+# that happens. The `aria-live` check inside apply() is a cheap guard so a
+# already-tagged element is skipped on the (many) unrelated mutations that
+# fire elsewhere on the page, instead of re-setting three attributes on
+# every single DOM change.
 ARIA_LIVE_HEAD = f"""
 <script>
-// Minimal aria-live shim for the status control (issue #15 / P5.1).
+// Aria-live shim for the status control (issue #15 / P5.1).
 // Gradio doesn't expose an aria-live prop, so mark the element by hand:
 // "polite" means a screen reader announces the change without
 // interrupting whatever the user is doing, and never steals focus.
-window.addEventListener("load", () => {{
-  const el = document.getElementById("{STATUS_ELEM_ID}");
-  if (el) {{
-    el.setAttribute("aria-live", "polite");
-    el.setAttribute("aria-atomic", "true");
-    el.setAttribute("role", "status");
+(function () {{
+  function apply() {{
+    const el = document.getElementById("{STATUS_ELEM_ID}");
+    // Guard: skip already-tagged elements so we're not re-setting
+    // attributes on every unrelated mutation elsewhere on the page.
+    if (el && el.getAttribute("aria-live") !== "polite") {{
+      el.setAttribute("aria-live", "polite");
+      el.setAttribute("aria-atomic", "true");
+      el.setAttribute("role", "status");
+    }}
   }}
-}});
+  apply(); // covers the element already being present
+  // Covers the element appearing later (Gradio's SPA render) or being
+  // replaced later (Gradio re-rendering this output on each run).
+  new MutationObserver(apply).observe(document.documentElement, {{
+    childList: true,
+    subtree: true,
+  }});
+}})();
 </script>
 """
 
