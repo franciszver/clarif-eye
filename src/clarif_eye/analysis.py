@@ -54,13 +54,43 @@ _SCRAPER_DATA_CAP = 4000
 
 # Number-like tokens (amounts, dates-as-digits, identifiers) that a spoken
 # script must be able to trace back to the source material. Deliberately
-# loose - it is a substring-presence check, not a parser - because the goal
-# is to catch INVENTED numbers, not to validate formatting.
+# loose - it is a token-equality check, not a parser - because the goal is
+# to catch INVENTED numbers, not to validate formatting.
 _NUMBER_TOKEN_RE = re.compile(r"\$?\d[\d,\-./:]*\d|\d")
+
+# Separators that join multi-part identifiers (an account number like
+# "4471-2205-88", a time like "10:30") rather than a decimal point. Used
+# below to also register each digit-run of such an identifier as its own
+# verifiable token, so a model that legitimately speaks one part of an
+# identifier ("4471") still verifies. "." is deliberately excluded: it is
+# how decimal amounts are written, and registering "104" as a stand-in for
+# "104.95" would let a truncated dollar amount slip back through - exactly
+# the leniency this check exists to close.
+_IDENTIFIER_SPLIT_RE = re.compile(r"[-/:]")
 
 
 def _strip_currency_punct(text):
     return text.replace("$", "").replace(",", "")
+
+
+def _input_number_tokens(ocr_output, scene_context, scraper_data):
+    """Whole number-like tokens (plus identifier sub-parts) from the inputs.
+
+    Each token is a value from the source text taken as a whole - not a
+    substring window into it - so "104.9" cannot pass by being contained in
+    "104.95". For tokens that are hyphen/slash/colon-separated identifiers,
+    the individual digit-runs are also added (see _IDENTIFIER_SPLIT_RE)
+    so a partial identifier mention still verifies.
+    """
+    haystack = f"{ocr_output} {scene_context} {scraper_data}"
+    tokens = set()
+    for raw in _NUMBER_TOKEN_RE.findall(haystack):
+        token = _strip_currency_punct(raw)
+        tokens.add(token)
+        for part in _IDENTIFIER_SPLIT_RE.split(token):
+            if part:
+                tokens.add(part)
+    return tokens
 
 
 def _numbers_verified(spoken_output, ocr_output, scene_context, scraper_data):
@@ -70,17 +100,19 @@ def _numbers_verified(spoken_output, ocr_output, scene_context, scraper_data):
     plausible-sounding amount, date, or identifier that a blind user cannot
     check. The prompt asks the model not to do this, but a prompt is not
     enforcement - this is the code-level backstop: every numeric token found
-    in `spoken_output` must appear, as a substring, somewhere in the
-    combined inputs the model was actually given. Comparison is lenient
-    (currency symbols and commas stripped from both sides) so "$104.95" in
-    the output matches "104.95" in the OCR text. A reply with no numeric
-    tokens at all has nothing to verify and trivially passes.
+    in `spoken_output` must EQUAL a whole number token from the combined
+    inputs the model was actually given (see _input_number_tokens) - not
+    merely appear as a substring of one, which would let a truncated amount
+    like "104.9" pass by virtue of being contained in "104.95". Comparison
+    is lenient (currency symbols and commas stripped from both sides) so
+    "$104.95" in the output matches "104.95" in the OCR text. A reply with
+    no numeric tokens at all has nothing to verify and trivially passes.
     """
     tokens = _NUMBER_TOKEN_RE.findall(spoken_output)
     if not tokens:
         return True
-    haystack = _strip_currency_punct(f"{ocr_output} {scene_context} {scraper_data}")
-    return all(_strip_currency_punct(token) in haystack for token in tokens)
+    input_tokens = _input_number_tokens(ocr_output, scene_context, scraper_data)
+    return all(_strip_currency_punct(token) in input_tokens for token in tokens)
 
 
 ANALYSIS_PROMPT = (

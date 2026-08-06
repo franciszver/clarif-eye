@@ -186,11 +186,14 @@ def test_non_empty_scraper_data_is_included_in_the_request():
 
 
 def test_markup_heavy_reply_is_sanitised_into_clean_spoken_prose():
+    # Note: no number is introduced here that isn't already in the source
+    # OCR ("200mg") - this test is pinning markup sanitisation, not number
+    # verification, and a fabricated number (e.g. an invented refill count)
+    # would now correctly degrade under the whole-token check instead.
     dirty_reply = (
         "# Medication Label\n\n"
         "This is **Ibuprofen** from `MedCo`:\n\n"
-        "- Dosage: 200mg\n"
-        "- Refills: 2\n\n"
+        "- Dosage: 200mg\n\n"
         "| Field | Value |\n"
         "|------|-------|\n"
         "| Dosage | 200mg |\n\n"
@@ -395,6 +398,82 @@ def test_legitimate_reply_with_numbers_traceable_to_inputs_passes():
     assert_tts_safe(final_output)
     assert "$104.95" in final_output
     assert "22 JULY 2026" in final_output
+
+
+def test_truncated_decimal_amount_degrades():
+    """A whole-token check, not substring: "$104.9" must NOT pass just
+    because "104.9" is a substring of "104.95"."""
+    ocr_output = (
+        "CITY OF RIVERTON WATER UTILITY STATEMENT Account Number: 4471-2205-88 "
+        "AMOUNT DUE $104.95 PAYMENT DUE BY: 22 JULY 2026"
+    )
+    scene_context = "a water utility statement"
+    client = FakeAnalysisClient(content="The amount due is $104.9.")
+
+    result = run_analysis(ocr_output, scene_context, "", client)
+
+    final_output = result["final_output"]
+    assert_tts_safe(final_output)
+    assert "$104.9." not in final_output
+    assert "verified" in final_output.lower() or "not safe" in final_output.lower()
+
+
+def test_bare_truncated_amount_without_decimal_degrades():
+    """"104" alone must not pass verification when the source only has
+    "104.95" - "." is not an identifier separator, so "104" is never
+    registered as a stand-in sub-token for "104.95"."""
+    ocr_output = (
+        "CITY OF RIVERTON WATER UTILITY STATEMENT Account Number: 4471-2205-88 "
+        "AMOUNT DUE $104.95 PAYMENT DUE BY: 22 JULY 2026"
+    )
+    scene_context = "a water utility statement"
+    client = FakeAnalysisClient(content="The amount due is 104.")
+
+    result = run_analysis(ocr_output, scene_context, "", client)
+
+    final_output = result["final_output"]
+    assert_tts_safe(final_output)
+    assert "verified" in final_output.lower() or "not safe" in final_output.lower()
+
+
+def test_reformatted_date_still_passes_as_standalone_tokens():
+    """Reformatting "22 JULY 2026" -> "July 22, 2026" must still verify:
+    the input tokeniser already produces "22" and "2026" as standalone
+    tokens from "22 JULY 2026" (the non-digit month text splits them
+    apart), so no identifier sub-tokenisation is needed for this case."""
+    ocr_output = (
+        "CITY OF RIVERTON WATER UTILITY STATEMENT Account Number: 4471-2205-88 "
+        "AMOUNT DUE $104.95 PAYMENT DUE BY: 22 JULY 2026"
+    )
+    scene_context = "a water utility statement"
+    client = FakeAnalysisClient(content="Payment is due by July 22, 2026.")
+
+    result = run_analysis(ocr_output, scene_context, "", client)
+
+    final_output = result["final_output"]
+    assert_tts_safe(final_output)
+    assert "July 22, 2026" in final_output
+
+
+def test_partial_identifier_mention_passes():
+    """Recommendation adopted: hyphen-separated identifier parts (e.g.
+    "4471" out of "4471-2205-88") are registered as their own tokens, so a
+    model that legitimately speaks only part of an identifier still
+    verifies. This is deliberately asymmetric with decimals (see
+    _IDENTIFIER_SPLIT_RE's docstring): "." is never a splitter, so this
+    leniency cannot be used to let a truncated dollar amount through."""
+    ocr_output = (
+        "CITY OF RIVERTON WATER UTILITY STATEMENT Account Number: 4471-2205-88 "
+        "AMOUNT DUE $104.95 PAYMENT DUE BY: 22 JULY 2026"
+    )
+    scene_context = "a water utility statement"
+    client = FakeAnalysisClient(content="The account number starts with 4471.")
+
+    result = run_analysis(ocr_output, scene_context, "", client)
+
+    final_output = result["final_output"]
+    assert_tts_safe(final_output)
+    assert "4471" in final_output
 
 
 def test_reply_with_no_numbers_at_all_passes_with_nothing_to_verify():
