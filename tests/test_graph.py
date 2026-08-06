@@ -38,13 +38,25 @@ def _reply(ocr, scene):
     return f"OCR_TEXT: {ocr}\nSCENE: {scene}"
 
 
-def run(graph, state, client=None):
+def run(graph, state, client=None, tts_provider=None):
     trace = []
     configurable = {"trace": trace}
     if client is not None:
         configurable["client"] = client
+    if tts_provider is not None:
+        configurable["tts_provider"] = tts_provider
     result = graph.invoke(state, config={"configurable": configurable})
     return result, trace
+
+
+# Minimal fake for tts_node's provider seam (clarif_eye.tts) so tests that
+# assert on audio_file_path - without being about tts itself - never touch
+# the network via a real EdgeTtsProvider. Writes a minimal valid-looking
+# mp3 (an ID3 tag) so run_tts's own "looks like audio" check passes.
+class _FakeTtsProvider:
+    def synthesize(self, text, out_path):
+        with open(out_path, "wb") as f:
+            f.write(b"ID3" + b"\x00" * 32)
 
 
 # --- State helper ------------------------------------------------------
@@ -170,7 +182,7 @@ def test_fast_path_populates_every_key_it_touches_scraper_data_stays_empty():
     state = make_initial_state("base64imagedata")
     client = FakeVisionClient(_reply("some text", "a room"))
 
-    result, _ = run(graph, state, client=client)
+    result, _ = run(graph, state, client=client, tts_provider=_FakeTtsProvider())
 
     assert result["ocr_output"] != ""
     assert result["scene_context"] != ""

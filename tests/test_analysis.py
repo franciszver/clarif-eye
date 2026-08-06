@@ -631,6 +631,15 @@ def test_analysis_node_accepts_client_injected_via_config_configurable():
 
 # --- CHECK G: full compiled graph runs end to end on the research path -----
 
+# Minimal fake for tts_node's provider seam (clarif_eye.tts) so this
+# end-to-end test - which is about analysis, not tts - never touches the
+# network via a real EdgeTtsProvider. Writes a minimal valid-looking mp3
+# (an ID3 tag) so run_tts's own "looks like audio" check passes.
+class _FakeTtsProvider:
+    def synthesize(self, text, out_path):
+        with open(out_path, "wb") as f:
+            f.write(b"ID3" + b"\x00" * 32)
+
 
 def test_full_compiled_graph_runs_end_to_end_on_research_path_with_fake_client():
     vision_reply = (
@@ -663,7 +672,10 @@ def test_full_compiled_graph_runs_end_to_end_on_research_path_with_fake_client()
     graph = build_graph()
     state = make_initial_state("base64data")
 
-    result = graph.invoke(state, config={"configurable": {"trace": [], "client": client}})
+    result = graph.invoke(
+        state,
+        config={"configurable": {"trace": [], "client": client, "tts_provider": _FakeTtsProvider()}},
+    )
 
     assert result["complexity_flag"] is True
     assert_tts_safe(result["final_output"])
