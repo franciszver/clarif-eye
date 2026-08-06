@@ -20,7 +20,10 @@ from clarif_eye.state import ClarifEyeState, make_initial_state
 # the vision-specific behavior). The graph-shape tests below only care about
 # routing and key presence, so they inject this no-network fake client
 # rather than exercising vision parsing/degradation logic themselves.
-LONG_OCR_TEXT = "x" * 250  # over the placeholder complexity threshold
+# 200 words, no data-density signals: trips only the router's long-document
+# word-count fallback (see clarif_eye.router), not the digit/currency/keyword
+# signals.
+LONG_OCR_TEXT = " ".join(["x"] * 200)
 
 
 class FakeVisionClient:
@@ -131,7 +134,7 @@ def test_vision_node_returns_complexity_flag_key():
 
 
 def test_full_graph_routes_using_node_owned_complexity_flag_not_caller_value():
-    # The fake reply's OCR text is long enough to trip the placeholder
+    # The fake reply's OCR text is long enough to trip the router's
     # complexity heuristic, computing complexity_flag=True - the OPPOSITE of
     # what we set below on the initial state. If a future vision node stops
     # returning complexity_flag, LangGraph's partial-update merge would
@@ -183,9 +186,9 @@ def test_fast_path_populates_every_key_it_touches_scraper_data_stays_empty():
 
 
 def test_fast_path_visits_vision_fast_synth_tts_only():
-    # Short OCR text keeps vision_node's placeholder heuristic under the
-    # complexity threshold, so complexity_flag=False and the fast path is
-    # taken.
+    # Short OCR text with no data-density signals keeps the router's
+    # complexity heuristic under threshold, so complexity_flag=False and
+    # the fast path is taken.
     graph = build_graph()
     state = make_initial_state("base64imagedata")
     client = FakeVisionClient(_reply("short text", "a room"))
@@ -201,8 +204,9 @@ def test_fast_path_visits_vision_fast_synth_tts_only():
 
 
 def test_research_path_visits_vision_research_analysis_tts_only():
-    # Long OCR text trips vision_node's placeholder complexity heuristic,
-    # so complexity_flag=True and the research path is taken.
+    # Long OCR text trips the router's complexity heuristic (long-document
+    # word-count fallback), so complexity_flag=True and the research path
+    # is taken.
     graph = build_graph()
     state = make_initial_state("base64imagedata")
     client = FakeVisionClient(_reply(LONG_OCR_TEXT, "a busy scene"))

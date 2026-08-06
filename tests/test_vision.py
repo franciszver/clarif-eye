@@ -15,7 +15,11 @@ from clarif_eye.state import make_initial_state
 from clarif_eye import vision
 from clarif_eye.vision import _parse_reply, run_vision
 
-LONG_TEXT = "x" * 250  # deliberately over the placeholder complexity threshold
+# 200 words, no data-density signals: trips only the router's long-document
+# word-count fallback (see clarif_eye.router), not the digit/currency/keyword
+# signals - i.e. exercises the "genuinely long document" branch of the
+# complexity heuristic.
+LONG_TEXT = " ".join(["x"] * 200)
 
 
 def _assert_reasonable_message(message, *, mentions):
