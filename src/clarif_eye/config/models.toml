@@ -37,9 +37,11 @@ ladder = [
 # bill, is dense with numbers and was recorded complexity_flag=true - the
 # architecture doc's ">50 words" rule would misroute it to the fast path).
 # The heuristic instead scores three data-density signals (digit count,
-# currency-amount count, document keyword hits) plus a much higher word
-# count as a fallback for genuinely long documents. All numbers here are
-# judgment calibrated against that one sample, not a tuned corpus.
+# currency-amount count, document keyword hits, all computed from
+# ocr_output only - never scene_context, which is model-generated prose,
+# not evidence about the photo) plus a much higher word count as a
+# fallback for genuinely long documents. All numbers here are judgment
+# calibrated against that one sample, not a tuned corpus.
 [router]
 # Fallback: a document this long is worth the research path even with no
 # other signal (e.g. dense prose that doesn't match our keyword list).
@@ -53,8 +55,23 @@ signal_score_threshold = 2
 digit_count_threshold = 6
 # Currency signal: count of currency-symbol-followed-by-digit matches.
 currency_count_threshold = 1
-# Keyword signal: count of keyword substring hits in ocr_output + scene_context.
+# Keyword signal: count of whole-word keyword hits in ocr_output.
 keyword_hit_threshold = 1
+# Keyword-alone override: this many distinct keyword hits route to
+# research even if neither of the other two signals fires. High-stakes
+# documents like a prescription label ("TABLETS", "MG", "DAILY") often
+# carry almost no digit/currency density, so vocabulary alone must be able
+# to decide - see router.py module docstring.
+keyword_strong_hit_threshold = 2
+# Word-count-fallback script awareness: whitespace splitting undercounts
+# scripts without spaces between words (e.g. CJK), so a long CJK document
+# could otherwise slip past word_count_threshold. If the average
+# characters-per-whitespace-token exceeds this, treat the text as
+# whitespace-free and estimate word count from character count instead.
+max_avg_word_chars = 20
+# Divisor used for that character-based estimate (~chars per "word" in a
+# script without spacing).
+chars_per_word_estimate = 2
 currency_symbols = ["$", "€", "£", "¥"]
 keywords = [
     "account number", "invoice", "reference number", "order number",
@@ -62,4 +79,12 @@ keywords = [
     "member id", "case number", "ticket number", "statement",
     "bill", "receipt", "balance", "due", "payment", "amount due",
     "total", "subtotal", "tax",
+    # Medication/pharmacy vocabulary (fresh-review FIX 1): the list above
+    # is purely billing vocabulary, so a prescription label - the
+    # highest-stakes input this router sees - could never score a keyword
+    # hit at all.
+    "tablet", "tablets", "capsule", "capsules", "dose", "doses", "dosage",
+    "mg", "ml", "prescription", "prescriptions", "refill", "refills",
+    "pharmacy", "take", "daily", "twice", "hours", "warning", "exp",
+    "expiry", "expiration", "pill", "pills",
 ]

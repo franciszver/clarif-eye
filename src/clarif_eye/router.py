@@ -21,19 +21,37 @@ simple).
 
 THE CHOSEN RULE
 ----------------
-Score three data-density signals, independent of length:
+Score three data-density signals, computed from ocr_output ONLY:
   1. digit density   - total digit characters in ocr_output
   2. currency hits   - count of currency-symbol-followed-by-digit matches
-  3. keyword hits     - document/identifier keyword substrings, checked
-                         across ocr_output AND scene_context (the vision
-                         model's own description - e.g. "a...statement" -
-                         is itself a legitimate signal)
+  3. keyword hits     - document/identifier/medication keyword matches
+                         (whole-word, see _keyword_hit_count)
 
-complexity_flag is True if at least `signal_score_threshold` of those 3
-signals fire, OR ocr_output has at least `word_count_threshold` words (a
-much higher bar than the doc's 50 - a fallback for genuinely long
-documents that don't happen to match the keyword list, not a trigger for
-an ordinary long sign or sentence).
+scene_context is deliberately NOT scored, even though it is still a
+function parameter (callers pass it, and it is kept for future use). It
+is model-generated prose describing the photo, not evidence about the
+photographed document itself; scoring it made routing depend on how the
+vision model chose to phrase its hedge ("could be a receipt or invoice
+with a balance due") rather than on what was actually photographed, and
+that hedging language could tip an ordinary product photo into the
+research path.
+
+complexity_flag is True if:
+  - at least `signal_score_threshold` of the 3 signals above fire, OR
+  - keyword_hits alone reaches `keyword_strong_hit_threshold` (a lower,
+    single-signal bar). This exists because some high-stakes documents -
+    a prescription label chief among them - carry their signal almost
+    entirely in vocabulary ("TABLETS", "MG", "DAILY") rather than in
+    digit or currency density, and a wrong dosage read aloud is worse
+    than an occasional unnecessary trip through the slower path, so two
+    or more distinct keyword hits are treated as sufficient on their
+    own. This is a judgment call, not measured, and is configurable.
+  - OR ocr_output implies at least `word_count_threshold` words (a much
+    higher bar than the doc's 50 - a fallback for genuinely long
+    documents that don't happen to match the keyword list, not a trigger
+    for an ordinary long sign or sentence). Word count is normally
+    whitespace-based, but scripts without whitespace (e.g. CJK) are
+    estimated from character count instead - see classify_complexity.
 
 All thresholds and the keyword/currency-symbol lists live in
 config/models.toml under [router] (see load_router_config), not as
@@ -44,6 +62,7 @@ without a code change.
 
 import re
 import tomllib
+from functools import lru_cache
 from importlib import resources
 from pathlib import Path
 from typing import NamedTuple
@@ -59,6 +78,9 @@ class RouterConfig(NamedTuple):
     digit_count_threshold: int
     currency_count_threshold: int
     keyword_hit_threshold: int
+    keyword_strong_hit_threshold: int
+    max_avg_word_chars: int
+    chars_per_word_estimate: int
     currency_symbols: tuple
     keywords: tuple
 
@@ -69,8 +91,11 @@ class RouterDecision(NamedTuple):
 
 
 def _validate_positive_int(value, name):
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise RouterError(f"router config {name!r} must be a non-negative int, got {value!r}")
+    # >= 1, not >= 0: a count threshold of 0 silently degenerates that
+    # signal to always-true (e.g. digits >= 0 is always True), which
+    # defeats the point of having the signal at all.
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise RouterError(f"router config {name!r} must be a positive int (>= 1), got {value!r}")
     return value
 
 
@@ -95,6 +120,9 @@ def _validate_router_section(section):
         "digit_count_threshold",
         "currency_count_threshold",
         "keyword_hit_threshold",
+        "keyword_strong_hit_threshold",
+        "max_avg_word_chars",
+        "chars_per_word_estimate",
     )
     for field in required_int_fields:
         if field not in section:
@@ -121,6 +149,9 @@ def _validate_router_section(section):
         digit_count_threshold=values["digit_count_threshold"],
         currency_count_threshold=values["currency_count_threshold"],
         keyword_hit_threshold=values["keyword_hit_threshold"],
+        keyword_strong_hit_threshold=values["keyword_strong_hit_threshold"],
+        max_avg_word_chars=values["max_avg_word_chars"],
+        chars_per_word_estimate=values["chars_per_word_estimate"],
         currency_symbols=currency_symbols,
         keywords=keywords,
     )
@@ -151,6 +182,21 @@ def load_router_config(path=None):
     return _validate_router_section(data["router"])
 
 
+@lru_cache(maxsize=1)
+def _cached_default_config():
+    """The packaged [router] config, loaded from disk exactly once.
+
+    classify_complexity is called on every single request (vision.py never
+    passes an explicit config), so re-parsing models.toml from disk each
+    time - as the OpenRouter client used to do for the model registry -
+    means one file open per request for a file that never changes at
+    runtime. Cached here instead; tests that need a fresh/different config
+    pass one explicitly via classify_complexity's `config` parameter (which
+    bypasses this cache entirely) or call load_router_config(path) directly.
+    """
+    return load_router_config()
+
+
 def _currency_hit_count(text, currency_symbols):
     count = 0
     for symbol in currency_symbols:
@@ -159,43 +205,71 @@ def _currency_hit_count(text, currency_symbols):
 
 
 def _keyword_hit_count(text_lower, keywords):
-    return sum(1 for kw in keywords if kw in text_lower)
+    # Word-boundary matching, not plain substring `in`: unanchored
+    # substrings produce absurd matches ("bill" inside "Billings", "tax"
+    # inside "taxi", "due" inside "residue"). \b works for multi-word
+    # keywords too (e.g. "invoice number") since it only anchors the two
+    # ends of the phrase.
+    return sum(1 for kw in keywords if re.search(r"\b" + re.escape(kw) + r"\b", text_lower))
 
 
 def classify_complexity(ocr_output, scene_context, config=None):
-    """Decide complexity_flag from ocr_output and scene_context.
+    """Decide complexity_flag from ocr_output (scene_context is unused - see
+    module docstring "THE CHOSEN RULE" for why).
 
     Pure, deterministic, no network/model call: same input always yields
     the same RouterDecision. Returns (complexity_flag, reason) so callers
     (and tests) can see WHY a given input routed where it did without a
     state schema change - state stays at exactly 7 keys.
+
+    scene_context stays in the signature (callers already pass it, and a
+    future issue may find a legitimate, deliberately-separate use for it)
+    but it does not participate in scoring.
     """
     if config is None:
-        config = load_router_config()
+        config = _cached_default_config()
 
     ocr_output = ocr_output or ""
     scene_context = scene_context or ""
 
+    char_count = len(ocr_output)
     word_count = len(ocr_output.split())
+    # Whitespace-based word counting silently collapses scripts that don't
+    # use spaces between words (e.g. CJK) into a single "word", so a long
+    # CJK document falls through the long-document fallback. Detect that
+    # by looking at the average characters-per-token: a plausible
+    # whitespace-separated word count and a huge average length are
+    # mutually implausible only in this whitespace-free case; fall back to
+    # a character-based estimate when it happens.
+    avg_word_chars = char_count / word_count if word_count > 0 else char_count
+    if avg_word_chars > config.max_avg_word_chars:
+        word_count = char_count // config.chars_per_word_estimate
+
     digit_count = sum(ch.isdigit() for ch in ocr_output)
     currency_count = _currency_hit_count(ocr_output, config.currency_symbols)
 
-    combined_lower = f"{ocr_output}\n{scene_context}".lower()
-    keyword_hits = _keyword_hit_count(combined_lower, config.keywords)
+    keyword_hits = _keyword_hit_count(ocr_output.lower(), config.keywords)
 
     digit_signal = digit_count >= config.digit_count_threshold
     currency_signal = currency_count >= config.currency_count_threshold
     keyword_signal = keyword_hits >= config.keyword_hit_threshold
     signal_score = sum((digit_signal, currency_signal, keyword_signal))
 
+    # A prescription label's evidence is almost entirely vocabulary
+    # ("TABLETS", "MG", "DAILY") with no reliable digit/currency density,
+    # so two or more distinct keyword hits alone are enough - see module
+    # docstring.
+    keyword_strong_signal = keyword_hits >= config.keyword_strong_hit_threshold
+
     long_document = word_count >= config.word_count_threshold
-    complexity_flag = signal_score >= config.signal_score_threshold or long_document
+    complexity_flag = signal_score >= config.signal_score_threshold or long_document or keyword_strong_signal
 
     reason = (
         f"word_count={word_count} (long_document>={config.word_count_threshold}: {long_document}); "
         f"digits={digit_count} (>={config.digit_count_threshold}: {digit_signal}); "
         f"currency_hits={currency_count} (>={config.currency_count_threshold}: {currency_signal}); "
-        f"keyword_hits={keyword_hits} (>={config.keyword_hit_threshold}: {keyword_signal}); "
+        f"keyword_hits={keyword_hits} (>={config.keyword_hit_threshold}: {keyword_signal}, "
+        f"strong>={config.keyword_strong_hit_threshold}: {keyword_strong_signal}); "
         f"signal_score={signal_score}/{config.signal_score_threshold} "
         f"-> {'research' if complexity_flag else 'fast_synth'}"
     )

@@ -152,6 +152,9 @@ def test_config_loads_from_toml_file(tmp_path):
         digit_count_threshold = 6
         currency_count_threshold = 1
         keyword_hit_threshold = 1
+        keyword_strong_hit_threshold = 2
+        max_avg_word_chars = 20
+        chars_per_word_estimate = 2
         currency_symbols = ["$"]
         keywords = ["total", "tax"]
         """,
@@ -172,6 +175,9 @@ def test_custom_toml_threshold_flips_routing(tmp_path):
         digit_count_threshold = 6
         currency_count_threshold = 1
         keyword_hit_threshold = 1
+        keyword_strong_hit_threshold = 2
+        max_avg_word_chars = 20
+        chars_per_word_estimate = 2
         currency_symbols = ["$"]
         keywords = ["total", "tax"]
         """,
@@ -213,8 +219,167 @@ def test_router_config_direct_construction():
         digit_count_threshold=2,
         currency_count_threshold=1,
         keyword_hit_threshold=1,
+        keyword_strong_hit_threshold=2,
+        max_avg_word_chars=20,
+        chars_per_word_estimate=2,
         currency_symbols=("$",),
         keywords=("bill",),
     )
     decision = classify_complexity("bill 12 34", "a note", config=config)
     assert decision.complexity_flag is True
+
+
+# --- FIX 1: medication labels must route to research ------------------------
+
+
+MEDICATION_LABELS = [
+    (
+        "amoxicillin_label",
+        "TAKE 1 TABLET BY MOUTH TWICE DAILY\nAMOXICILLIN 500 MG\nQTY 30\nREFILLS: 2",
+    ),
+    (
+        "ibuprofen_label",
+        "IBUPROFEN 200 MG\nTAKE 2 TABLETS EVERY 6 HOURS",
+    ),
+    (
+        "lisinopril_label",
+        "LISINOPRIL 10 MG TABLET\nTAKE ONE TABLET BY MOUTH DAILY\nQTY: 30 REFILLS: 0\nEXP: 03/2027",
+    ),
+]
+
+
+@pytest.mark.parametrize("case_id,ocr", MEDICATION_LABELS, ids=[c[0] for c in MEDICATION_LABELS])
+def test_medication_labels_route_to_research(case_id, ocr):
+    decision = classify_complexity(ocr, "a small printed label")
+    assert decision.complexity_flag is True, f"{case_id}: reason={decision.reason}"
+
+
+# --- FIX 2: scene_context (model prose) must not contribute to scoring ------
+
+
+def test_cereal_box_scene_prose_does_not_trigger_research():
+    ocr = "8901030875021 NET WT 340g"
+    scene = "This looks like it could be a receipt or invoice with a balance due"
+    decision = classify_complexity(ocr, scene)
+    assert decision.complexity_flag is False, decision.reason
+    assert "keyword_hits=0" in decision.reason
+
+
+def test_sticky_note_scene_prose_does_not_trigger_research():
+    ocr = "Call 555-867-5309 for details"
+    scene = "This resembles an official statement or bill"
+    decision = classify_complexity(ocr, scene)
+    assert decision.complexity_flag is False, decision.reason
+    assert "keyword_hits=0" in decision.reason
+
+
+# --- FIX 3: keyword matching is whole-word, not unanchored substring -------
+
+
+UNANCHORED_SUBSTRING_CASES = [
+    ("billings", "WELCOME TO BILLINGS MONTANA POP 109936 ELEV 3160"),
+    ("totally", "This road is totally closed ahead"),
+    ("taxi", "Please hail a taxi outside the airport"),
+    ("residue", "Wipe away any residue before use"),
+]
+
+
+@pytest.mark.parametrize("case_id,ocr", UNANCHORED_SUBSTRING_CASES, ids=[c[0] for c in UNANCHORED_SUBSTRING_CASES])
+def test_unanchored_substrings_do_not_count_as_keyword_hits(case_id, ocr):
+    decision = classify_complexity(ocr, "a sign")
+    assert "keyword_hits=0" in decision.reason, f"{case_id}: reason={decision.reason}"
+
+
+def test_multi_word_keyword_still_matches_whole_phrase():
+    decision = classify_complexity("Your order number 12345 has shipped", "a note")
+    assert "keyword_hits=1" in decision.reason
+
+
+# --- FIX 5: each of the 3 signals must be independently load-bearing -------
+#
+# Each case below fires exactly 2 of the 3 signals to reach the default
+# signal_score_threshold of 2, with the 3rd signal deliberately absent (and
+# keyword_hits kept below keyword_strong_hit_threshold so the keyword-alone
+# override can't mask the result). Deleting any ONE signal from the scoring
+# code turns one of its firing signals off, which drops that case's score
+# below 2 and flips complexity_flag from True to False - i.e. removing any
+# one signal fails at least one of these tests, proven manually in the
+# task's CHECK F.
+
+
+def test_digit_and_currency_signals_alone_reach_threshold_without_keyword():
+    decision = classify_complexity("123456 $9.99", "a note")
+    assert "keyword_hits=0" in decision.reason
+    assert decision.complexity_flag is True, decision.reason
+
+
+def test_currency_and_keyword_signals_alone_reach_threshold_without_digit():
+    decision = classify_complexity("Please pay total $5", "a note")
+    assert "digits=1 " in decision.reason
+    assert decision.complexity_flag is True, decision.reason
+
+
+def test_digit_and_keyword_signals_alone_reach_threshold_without_currency():
+    decision = classify_complexity("Order number 123456", "a note")
+    assert "currency_hits=0" in decision.reason
+    assert decision.complexity_flag is True, decision.reason
+
+
+# --- FIX 6: word-count fallback must be script-aware (CJK has no spaces) ---
+
+
+def test_long_cjk_document_routes_to_research():
+    # No ASCII whitespace at all, so len(text.split()) == 1 regardless of
+    # length - this must fall back to a character-based estimate.
+    ocr = "これは長い日本語の文章です。" * 25  # ~350 characters, 0 spaces
+    assert len(ocr.split()) == 1
+    decision = classify_complexity(ocr, "a printed page of Japanese text")
+    assert decision.complexity_flag is True, decision.reason
+
+
+# --- FIX 7: a count threshold of 0 must be rejected at load time -----------
+
+
+def test_zero_digit_count_threshold_rejected(tmp_path):
+    path = tmp_path / "router.toml"
+    path.write_text(
+        """
+        [router]
+        word_count_threshold = 150
+        signal_score_threshold = 2
+        digit_count_threshold = 0
+        currency_count_threshold = 1
+        keyword_hit_threshold = 1
+        keyword_strong_hit_threshold = 2
+        max_avg_word_chars = 20
+        chars_per_word_estimate = 2
+        currency_symbols = ["$"]
+        keywords = ["total", "tax"]
+        """,
+        encoding="utf-8",
+    )
+    with pytest.raises(RouterError, match="digit_count_threshold"):
+        load_router_config(path)
+
+
+# --- FIX 4: config is loaded from disk exactly once, not per call ----------
+
+
+def test_config_loaded_from_disk_exactly_once_across_many_calls(monkeypatch):
+    from clarif_eye import router
+
+    router._cached_default_config.cache_clear()
+    calls = []
+    real_load_router_config = router.load_router_config
+
+    def counting_load(path=None):
+        calls.append(path)
+        return real_load_router_config(path)
+
+    monkeypatch.setattr(router, "load_router_config", counting_load)
+    try:
+        for _ in range(5):
+            router.classify_complexity("some ocr text", "some scene")
+        assert len(calls) == 1
+    finally:
+        router._cached_default_config.cache_clear()
