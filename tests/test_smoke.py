@@ -6,11 +6,6 @@ from pathlib import Path
 import clarif_eye
 
 
-def test_import_clarif_eye():
-    """Test that clarif_eye can be imported."""
-    assert clarif_eye is not None
-
-
 def test_version_exists():
     """Test that clarif_eye has a __version__ attribute."""
     assert hasattr(clarif_eye, "__version__")
