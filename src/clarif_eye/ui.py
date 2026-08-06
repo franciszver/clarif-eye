@@ -123,6 +123,19 @@ STATUS_DEGRADED = "Finished, but with a limited result. See the text below for d
 # already-tagged element is skipped on the (many) unrelated mutations that
 # fire elsewhere on the page, instead of re-setting three attributes on
 # every single DOM change.
+#
+# KEYBOARD-REACHABILITY FIX (found via real-browser Chrome DevTools check,
+# same follow-up to issue #15): Gradio 6.22 renders an output-only Textbox
+# with a `disabled` <textarea>. A disabled form control cannot receive
+# focus and is skipped by keyboard Tab navigation entirely - so
+# #description-output, the accessible fallback shown whenever audio isn't
+# available, was NOT in the tab order at all, and FOCUS_RESULT_JS's
+# el.focus() call below silently did nothing. The SAME apply()/
+# MutationObserver pair (reused, not duplicated, so it survives Gradio
+# re-rendering this output on every run exactly like the aria-live tagging
+# must) also strips `disabled` off that textarea and swaps in `readOnly` +
+# `tabindex="0"` instead: readonly text inputs remain non-editable but,
+# unlike disabled ones, ARE focusable and part of the tab order.
 ARIA_LIVE_HEAD = f"""
 <script>
 // Aria-live shim for the status control (issue #15 / P5.1).
@@ -138,6 +151,16 @@ ARIA_LIVE_HEAD = f"""
       el.setAttribute("aria-live", "polite");
       el.setAttribute("aria-atomic", "true");
       el.setAttribute("role", "status");
+    }}
+    // Keyboard-reachability fix: swap disabled -> readOnly + tabindex on
+    // the description output so it stays non-editable but re-enters the
+    // tab order. Guard: only touch it while still disabled, so this isn't
+    // re-run on every unrelated mutation either.
+    const resultEl = document.querySelector("#{RESULT_ELEM_ID} textarea");
+    if (resultEl && resultEl.disabled) {{
+      resultEl.disabled = false;
+      resultEl.readOnly = true;
+      resultEl.setAttribute("tabindex", "0");
     }}
   }}
   apply(); // covers the element already being present
@@ -160,8 +183,15 @@ ARIA_LIVE_HEAD = f"""
 # with the image input.
 FOCUS_RESULT_JS = f"""
 () => {{
-  const el = document.querySelector('#{RESULT_ELEM_ID} textarea');
-  if (el) {{ el.focus(); }}
+  // Defensive: if the element isn't there, or isn't focusable for any
+  // reason (e.g. the keyboard-reachability shim above hasn't run yet, or
+  // Gradio changes how it renders this output), this must not throw -
+  // an uncaught client-side error would be silent to the user but is
+  // still a correctness bug.
+  try {{
+    const el = document.querySelector('#{RESULT_ELEM_ID} textarea');
+    if (el && typeof el.focus === 'function') {{ el.focus(); }}
+  }} catch (e) {{}}
 }}
 """
 
