@@ -59,7 +59,7 @@ def main():
         parsed = {
             "ocr_output": ocr_output,
             "scene_context": scene_context,
-            "complexity_flag": len(ocr_output) > 200,
+            "complexity_flag": vision._complexity_flag(ocr_output),
         }
 
     FIXTURES_DIR.mkdir(parents=True, exist_ok=True)

@@ -59,6 +59,16 @@ def _build_messages(image_data):
     ]
 
 
+def _strip_code_fence(text):
+    """Strip a leading/trailing ``` fence line (and language tag) if present."""
+    lines = text.split("\n")
+    if lines and lines[0].strip().startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
 def _parse_reply(reply):
     """Parse the model's reply into (ocr_output, scene_context), or None.
 
@@ -67,26 +77,56 @@ def _parse_reply(reply):
     parses to "" is valid (no visible text); the scene section is the only
     one required to be non-blank, since a legitimate reply always describes
     something.
+
+    A line counts as a section header ONLY if it BEGINS (after stripping
+    leading whitespace) with the marker - a marker string occurring mid-line
+    (e.g. photographed text that happens to read "...SCENE: 4...") is just
+    body text, not a new section, so it stays folded into whichever section
+    it physically falls in. The requested reply format has exactly one
+    header line per marker; if either marker's header line appears zero or
+    more than once, the reply is ambiguous (a real header could be hiding
+    among noise, or noise could look like a header) and the whole reply is
+    treated as unparseable rather than guessing which occurrence is real.
     """
-    if OCR_MARKER not in reply or SCENE_MARKER not in reply:
+    lines = reply.split("\n")
+
+    ocr_starts = []
+    scene_starts = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith(OCR_MARKER):
+            ocr_starts.append(i)
+        elif stripped.startswith(SCENE_MARKER):
+            scene_starts.append(i)
+
+    if len(ocr_starts) != 1 or len(scene_starts) != 1:
         return None
 
-    ocr_index = reply.index(OCR_MARKER)
-    scene_index = reply.index(SCENE_MARKER)
-    if ocr_index == scene_index:
-        return None
+    ocr_index = ocr_starts[0]
+    scene_index = scene_starts[0]
+
+    def section_text(start_index, marker, end_index):
+        first_line = lines[start_index].strip()[len(marker) :]
+        body_lines = [first_line] + lines[start_index + 1 : end_index]
+        return _strip_code_fence("\n".join(body_lines).strip())
 
     if ocr_index < scene_index:
-        ocr_text = reply[ocr_index + len(OCR_MARKER) : scene_index].strip()
-        scene_text = reply[scene_index + len(SCENE_MARKER) :].strip()
+        ocr_text = section_text(ocr_index, OCR_MARKER, scene_index)
+        scene_text = section_text(scene_index, SCENE_MARKER, len(lines))
     else:
-        scene_text = reply[scene_index + len(SCENE_MARKER) : ocr_index].strip()
-        ocr_text = reply[ocr_index + len(OCR_MARKER) :].strip()
+        scene_text = section_text(scene_index, SCENE_MARKER, ocr_index)
+        ocr_text = section_text(ocr_index, OCR_MARKER, len(lines))
 
     if not scene_text:
         return None
 
     return ocr_text, scene_text
+
+
+def _complexity_flag(ocr_output):
+    # Placeholder rule (issue #6 / P1.3 owns the real heuristic): shared so
+    # run_vision and the fixture recorder script can't silently diverge.
+    return len(ocr_output) > 200
 
 
 def _degraded(message):
@@ -107,25 +147,50 @@ def run_vision(image_data, client=None):
     `client` is injectable (tests pass a fake); when omitted, a real
     OpenRouterClient is constructed lazily, inside the same try/except that
     handles every other client failure, so a missing API key degrades the
-    same way a ladder exhaustion would instead of raising.
+    same way a ladder exhaustion would instead of raising. A client built
+    here (not injected) is closed in a `finally` before returning, so its
+    httpx connection pool doesn't leak; an injected client is owned by the
+    caller and is never closed here.
     """
-    try:
-        if client is None:
+    owns_client = client is None
+    if owns_client:
+        try:
             client = _default_client()
-        result = client.complete("eyes", _build_messages(image_data))
-    except LadderExhaustedError:
-        return _degraded(
-            "Vision could not run right now: every available model was busy "
-            "or unavailable. Please try again in a moment."
-        )
-    except OpenRouterError:
-        return _degraded(
-            "Vision could not run because of a configuration problem with "
-            "the service. Please tell whoever set this up."
-        )
+        except OpenRouterError:
+            return _degraded(
+                "Vision could not run because of a configuration problem with "
+                "the service. Please tell whoever set this up."
+            )
+    try:
+        try:
+            result = client.complete("eyes", _build_messages(image_data))
+        except LadderExhaustedError:
+            return _degraded(
+                "Vision could not run right now: every available model was busy "
+                "or unavailable. Please try again in a moment."
+            )
+        except OpenRouterError:
+            return _degraded(
+                "Vision could not run because of a configuration problem with "
+                "the service. Please tell whoever set this up."
+            )
+        except Exception:
+            # Contract (module docstring): no raw exception may escape into
+            # the graph. This catches everything else the injected client
+            # could raise (ValueError, TimeoutError, KeyError, RuntimeError,
+            # ...) without swallowing KeyboardInterrupt/SystemExit, which
+            # derive from BaseException, not Exception.
+            return _degraded(
+                "Vision could not run because of an unexpected internal "
+                "error. Please try again, and tell whoever set this up if "
+                "it keeps happening."
+            )
+    finally:
+        if owns_client:
+            client.close()
 
     reply = result.content
-    if not reply or not reply.strip():
+    if not isinstance(reply, str) or not reply.strip():
         return _degraded("The vision model returned an empty response.")
 
     parsed = _parse_reply(reply)
@@ -133,11 +198,8 @@ def run_vision(image_data, client=None):
         return _degraded("The vision model's response could not be understood.")
 
     ocr_output, scene_context = parsed
-    # Placeholder rule: issue #6 (P1.3) owns the real complexity heuristic
-    # and will replace this rule, not the ownership of the key.
-    complexity_flag = len(ocr_output) > 200
     return {
         "ocr_output": ocr_output,
         "scene_context": scene_context,
-        "complexity_flag": complexity_flag,
+        "complexity_flag": _complexity_flag(ocr_output),
     }

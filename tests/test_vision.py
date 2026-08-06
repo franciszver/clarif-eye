@@ -12,9 +12,24 @@ import pytest
 from clarif_eye.client import CompletionResult, LadderExhaustedError, OpenRouterError
 from clarif_eye.graph import build_graph, vision_node
 from clarif_eye.state import make_initial_state
-from clarif_eye.vision import run_vision
+from clarif_eye import vision
+from clarif_eye.vision import _parse_reply, run_vision
 
 LONG_TEXT = "x" * 250  # deliberately over the placeholder complexity threshold
+
+
+def _assert_reasonable_message(message, *, mentions):
+    """Shared shape check for degraded messages (FIX 5): not just non-blank.
+
+    `mentions` is a lowercase substring the message must contain, tying the
+    assertion to the actual condition being degraded so a reword to "." (or
+    to an unrelated sentence) fails, while an honest rewording of the same
+    condition still passes.
+    """
+    assert isinstance(message, str)
+    words = message.split()
+    assert len(words) >= 5, f"degraded message too short to be meaningful: {message!r}"
+    assert mentions in message.lower(), f"expected {mentions!r} in message: {message!r}"
 
 
 class FakeVisionClient:
@@ -25,12 +40,16 @@ class FakeVisionClient:
         self.exc = exc
         self.model = model
         self.calls = []
+        self.closed = False
 
     def complete(self, role, messages, **params):
         self.calls.append({"role": role, "messages": messages, "params": params})
         if self.exc is not None:
             raise self.exc
         return CompletionResult(content=self.content, model=self.model)
+
+    def close(self):
+        self.closed = True
 
 
 def well_formed_reply(ocr="a coffee cup label", scene="a kitchen counter"):
@@ -132,8 +151,7 @@ def test_malformed_reply_degrades_without_raising():
     result = run_vision("base64data", client)
 
     assert result["ocr_output"] == ""
-    assert isinstance(result["scene_context"], str)
-    assert result["scene_context"].strip() != ""
+    _assert_reasonable_message(result["scene_context"], mentions="understood")
 
 
 # --- Degradation: empty reply ------------------------------------------------
@@ -145,8 +163,7 @@ def test_empty_reply_degrades_without_raising():
     result = run_vision("base64data", client)
 
     assert result["ocr_output"] == ""
-    assert isinstance(result["scene_context"], str)
-    assert result["scene_context"].strip() != ""
+    _assert_reasonable_message(result["scene_context"], mentions="empty")
 
 
 # --- Degradation: LadderExhaustedError --------------------------------------
@@ -158,8 +175,7 @@ def test_ladder_exhausted_degrades_without_raising():
     result = run_vision("base64data", client)
 
     assert result["ocr_output"] == ""
-    assert isinstance(result["scene_context"], str)
-    assert result["scene_context"].strip() != ""
+    _assert_reasonable_message(result["scene_context"], mentions="busy")
 
 
 # --- Degradation: terminal OpenRouterError ----------------------------------
@@ -171,8 +187,165 @@ def test_openrouter_error_degrades_without_raising():
     result = run_vision("base64data", client)
 
     assert result["ocr_output"] == ""
-    assert isinstance(result["scene_context"], str)
-    assert result["scene_context"].strip() != ""
+    _assert_reasonable_message(result["scene_context"], mentions="configuration")
+
+
+# --- Degradation: unexpected exception types (FIX 1) -------------------------
+
+
+@pytest.mark.parametrize("exc", [ValueError("bad"), TimeoutError("timed out"), RuntimeError("oops")])
+def test_unexpected_exception_types_degrade_without_raising(exc):
+    client = FakeVisionClient(exc=exc)
+
+    result = run_vision("base64data", client)
+
+    assert result["ocr_output"] == ""
+    _assert_reasonable_message(result["scene_context"], mentions="unexpected")
+    assert isinstance(result["complexity_flag"], bool)
+
+
+def test_key_error_degrades_without_raising():
+    client = FakeVisionClient(exc=KeyError("missing"))
+
+    result = run_vision("base64data", client)
+
+    assert result["ocr_output"] == ""
+    _assert_reasonable_message(result["scene_context"], mentions="unexpected")
+
+
+def test_keyboard_interrupt_is_not_swallowed():
+    client = FakeVisionClient(exc=KeyboardInterrupt())
+
+    with pytest.raises(KeyboardInterrupt):
+        run_vision("base64data", client)
+
+
+# --- Degradation: non-string reply (FIX 2) ------------------------------------
+
+
+@pytest.mark.parametrize("bad_reply", [{}, 5, None])
+def test_non_string_reply_degrades_without_raising(bad_reply):
+    client = FakeVisionClient(content=bad_reply)
+
+    result = run_vision("base64data", client)
+
+    assert result["ocr_output"] == ""
+    _assert_reasonable_message(result["scene_context"], mentions="empty")
+    assert isinstance(result["complexity_flag"], bool)
+
+
+# --- Parser robustness (FIX 3) ------------------------------------------------
+
+
+def test_parser_does_not_misfile_ocr_text_containing_scene_marker_lines():
+    """The exact realistic agenda-photo reply from the review finding.
+
+    Multiple lines start with SCENE: inside what is genuinely photographed
+    text. The parser must not silently truncate the OCR text to one word
+    and read the rest aloud as a scene description - it must either keep
+    the OCR text whole or degrade the whole reply, never the old
+    first-occurrence behaviour.
+    """
+    reply = (
+        "OCR_TEXT: AGENDA\n"
+        "SCENE: intro (5 min)\n"
+        "SCENE: demo (10 min)\n"
+        "SCENE: overall a whiteboard photo"
+    )
+
+    parsed = _parse_reply(reply)
+
+    # Either the OCR text is kept whole (not truncated to "AGENDA"), or the
+    # whole reply is treated as unparseable and degrades - never the old
+    # buggy behaviour of a one-word OCR result plus the agenda items read
+    # aloud as if they described the room.
+    if parsed is not None:
+        ocr_output, _scene_context = parsed
+        assert ocr_output != "AGENDA"
+
+    client = FakeVisionClient(content=reply)
+    result = run_vision("base64data", client)
+    assert result["ocr_output"] != "AGENDA"
+
+
+def test_parser_treats_marker_mid_line_as_body_text_not_a_new_section():
+    reply = "OCR_TEXT: the sign reads SCENE: closed\nSCENE: a shop front at night"
+
+    parsed = _parse_reply(reply)
+
+    assert parsed is not None
+    ocr_output, scene_context = parsed
+    assert ocr_output == "the sign reads SCENE: closed"
+    assert scene_context == "a shop front at night"
+
+
+def test_parser_degrades_when_a_marker_line_repeats_many_times():
+    reply = "OCR_TEXT: menu\n" + "\n".join(f"SCENE: item {i}" for i in range(10))
+
+    parsed = _parse_reply(reply)
+
+    assert parsed is None
+
+
+def test_parser_still_handles_preamble_before_markers():
+    reply = "Sure, here is my analysis:\nOCR_TEXT: hello\nSCENE: a desk"
+
+    parsed = _parse_reply(reply)
+
+    assert parsed == ("hello", "a desk")
+
+
+def test_parser_still_handles_reversed_marker_order():
+    reply = "SCENE: a desk\nOCR_TEXT: hello"
+
+    parsed = _parse_reply(reply)
+
+    assert parsed == ("hello", "a desk")
+
+
+def test_parser_still_returns_none_for_missing_marker():
+    reply = "OCR_TEXT: hello, no scene marker here"
+
+    parsed = _parse_reply(reply)
+
+    assert parsed is None
+
+
+def test_parser_strips_code_fence_artifacts():
+    reply = "```\nOCR_TEXT: hello\nSCENE: a room\n```"
+
+    parsed = _parse_reply(reply)
+
+    assert parsed == ("hello", "a room")
+
+
+# --- Client lifecycle (FIX 4) --------------------------------------------------
+
+
+def test_self_constructed_client_is_closed(monkeypatch):
+    fake = FakeVisionClient(content=well_formed_reply())
+    monkeypatch.setattr(vision, "_default_client", lambda: fake)
+
+    run_vision("base64data")
+
+    assert fake.closed is True
+
+
+def test_injected_client_is_not_closed():
+    client = FakeVisionClient(content=well_formed_reply())
+
+    run_vision("base64data", client)
+
+    assert client.closed is False
+
+
+def test_self_constructed_client_is_closed_even_on_degraded_path(monkeypatch):
+    fake = FakeVisionClient(exc=LadderExhaustedError("eyes", ()))
+    monkeypatch.setattr(vision, "_default_client", lambda: fake)
+
+    run_vision("base64data")
+
+    assert fake.closed is True
 
 
 # --- vision_node: client injection, graph-facing wrapper --------------------
