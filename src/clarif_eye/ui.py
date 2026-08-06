@@ -89,12 +89,30 @@ AUDIO_UNAVAILABLE_NOTE = (
 STATUS_ELEM_ID = "status-live-region"
 STATUS_ELEM_CLASSES = ["live-status"]
 RESULT_ELEM_ID = "description-output"
+AUDIO_ELEM_ID = "audio-output"
+
+# How long the deferred-play shim (see ARIA_LIVE_HEAD below) waits after
+# the audio element gets a src before it calls .play() - long enough for
+# a screen reader to finish speaking the (now short) STATUS_SUCCESS_AUDIO
+# announcement before the audio starts (issue #47 / P5.3).
+AUDIO_PLAY_DELAY_MS = 1800
 
 STATUS_IDLE = 'Ready. Choose or take a photo, then activate "Describe this photo".'
 STATUS_WORKING = (
     "Photo received. Describing it now; this can take up to about 30 seconds."
 )
-STATUS_SUCCESS_AUDIO = "Description ready. Audio is playing; the text is below too."
+# SHORT ON PURPOSE (issue #47 / P5.3): when audio will play, the audio
+# itself is the completion signal - a long spoken status is redundant with
+# it and, worse, collides with it (two voices talking over each other; see
+# docs/ACCESSIBILITY.md's Known defects entry for #47). Kept to "over in
+# about a second" so even a slight overlap with the deferred audio start
+# (see AUDIO_PLAY_DELAY_MS / ARIA_LIVE_HEAD) is easy to hear past. Does NOT
+# assert "Audio is playing" as a fact, since the browser may block
+# programmatic playback (see ARIA_LIVE_HEAD) and that would be a lie.
+STATUS_SUCCESS_AUDIO = "Description ready."
+# FULL ON PURPOSE: no audio plays in this outcome, so there is nothing for
+# this announcement to collide with, and it is the user's ONLY signal - it
+# must say the text is a fallback, not just "ready".
 STATUS_SUCCESS_TEXT_ONLY = f"Description ready as text. {AUDIO_UNAVAILABLE_NOTE}"
 STATUS_DEGRADED = "Finished, but with a limited result. See the text below for details."
 
@@ -123,6 +141,33 @@ STATUS_DEGRADED = "Finished, but with a limited result. See the text below for d
 # already-tagged element is skipped on the (many) unrelated mutations that
 # fire elsewhere on the page, instead of re-setting three attributes on
 # every single DOM change.
+#
+# AUDIO SEQUENCING FIX (issue #47 / P5.3, reported from real screen-reader
+# use by the owner): the synthesized audio used to start via
+# gr.Audio(autoplay=True) at the exact moment the completion status was
+# still being announced, so a screen reader and the spoken audio talked
+# over each other and neither was intelligible. Two changes, together:
+# (1) STATUS_SUCCESS_AUDIO above is now short, so even a slight overlap is
+# brief; (2) autoplay is turned OFF on the component (see build_interface)
+# and this SAME apply()/MutationObserver pair instead starts playback
+# deliberately, after AUDIO_PLAY_DELAY_MS, once it sees the audio element
+# has a src - option (a) from the three sequencing options considered,
+# chosen because it is the only one that also solves "what if playback
+# can't be started programmatically": the delayed .play() call's rejected
+# promise is swallowed (.catch), and because autoplay is off (not merely
+# short), the <audio> control was never hidden or auto-triggered in the
+# first place, so it remains visible/reachable for the user to press
+# manually either way. The check is STRUCTURAL - whether the <audio>
+# element has a src at all - never a match against the status text, same
+# discipline status_for_result already uses. The `deferredPlaySrc` guard
+# compares against the LAST src this shim scheduled, not just "have we
+# ever scheduled anything", so a new audio src on a later run is still
+# picked up even though Gradio reuses the same DOM node.
+#
+# HONESTY: whether the two voices actually stop colliding for a real
+# screen-reader user can only be confirmed by a human screen-reader pass -
+# see docs/ACCESSIBILITY.md's Known defects entry for #47, which is not
+# marked "confirmed fixed" until the owner re-tests.
 #
 # KEYBOARD-REACHABILITY FIX (found via real-browser Chrome DevTools check,
 # same follow-up to issue #15): Gradio 6.22 renders an output-only Textbox
@@ -161,6 +206,21 @@ ARIA_LIVE_HEAD = f"""
       resultEl.disabled = false;
       resultEl.readOnly = true;
       resultEl.setAttribute("tabindex", "0");
+    }}
+    // Audio sequencing fix (issue #47 / P5.3): the <audio> element has
+    // autoplay=False (see build_interface), so playback never starts on
+    // its own - start it deliberately, after a delay, once this run
+    // actually produced audio (structural: a src is present at all).
+    const audioEl = document.querySelector("#{AUDIO_ELEM_ID} audio");
+    if (audioEl && audioEl.src && audioEl.dataset.deferredPlaySrc !== audioEl.src) {{
+      audioEl.dataset.deferredPlaySrc = audioEl.src;
+      setTimeout(() => {{
+        // If the browser blocks programmatic playback (autoplay policies
+        // vary), swallow the rejection: the control stays visible and
+        // reachable so the user can press play manually instead of the
+        // page throwing a silent, uncaught error.
+        audioEl.play().catch(() => {{}});
+      }}, {AUDIO_PLAY_DELAY_MS});
     }}
   }}
   apply(); // covers the element already being present
@@ -413,7 +473,11 @@ def build_interface(resources):
             elem_id=STATUS_ELEM_ID,
             elem_classes=STATUS_ELEM_CLASSES,
         )
-        audio_output = gr.Audio(label="Spoken description", autoplay=True)
+        # autoplay=False (issue #47 / P5.3): ARIA_LIVE_HEAD's shim starts
+        # playback deliberately, after a delay, instead of the browser
+        # firing it the instant a src is set - see ARIA_LIVE_HEAD's "AUDIO
+        # SEQUENCING FIX" comment for why.
+        audio_output = gr.Audio(label="Spoken description", autoplay=False, elem_id=AUDIO_ELEM_ID)
         text_output = gr.Textbox(label="Description (text)", lines=6, elem_id=RESULT_ELEM_ID)
 
         submit_event = submit_button.click(
