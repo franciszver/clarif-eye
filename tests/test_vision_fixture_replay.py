@@ -52,41 +52,59 @@ GROUND_TRUTH_FACTS = [
 ]
 
 
-@pytest.fixture
-def fixture_raw_path():
-    """Resolve fixture file path relative to this test file."""
-    return Path(__file__).parent / "fixtures" / "vision_reply_raw.txt"
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+# Ground-truth facts are specific to the one recorded fixture we have today
+# (the synthetic utility bill, OLD OCR_TEXT:/SCENE: format - see P1.8/#29:
+# this fixture is expected to keep passing via the legacy fallback parser,
+# not the new sentinel format, because it's real recorded evidence and
+# fixtures are not edited). A future fixture recorded with the new
+# sentinel-delimited prompt (P1.8/#29) will be discovered automatically
+# below and only gets the format-agnostic assertions, not this fact list.
+GROUND_TRUTH_FACTS_BY_FIXTURE = {
+    "vision_reply_raw.txt": GROUND_TRUTH_FACTS,
+}
 
 
-@pytest.fixture
-def fixture_parsed_path():
-    """Resolve fixture file path relative to this test file."""
-    return Path(__file__).parent / "fixtures" / "vision_reply_parsed.json"
+def _discover_vision_fixture_pairs():
+    """Find every (raw, parsed) fixture pair under tests/fixtures/.
 
-
-def skip_if_fixture_missing(fixture_path):
-    """Skip the test with a clear message if the fixture file is absent."""
-    if not fixture_path.exists():
-        pytest.skip(
-            f"Fixture not found: {fixture_path.name}. "
-            "This test requires recorded output from live model inference. "
-            "Run locally to generate, then commit the fixture files."
+    Iterates over whichever `vision_reply_raw*.txt` fixtures exist rather
+    than hardcoding one filename, so a new fixture recorded later (e.g.
+    with the new sentinel prompt) is picked up without editing this test -
+    and if none exist, the test below skips cleanly instead of failing.
+    """
+    pairs = []
+    for raw_path in sorted(FIXTURES_DIR.glob("vision_reply_raw*.txt")):
+        parsed_path = FIXTURES_DIR / raw_path.name.replace("_raw", "_parsed").replace(
+            ".txt", ".json"
         )
+        if parsed_path.exists():
+            pairs.append((raw_path, parsed_path))
+    return pairs
 
 
+_FIXTURE_PAIRS = _discover_vision_fixture_pairs()
+_PARAMS = _FIXTURE_PAIRS or [pytest.param(None, None, marks=pytest.mark.skip(
+    reason="No vision_reply_raw*.txt fixtures found under tests/fixtures/. "
+    "This test requires recorded output from live model inference. "
+    "Run locally to generate, then commit the fixture files."
+))]
+_IDS = [raw.name for raw, _parsed in _FIXTURE_PAIRS] or ["no-fixtures"]
+
+
+@pytest.mark.parametrize("fixture_raw_path,fixture_parsed_path", _PARAMS, ids=_IDS)
 def test_replay_fixture_through_real_parser(fixture_raw_path, fixture_parsed_path):
-    """Replay the recorded nemotron reply through run_vision and verify parsing.
+    """Replay each recorded vision reply through run_vision and verify parsing.
 
     Loads the raw fixture (model's verbatim reply), feeds it through run_vision
     with an injected fake client, and asserts that:
-    - All ground-truth facts appear in the parsed ocr_output
+    - All ground-truth facts appear in the parsed ocr_output (only checked for
+      fixtures that have a known fact list - see GROUND_TRUTH_FACTS_BY_FIXTURE)
     - scene_context is a real sentence (not empty or a fragment)
     - scene_context does not leak marker strings (OCR_TEXT:, SCENE:)
     - complexity_flag is a bool and matches the recorded JSON
     """
-    skip_if_fixture_missing(fixture_raw_path)
-    skip_if_fixture_missing(fixture_parsed_path)
-
     # Load the recorded raw reply and expected parsed result
     raw_reply = fixture_raw_path.read_text()
     expected_parsed = json.loads(fixture_parsed_path.read_text())
@@ -95,9 +113,9 @@ def test_replay_fixture_through_real_parser(fixture_raw_path, fixture_parsed_pat
     client = FakeFixtureClient(raw_reply)
     result = run_vision("dummy_base64_data", client)
 
-    # Verify all ground-truth facts are in the OCR output
+    # Verify all ground-truth facts are in the OCR output (fixture-specific)
     ocr_output = result["ocr_output"]
-    for fact in GROUND_TRUTH_FACTS:
+    for fact in GROUND_TRUTH_FACTS_BY_FIXTURE.get(fixture_raw_path.name, []):
         assert fact in ocr_output, f"Expected fact {fact!r} not found in ocr_output"
 
     # Verify scene_context is non-trivial (real sentence, not fragment)
