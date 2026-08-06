@@ -644,6 +644,97 @@ def test_user_gesture_delay_does_not_stack_on_top_of_pending_autoplay_defer():
     assert "a11yAutoplayPending" in ARIA_LIVE_HEAD
 
 
+# --- Regression: audio never played at all (found in a real browser) ------
+#
+# HONESTY: whether audio actually plays can only be confirmed in a real
+# browser - pytest never renders a DOM or loads real media, so nothing in
+# this file (before or after this fix) can prove playback happens. This
+# exact regression is the proof of that limit: the deferred-playback block
+# gated scheduling on `audioEl.src` being truthy at the moment apply() ran,
+# and the full 484-test suite above passed while audio was COMPLETELY
+# broken on main - a human (the owner), driving the real browser, found it
+# via Chrome DevTools, not this suite. `audioEl.src` is a JS PROPERTY
+# Gradio's Svelte player assigns; a property assignment produces no DOM
+# mutation, so the childList/subtree MutationObserver above never re-ran
+# apply() at the moment a source actually became available, and the old
+# gate (`audioEl.src && audioEl.dataset.deferredPlaySrc !== audioEl.src`)
+# was, in practice, never satisfied. These tests assert the STRUCTURE of
+# the fix (a real media-load event schedules playback, not a src check
+# alone) - they cannot and do not claim to prove sound comes out of a
+# speaker.
+#
+# RED-FIRST: written to FAIL against the pre-fix shim, which has no
+# addEventListener for any media-load event at all.
+
+
+def test_shim_schedules_playback_from_a_media_load_event_not_src_alone():
+    # The fix must not depend on apply() happening to observe audioEl.src
+    # becoming truthy (see this section's comment above for why that never
+    # reliably fires). Instead it must attach a real media event listener -
+    # loadeddata, canplay, or durationchange - to the audio element, and
+    # schedule playback from inside that listener's callback.
+    assert "addEventListener(" in ARIA_LIVE_HEAD
+    assert any(
+        f'"{event}"' in ARIA_LIVE_HEAD or f"'{event}'" in ARIA_LIVE_HEAD
+        for event in ("loadeddata", "canplay", "durationchange")
+    ), "no recognized media-load event is wired up to schedule playback"
+
+
+def test_shim_guards_against_duplicate_media_listeners_on_the_same_element():
+    # Gradio reuses the same <audio> DOM node across submissions (it never
+    # gets torn down and recreated), and apply() re-runs on every unrelated
+    # DOM mutation elsewhere on the page. Without a guard, a second (or
+    # hundredth) apply() call would attach another media-load listener to
+    # the same element, and a single loadeddata/canplay event would then
+    # schedule N overlapping/duplicate play attempts. Same guard discipline
+    # as every other check in apply() (aria-live, deferredPlaySrc,
+    # a11yPlayDelayWrapped, a11yImgDone).
+    assert "a11yMediaListenerAttached" in ARIA_LIVE_HEAD
+    # The guard must actually gate the addEventListener call, not just
+    # exist as an unused string somewhere in the shim.
+    guard_index = ARIA_LIVE_HEAD.index("a11yMediaListenerAttached")
+    listener_index = ARIA_LIVE_HEAD.index("addEventListener(")
+    assert guard_index < listener_index
+
+
+def test_shim_still_reschedules_on_a_second_submission():
+    # A second submission must play too, not just the first - the fix must
+    # not collapse into a one-shot listener that fires once ever and then
+    # goes silent for every subsequent result. The per-src dedupe
+    # (deferredPlaySrc) must live INSIDE the media-event callback (so it
+    # re-evaluates on every load event) rather than gating whether the
+    # listener itself gets attached.
+    assert "deferredPlaySrc" in ARIA_LIVE_HEAD
+    listener_index = ARIA_LIVE_HEAD.index("addEventListener(")
+    dedupe_index = ARIA_LIVE_HEAD.index("deferredPlaySrc")
+    assert dedupe_index > listener_index, (
+        "deferredPlaySrc dedupe must be evaluated inside the media-event "
+        "callback, not used to gate attaching the listener itself"
+    )
+
+
+def test_shim_sets_preload_so_media_events_actually_fire():
+    # An <audio> element with the browser's default (or Gradio's own)
+    # preload behaviour may never fetch enough data to fire loadeddata/
+    # canplay until playback is attempted - which would make the whole
+    # fix a no-op. The shim must force eager loading.
+    assert "preload" in ARIA_LIVE_HEAD
+    assert '"auto"' in ARIA_LIVE_HEAD or "'auto'" in ARIA_LIVE_HEAD
+
+
+def test_user_gesture_delay_and_pause_behaviour_unchanged_by_the_fix():
+    # This regression fix must not touch #52's user-gesture delay or the
+    # immediate-pause guarantee - both are re-asserted here, scoped to this
+    # section, so a future change to the media-event fix that regresses
+    # either of them fails loudly right next to the fix that could cause it.
+    from clarif_eye.ui import USER_PLAY_DELAY_MS
+
+    assert "audioEl.play = function" in ARIA_LIVE_HEAD
+    assert str(USER_PLAY_DELAY_MS) in ARIA_LIVE_HEAD
+    assert "audioEl.pause = function" not in ARIA_LIVE_HEAD
+    assert "audioEl.pause()" not in ARIA_LIVE_HEAD
+
+
 # --- P4.3 / issue #49: accessible "How this works" section -----------------
 #
 # Owner request: a section near the bottom explaining the pipeline, the
