@@ -642,3 +642,101 @@ def test_user_gesture_delay_does_not_stack_on_top_of_pending_autoplay_defer():
     # track whether the autoplay defer for this src is still pending and
     # branch on it inside the wrapped .play().
     assert "a11yAutoplayPending" in ARIA_LIVE_HEAD
+
+
+# --- P4.3 / issue #49: accessible "How this works" section -----------------
+#
+# Owner request: a section near the bottom explaining the pipeline, the
+# LangGraph state machine, and the eyes/brain model ladders, since this is a
+# demo application. Content must be ACCURATE to the code as it exists, not a
+# design doc's wording (see clarif_eye.ui.HOW_IT_WORKS_MARKDOWN's docstring).
+#
+# ACCESSIBILITY, per #48's lesson: a diagram with no genuine text equivalent
+# announces as a bare "graphic" - worse than no diagram at all. This section
+# is deliberately a text-only ordered list (never an image/SVG), and uses
+# real Markdown heading syntax ("## "/"### ") so gr.Markdown renders actual
+# <h2>/<h3> elements a screen reader can navigate by heading - not merely
+# bold or large-looking text.
+#
+# RED-FIRST: written to FAIL against the pre-#49 ui.py, which has no
+# HOW_IT_WORKS_ELEM_ID / HOW_IT_WORKS_MARKDOWN and no such section in
+# build_interface() at all.
+
+
+def test_how_it_works_section_exists_after_result_area_with_real_headings():
+    from clarif_eye.ui import HOW_IT_WORKS_ELEM_ID, HOW_IT_WORKS_MARKDOWN
+
+    resources = _resources(FakeGraph())
+    demo = build_interface(resources)
+    try:
+        components = _components(demo)
+        matches = [c for c in components if getattr(c, "elem_id", None) == HOW_IT_WORKS_ELEM_ID]
+        assert len(matches) == 1
+        section = matches[0]
+        assert isinstance(section, gr.Markdown)
+
+        # Real heading markup, not visually-styled text - a screen reader
+        # navigates by heading only if these are genuine Markdown headings.
+        assert "## " in HOW_IT_WORKS_MARKDOWN
+        assert "### " in HOW_IT_WORKS_MARKDOWN
+
+        # Placed AFTER the result textbox (never before it), so it can never
+        # delay someone who came to use the tool and never sits between the
+        # live region and the result it announces.
+        result_index = next(i for i, c in enumerate(components) if getattr(c, "elem_id", None) == RESULT_ELEM_ID)
+        section_index = components.index(section)
+        assert section_index > result_index
+    finally:
+        demo.close()
+
+
+def test_how_it_works_names_both_model_roles_and_actual_configured_models():
+    # Pulled from the REAL packaged registry (never a hand-copied string),
+    # so this test breaks loudly if config/models.toml is edited and the
+    # section text is not - exactly the "accurate to the code" requirement.
+    from clarif_eye.registry import load_registry
+    from clarif_eye.ui import HOW_IT_WORKS_MARKDOWN
+
+    registry = load_registry()
+    assert "eyes" in HOW_IT_WORKS_MARKDOWN
+    assert "brain" in HOW_IT_WORKS_MARKDOWN
+    for role in ("eyes", "brain"):
+        for model_id in registry.ladder(role):
+            assert model_id in HOW_IT_WORKS_MARKDOWN, (
+                f"configured model {model_id!r} for role {role!r} is not named in the how-it-works section"
+            )
+
+
+def test_how_it_works_introduces_no_unlabelled_image():
+    # #48's lesson: any diagram with no genuine text equivalent announces as
+    # a bare "graphic". The simplest way to guarantee that never happens
+    # here is to never introduce image/SVG markup at all - a text-only
+    # ordered list carries the same information with no accessibility risk.
+    from clarif_eye.ui import HOW_IT_WORKS_MARKDOWN
+
+    assert "![" not in HOW_IT_WORKS_MARKDOWN
+    assert "<img" not in HOW_IT_WORKS_MARKDOWN.lower()
+    assert "<svg" not in HOW_IT_WORKS_MARKDOWN.lower()
+
+
+def test_how_it_works_does_not_add_a_second_mutation_observer():
+    # This section is a plain gr.Markdown block with no injected JS of its
+    # own - the page must still carry exactly one MutationObserver (see
+    # test_aria_live_shim_uses_mutation_observer_not_load_only above), the
+    # same invariant this whole file enforces for every other addition.
+    assert ARIA_LIVE_HEAD.count("MutationObserver") == 1
+
+
+def test_how_it_works_is_not_mistaken_for_an_interactive_control():
+    # Static explanatory content, not a control: must not appear among the
+    # interactive/labelled-control set this file already enumerates
+    # elsewhere, and must not carry a positive tabindex.
+    from clarif_eye.ui import HOW_IT_WORKS_ELEM_ID
+
+    resources = _resources(FakeGraph())
+    demo = build_interface(resources)
+    try:
+        section = next(c for c in _components(demo) if getattr(c, "elem_id", None) == HOW_IT_WORKS_ELEM_ID)
+        assert not isinstance(section, (gr.Image, gr.Button, gr.Audio, gr.Textbox))
+    finally:
+        demo.close()
