@@ -202,6 +202,24 @@ These are being fixed:
   announcement and audio no longer collide, in a real browser is something
   only a human/browser pass can confirm; that has not happened yet -
   **awaiting confirmation, not claimed fixed.**
+- **Camera photos come back mirrored (#59)**: The owner, using the camera
+  to photograph a bill/label/sign, found the resulting image reversed -
+  Gradio's `gr.Image` webcam capture mirrors by default
+  (`WebcamOptions.mirror=True`), a setting meant for selfies. Reversed text
+  is not merely harder to read; the vision model cannot read it at all, so
+  the description it produced was confidently wrong rather than merely
+  poor, and every downstream step (density scoring, number verification,
+  the spoken description) then operated on that wrong reading. **Fix
+  attempted, not yet confirmed by a real capture:** the `gr.Image` call in
+  `build_interface` now passes `webcam_options=gr.WebcamOptions(mirror=False)`,
+  since this app has no selfie use case - every photo is of something the
+  user is not looking at, so mirroring has no upside and only breaks text.
+  This is checked by an automated test that inspects the constructed
+  component's `webcam_options.mirror` value - a constructor-argument check
+  only. Whether the captured pixels are actually un-mirrored can only be
+  confirmed by taking a real photo with a real camera, which the owner will
+  do; that has not happened yet - **awaiting confirmation, not claimed
+  fixed.**
 
 ## Known limitations a user should know
 

@@ -616,6 +616,33 @@ def test_image_labelling_never_introduces_a_positive_tabindex():
         assert int(value) == 0, f"positive tabindex found: {value}"
 
 
+def test_camera_capture_is_not_mirrored():
+    # P4.5 / issue #59: Gradio's WebcamOptions defaults to mirror=True,
+    # which suits selfies but reverses any text in the frame (a bill,
+    # label, or sign) - exactly what this app's blind users rely on the
+    # vision model to read correctly. Written to FAIL against the pre-fix
+    # gr.Image call, which passes no webcam_options and so inherits the
+    # mirrored default.
+    #
+    # CONSTRUCTOR-ARGUMENT CHECK ONLY (same discipline as the rest of this
+    # file): this confirms build_interface() constructs the Image component
+    # with mirror=False, not that a real camera capture is actually
+    # un-mirrored - only a real capture (the owner's) can confirm that. See
+    # docs/ACCESSIBILITY.md's Known defects entry for #59.
+    from clarif_eye.ui import IMAGE_INPUT_ELEM_ID
+
+    resources = _resources(FakeGraph())
+    demo = build_interface(resources)
+    try:
+        image_components = [c for c in _components(demo) if getattr(c, "elem_id", None) == IMAGE_INPUT_ELEM_ID]
+        assert len(image_components) == 1
+        webcam_options = image_components[0].webcam_options
+        assert webcam_options is not None
+        assert webcam_options.mirror is False
+    finally:
+        demo.close()
+
+
 # --- P5.5 / issue #52: pressing Play collides with the control announcement
 #
 # Real screen-reader use (owner, Narrator on Windows) found a DIFFERENT
