@@ -68,21 +68,21 @@ browser and confirmed:
 
 ### Human screen-reader verified
 
-**Only the progress announcement has been confirmed spoken by a real
-screen reader** (owner decision D19, 2026-08-06). The owner ran the live
-app with a screen reader and heard it read aloud, verbatim:
+The owner ran the live app with a screen reader and confirmed:
 
-> "Photo received. Describing it now; this can take up to about 30
-> seconds."
+- **Progress announcement**: heard read aloud, verbatim: *"Photo received.
+  Describing it now; this can take up to about 30 seconds."*
+- **Completion announcement**: heard read aloud, verbatim: *"Description
+  ready. Audio is playing; the text is below too."* (Note: the synthesized
+  audio begins at the same moment and speaks over this announcement, making
+  both difficult to hear - see Known defects.)
 
 No other claim in this document is "screen-reader tested." That phrase is
-not used here for anything beyond the sentence above, because it has not
-been confirmed for anything beyond the sentence above.
+not used here for anything beyond the statements above, because it has not
+been confirmed for anything beyond the statements above.
 
 ## What is explicitly NOT verified
 
-- **The completion announcement** (description ready / audio unavailable /
-  degraded result) has not been confirmed spoken by a screen reader.
 - **Post-run discoverability** - whether a screen-reader user reliably
   finds and reads the description text after the completion announcement -
   has not been human-verified.
@@ -92,6 +92,17 @@ been confirmed for anything beyond the sentence above.
   reader on one platform; behavior on others - VoiceOver, TalkBack, other
   browser/screen-reader combinations - is unknown).
 - **Mobile** has not been checked at all, on any platform.
+
+## Known defects
+
+These are being fixed:
+
+- **Audio talks over the announcement (#47)**: When a description is ready,
+  the synthesized audio begins at the same moment the screen reader is still
+  announcing the completion status, making both difficult to hear.
+- **Images announce as "graphic" (#48)**: Images in the interface are not
+  labelled, so a screen reader announces an unhelpful bare "graphic" instead
+  of a meaningful description.
 
 ## Known limitations a user should know
 
