@@ -1,5 +1,8 @@
 """Smoke test for clarif_eye package."""
 
+import tomllib
+from pathlib import Path
+
 import clarif_eye
 
 
@@ -21,4 +24,8 @@ def test_version_is_string():
 
 def test_version_matches_pyproject():
     """Test that __version__ matches the declared version in pyproject.toml."""
-    assert clarif_eye.__version__ == "0.1.0"
+    pyproject_path = Path(__file__).parent.parent / "pyproject.toml"
+    with open(pyproject_path, "rb") as f:
+        pyproject_data = tomllib.load(f)
+    expected_version = pyproject_data["project"]["version"]
+    assert clarif_eye.__version__ == expected_version
