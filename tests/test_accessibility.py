@@ -896,7 +896,7 @@ def test_pipeline_diagram_exists_with_role_img_and_a_nonempty_label():
 
 
 def test_pipeline_diagram_has_an_associated_text_description():
-    from clarif_eye.ui import DIAGRAM_DESC_ELEM_ID, PIPELINE_DIAGRAM_DESCRIPTION
+    from clarif_eye.ui import DIAGRAM_DESC_ELEM_ID, DIAGRAM_ELEM_ID, PIPELINE_DIAGRAM_DESCRIPTION
 
     assert PIPELINE_DIAGRAM_DESCRIPTION
 
