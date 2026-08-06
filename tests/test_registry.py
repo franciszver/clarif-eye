@@ -2,7 +2,7 @@
 
 import pytest
 
-from clarif_eye.registry import RegistryError, load_registry
+from clarif_eye.registry import ModelRegistry, RegistryError, load_registry
 
 
 def write_config(tmp_path, text):
@@ -178,3 +178,90 @@ def test_unknown_role_raises():
     registry = load_registry()
     with pytest.raises(RegistryError, match="unknown"):
         registry.ladder("hands")
+
+
+# --- Direct construction cannot bypass the free-only policy ---------------
+
+
+def test_direct_construction_with_non_free_model_raises():
+    with pytest.raises(RegistryError, match="free"):
+        ModelRegistry({"eyes": ("paid/model-not-free",), "brain": ("also-paid",)})
+
+
+def test_direct_construction_with_empty_ladder_raises():
+    with pytest.raises(RegistryError, match="eyes"):
+        ModelRegistry({"eyes": (), "brain": ("b/model:free",)})
+
+
+def test_direct_construction_with_blank_entry_raises():
+    with pytest.raises(RegistryError, match="eyes"):
+        ModelRegistry({"eyes": ("   ",), "brain": ("b/model:free",)})
+
+
+def test_direct_construction_with_duplicate_entries_raises():
+    with pytest.raises(RegistryError, match="eyes"):
+        ModelRegistry(
+            {"eyes": ("a/model:free", "a/model:free"), "brain": ("b/model:free",)}
+        )
+
+
+def test_direct_construction_missing_role_raises():
+    with pytest.raises(RegistryError, match="brain"):
+        ModelRegistry({"eyes": ("a/model:free",)})
+
+
+# --- Returned ladders mapping cannot be mutated to inject a model ---------
+
+
+def test_ladders_mapping_cannot_be_mutated():
+    registry = load_registry()
+    with pytest.raises(TypeError):
+        registry._ladders["eyes"] = ("paid-model",)
+
+
+# --- Validation: whitespace in entries -------------------------------------
+
+
+def test_ladder_entry_leading_whitespace_raises(tmp_path):
+    path = write_config(
+        tmp_path,
+        """
+        [eyes]
+        ladder = [" a/model:free"]
+
+        [brain]
+        ladder = ["b/model:free"]
+        """,
+    )
+    with pytest.raises(RegistryError, match="whitespace"):
+        load_registry(path)
+
+
+def test_ladder_entry_trailing_whitespace_raises(tmp_path):
+    path = write_config(
+        tmp_path,
+        """
+        [eyes]
+        ladder = ["a/model:free "]
+
+        [brain]
+        ladder = ["b/model:free"]
+        """,
+    )
+    with pytest.raises(RegistryError, match="whitespace"):
+        load_registry(path)
+
+
+# --- Validation: single error surface --------------------------------------
+
+
+def test_missing_config_file_raises_registry_error(tmp_path):
+    missing_path = tmp_path / "does-not-exist.toml"
+    with pytest.raises(RegistryError):
+        load_registry(missing_path)
+
+
+def test_malformed_toml_raises_registry_error(tmp_path):
+    path = write_config(tmp_path, "this is not [valid toml")
+    with pytest.raises(RegistryError):
+        load_registry(path)

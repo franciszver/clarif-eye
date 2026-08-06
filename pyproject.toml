@@ -14,9 +14,13 @@ dev = ["pytest>=7.4"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+include-package-data = true
 
 [tool.setuptools.packages]
 find = {where = ["src"]}
+
+[tool.setuptools.package-data]
+clarif_eye = ["config/models.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
