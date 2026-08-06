@@ -99,7 +99,20 @@ These are being fixed:
 
 - **Audio talks over the announcement (#47)**: When a description is ready,
   the synthesized audio begins at the same moment the screen reader is still
-  announcing the completion status, making both difficult to hear.
+  announcing the completion status, making both difficult to hear. **Fix
+  attempted, not yet confirmed by a human screen-reader pass:** the
+  with-audio completion announcement is now short ("Description ready.")
+  instead of "Description ready. Audio is playing; the text is below too.",
+  since audio being available at all is the primary signal and a long
+  announcement both duplicates it and collides with it. Audio no longer
+  autoplays the instant it is ready; a script instead starts playback about
+  1.8 seconds later, giving a screen reader time to finish the (now short)
+  announcement first. If a browser blocks that deliberate playback attempt,
+  the audio control stays visible and reachable so the user can press play
+  manually - the status wording no longer claims audio "is playing" as a
+  fact, since that may not be true. Whether the two voices actually stop
+  colliding is something only a human screen-reader pass can confirm; that
+  has not happened yet.
 - **Images announce as "graphic" (#48)**: Images in the interface are not
   labelled, so a screen reader announces an unhelpful bare "graphic" instead
   of a meaningful description.
