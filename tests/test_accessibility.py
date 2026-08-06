@@ -268,3 +268,45 @@ def test_aria_live_shim_uses_mutation_observer_not_load_only():
     # "load" handler. A correct shim must not depend solely on that event
     # firing after the element already exists in the DOM.
     assert 'addEventListener("load"' not in ARIA_LIVE_HEAD
+
+
+def test_description_output_is_made_keyboard_focusable():
+    # Regression test for a real-browser bug found via Chrome DevTools
+    # (issue #15 keyboard-accessibility follow-up): Gradio renders
+    # output-only Textboxes as `disabled`. A disabled form control cannot
+    # receive focus and is removed from the tab order entirely, so the
+    # description text - the accessible fallback when audio is
+    # unavailable - could not be reached by keyboard at all, and
+    # FOCUS_RESULT_JS's el.focus() call silently did nothing (focus
+    # stayed on the submit button after a run).
+    #
+    # STATIC/SOURCE-LEVEL CHECK ONLY (same discipline as the rest of this
+    # file, see test_aria_live_shim_uses_mutation_observer_not_load_only):
+    # this cannot see the rendered DOM or prove the description is
+    # actually reachable by pressing Tab in a real browser - only that the
+    # mechanism which fixes it is present in the shim source. Keyboard
+    # reachability of the description output was verified manually in
+    # Chrome DevTools for this fix; there is no automated browser test in
+    # this suite covering it (Owner decision D13 accepted automated-only
+    # coverage for P5.1 - this does not extend that claim to "browser-
+    # verified").
+    #
+    # Written to FAIL against the pre-fix shim, which only ever touched
+    # #status-live-region and never looked at #description-output.
+    assert RESULT_ELEM_ID in ARIA_LIVE_HEAD
+    assert "disabled" in ARIA_LIVE_HEAD
+    assert "readOnly" in ARIA_LIVE_HEAD or "readonly" in ARIA_LIVE_HEAD
+    assert "tabindex" in ARIA_LIVE_HEAD.lower()
+
+    # The SAME apply()/MutationObserver pair that tags the live region must
+    # do this, not a second observer, so the fix survives Gradio
+    # re-rendering the output component's DOM node on every run just like
+    # the aria-live tagging already must.
+    assert ARIA_LIVE_HEAD.count("MutationObserver") == 1
+
+
+def test_focus_result_js_is_defensive_against_a_non_focusable_element():
+    # FOCUS_RESULT_JS must never throw even if, for any reason, the
+    # element it targets can't be focused - a thrown error client-side
+    # would be silent to the user but is still a correctness bug.
+    assert "try" in FOCUS_RESULT_JS and "catch" in FOCUS_RESULT_JS
