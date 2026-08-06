@@ -13,6 +13,7 @@ for the leak-prevention tests.
 """
 
 import os
+import time
 from dataclasses import dataclass
 
 import httpx
@@ -21,13 +22,38 @@ from clarif_eye.registry import load_registry
 
 API_BASE_URL = "https://openrouter.ai/api/v1"
 
-# Per-role latency budgets (seconds), from the product spec. Used as the
-# request timeout so a stuck rung can't hang forever.
+# Per-role latency budgets (seconds), from the product spec. This is a TOTAL
+# deadline for the whole complete() call (a UX contract for a blind user
+# waiting on spoken feedback), not a per-attempt timeout - each rung gets
+# whatever time is left in the budget, never more.
 ROLE_TIMEOUTS = {
     "eyes": 8.0,
     "brain": 25.0,
 }
 DEFAULT_TIMEOUT = 25.0
+
+# Known model-availability error-message signatures, derived from live
+# OpenRouter responses recorded in prd/openrouter-error-shapes.md. Matched
+# case-insensitively against error.message only (not error.code, which is
+# just the HTTP status and matches everything). Must be revisited if
+# OpenRouter changes its error text.
+_MODEL_NOT_FOUND_SIGNATURES = (
+    "is not a valid model id",
+    "no endpoints found",
+    "no allowed providers",
+    "model not found",
+)
+
+# HTTP statuses whose outcome cannot change by trying another model: same
+# key, same credit, same payload every time. Advancing the ladder on these
+# just burns round-trips and reports a "model" failure when the real cause
+# is the key, credit, or the request itself.
+_TERMINAL_STATUS_REASONS = {
+    401: "authentication failed - check OPENROUTER_API_KEY",
+    403: "authorization failed - check OPENROUTER_API_KEY",
+    402: "out of credit on this OpenRouter account",
+    413: "request payload too large",
+}
 
 
 class OpenRouterError(Exception):
@@ -87,6 +113,12 @@ class OpenRouterClient:
     def __str__(self):
         return repr(self)
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
     def close(self):
         self._client.close()
 
@@ -96,18 +128,38 @@ class OpenRouterClient:
         `messages` and any extra `params` (e.g. temperature) are sent as-is
         in the OpenAI-compatible chat completions request body.
 
+        The role's latency budget (ROLE_TIMEOUTS) is a TOTAL deadline for
+        this call, not a per-attempt timeout: elapsed time is tracked with
+        time.monotonic() and each attempt gets only what's left of the
+        budget. Once the budget is exhausted, remaining rungs are skipped
+        immediately.
+
         Returns a CompletionResult. Raises LadderExhaustedError if every
-        rung fails, or OpenRouterError immediately if the request itself is
-        malformed (a caller bug, not a ladder failure).
+        rung fails (or the budget runs out), or OpenRouterError immediately
+        for a terminal failure (auth/credit/payload) or a malformed request
+        (a caller bug, not a ladder failure).
         """
         ladder = load_registry().ladder(role)
-        timeout = ROLE_TIMEOUTS.get(role, DEFAULT_TIMEOUT)
+        budget = ROLE_TIMEOUTS.get(role, DEFAULT_TIMEOUT)
+        deadline = time.monotonic() + budget
 
         attempts = []
-        for model in ladder:
+        for index, model in enumerate(ladder):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                skipped = len(ladder) - index
+                attempts.append(
+                    (
+                        model,
+                        f"budget exhausted ({budget}s role budget used up); "
+                        f"{skipped} rung(s) never tried",
+                    )
+                )
+                break
+
             payload = {"model": model, "messages": messages, **params}
             try:
-                response = self._client.post("/chat/completions", json=payload, timeout=timeout)
+                response = self._client.post("/chat/completions", json=payload, timeout=remaining)
             except httpx.TimeoutException:
                 attempts.append((model, "request timed out"))
                 continue
@@ -116,11 +168,20 @@ class OpenRouterClient:
                 continue
 
             if response.status_code == 200:
-                data = response.json()
-                content = data["choices"][0]["message"]["content"]
-                return CompletionResult(content=content, model=model)
+                result = self._parse_success(response, model)
+                if result is None:
+                    attempts.append((model, "malformed or empty response body"))
+                    continue
+                return result
 
             reason = self._describe_failure(response)
+
+            if response.status_code in _TERMINAL_STATUS_REASONS:
+                raise OpenRouterError(
+                    f"OpenRouter request failed for model {model!r} "
+                    f"(HTTP {response.status_code}): {_TERMINAL_STATUS_REASONS[response.status_code]} "
+                    f"({reason})"
+                )
 
             if response.status_code == 429:
                 attempts.append((model, f"rate limited (429): {reason}"))
@@ -128,6 +189,11 @@ class OpenRouterClient:
             if response.status_code >= 500:
                 attempts.append((model, f"server error ({response.status_code}): {reason}"))
                 continue
+            # OpenRouter has been observed to return 400 (not 404) for an
+            # unknown model - see prd/openrouter-error-shapes.md. This 404
+            # branch is likely dead against OpenRouter itself, but is kept
+            # as defensive failover since other OpenAI-compatible proxies
+            # do use 404 for the same condition.
             if response.status_code == 404:
                 attempts.append((model, f"model not found (404): {reason}"))
                 continue
@@ -142,6 +208,35 @@ class OpenRouterClient:
             attempts.append((model, f"unexpected status {response.status_code}: {reason}"))
 
         raise LadderExhaustedError(role, tuple(attempts))
+
+    @staticmethod
+    def _parse_success(response, model):
+        """Defensively parse an HTTP 200 body into a CompletionResult.
+
+        Returns None (a failed rung, not an exception) if the body isn't
+        valid JSON, lacks the expected shape, or yields null/empty/
+        whitespace-only content - never lets a raw IndexError/KeyError
+        escape and never returns a CompletionResult with blank content.
+        """
+        try:
+            data = response.json()
+        except ValueError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return None
+        first = choices[0]
+        if not isinstance(first, dict):
+            return None
+        message = first.get("message")
+        if not isinstance(message, dict):
+            return None
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return None
+        return CompletionResult(content=content, model=model)
 
     @staticmethod
     def _describe_failure(response):
@@ -160,9 +255,10 @@ class OpenRouterClient:
         """Distinguish a 400 for an unknown/invalid model from a caller bug.
 
         OpenRouter uses the same 400 status for both. We only advance the
-        ladder when the error clearly names the model as the problem;
-        anything else is treated as a caller-side malformed request and
-        must surface immediately instead of silently burning every rung.
+        ladder when the error message matches a known model-availability
+        signature (see _MODEL_NOT_FOUND_SIGNATURES); anything else is
+        treated as a caller-side malformed request and must surface
+        immediately instead of silently burning every rung.
         """
         try:
             data = response.json()
@@ -171,5 +267,5 @@ class OpenRouterClient:
         error = data.get("error") if isinstance(data, dict) else None
         if not isinstance(error, dict):
             return False
-        text = f"{error.get('message', '')} {error.get('code', '')}".lower()
-        return "model" in text
+        message = str(error.get("message", "")).lower()
+        return any(signature in message for signature in _MODEL_NOT_FOUND_SIGNATURES)
