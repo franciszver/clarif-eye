@@ -569,3 +569,76 @@ def test_image_labelling_never_introduces_a_positive_tabindex():
     injected = ARIA_LIVE_HEAD + FOCUS_RESULT_JS
     for value in re.findall(r'tabindex["\'\s:=,]+["\']?(\d+)', injected, re.IGNORECASE):
         assert int(value) == 0, f"positive tabindex found: {value}"
+
+
+# --- P5.5 / issue #52: pressing Play collides with the control announcement
+#
+# Real screen-reader use (owner, Narrator on Windows) found a DIFFERENT
+# collision from #47: #47 was the app's OWN completion status colliding with
+# AUTOMATIC playback. This one is the SCREEN READER'S OWN announcement of the
+# Play control being activated (button name and/or the state change to
+# "Pause") colliding with playback the USER just started by pressing Play -
+# either to replay, or because the browser blocked the automatic attempt.
+# The app cannot detect or suppress that announcement (no screen-reader
+# detection - see ARIA_LIVE_HEAD's design constraints), so the only lever is
+# delaying when the audio itself actually starts sounding.
+#
+# STATIC/SOURCE-LEVEL CHECK ONLY (same discipline as the rest of this file):
+# these assert the mechanism is present in the shim's source, never that a
+# real screen reader actually stops colliding - only a human screen-reader
+# pass can confirm that (see docs/ACCESSIBILITY.md's Known defects entry for
+# #52, not marked "confirmed fixed").
+#
+# RED-FIRST: written to FAIL against the pre-fix shim, which only ever
+# called audioEl.play() from the autoplay-defer setTimeout and never wrapped
+# or delayed a user-initiated call to .play() at all.
+
+
+def test_user_gesture_play_delay_constant_exists_and_is_in_range():
+    from clarif_eye.ui import USER_PLAY_DELAY_MS
+
+    # Roughly 0.8-1.2s per the issue: long enough for a screen reader to
+    # finish announcing the control activation, short enough not to feel
+    # broken to a sighted user pressing Play.
+    assert 800 <= USER_PLAY_DELAY_MS <= 1200
+
+
+def test_shim_defers_user_initiated_playback():
+    from clarif_eye.ui import USER_PLAY_DELAY_MS
+
+    # The user-gesture delay must be wired through a wrapped .play() (the
+    # only hook available for a click on the audio widget's own Play
+    # control - see module comment) and use its own named constant/timer,
+    # distinct from the autoplay-defer timer.
+    assert "audioEl.play = function" in ARIA_LIVE_HEAD
+    assert str(USER_PLAY_DELAY_MS) in ARIA_LIVE_HEAD
+    # Must not implement this by letting playback begin and then pausing it
+    # again (a stutter) - that would mean an unconditional pause() call
+    # sitting right next to the play-wrapping code.
+    assert "audioEl.pause()" not in ARIA_LIVE_HEAD
+
+
+def test_pausing_is_not_delayed():
+    # Pause must remain immediate - the shim must never wrap or delay
+    # audioEl.pause, only audioEl.play.
+    assert "audioEl.pause = function" not in ARIA_LIVE_HEAD
+
+
+def test_autoplay_defer_still_present_and_unchanged():
+    from clarif_eye.ui import AUDIO_PLAY_DELAY_MS
+
+    # #47's mechanism (deferred AUTOMATIC playback) must still be intact:
+    # same constant, same value, still driving a setTimeout before the
+    # first automatic play attempt.
+    assert AUDIO_PLAY_DELAY_MS == 1800
+    assert str(AUDIO_PLAY_DELAY_MS) in ARIA_LIVE_HEAD
+    assert "deferredPlaySrc" in ARIA_LIVE_HEAD
+
+
+def test_user_gesture_delay_does_not_stack_on_top_of_pending_autoplay_defer():
+    # A user gesture arriving while the ~1800ms autoplay defer is still
+    # pending must not add a further USER_PLAY_DELAY_MS on top (that would
+    # produce ~2.8s of dead air instead of the intended ~1s). The shim must
+    # track whether the autoplay defer for this src is still pending and
+    # branch on it inside the wrapped .play().
+    assert "a11yAutoplayPending" in ARIA_LIVE_HEAD
