@@ -302,24 +302,36 @@ STATUS_DEGRADED = "Finished, but with a limited result. See the text below for d
 # (1) STATUS_SUCCESS_AUDIO above is now short, so even a slight overlap is
 # brief; (2) autoplay is turned OFF on the component (see build_interface)
 # and this SAME apply()/MutationObserver pair instead starts playback
-# deliberately, after AUDIO_PLAY_DELAY_MS, once it sees the audio element
-# has a src - option (a) from the three sequencing options considered,
-# chosen because it is the only one that also solves "what if playback
-# can't be started programmatically": the delayed .play() call's rejected
-# promise is swallowed (.catch), and because autoplay is off (not merely
-# short), the <audio> control was never hidden or auto-triggered in the
-# first place, so it remains visible/reachable for the user to press
-# manually either way. The check is STRUCTURAL - whether the <audio>
-# element has a src at all - never a match against the status text, same
-# discipline status_for_result already uses. The `deferredPlaySrc` guard
-# compares against the LAST src this shim scheduled, not just "have we
-# ever scheduled anything", so a new audio src on a later run is still
-# picked up even though Gradio reuses the same DOM node.
+# deliberately, after AUDIO_PLAY_DELAY_MS.
 #
-# HONESTY: whether the two voices actually stop colliding for a real
-# screen-reader user can only be confirmed by a human screen-reader pass -
-# see docs/ACCESSIBILITY.md's Known defects entry for #47, which is not
-# marked "confirmed fixed" until the owner re-tests.
+# REGRESSION, then FIX (found by the owner in a REAL BROWSER, not by this
+# test suite - see the module-level tests' "Regression: audio never played
+# at all" section in tests/test_accessibility.py): the #47 implementation
+# originally scheduled playback by checking whether the <audio> element
+# "has a src at all" from inside apply(). That check is never satisfied in
+# practice: Gradio's Svelte player assigns `audio.src` as a JS PROPERTY,
+# which produces no DOM mutation, so the childList/subtree
+# MutationObserver has no reliable reason to re-run apply() at the moment
+# a src actually appears. Audio never played, at all, despite the full
+# suite passing. The fix (see the `loadeddata` listener inside apply()
+# below) instead attaches one real media-load event listener to the audio
+# element the first time it's seen, and schedules playback from THAT
+# event firing - not from apply() happening to observe src. The delayed
+# .play() call's rejected promise is still swallowed (.catch), and
+# autoplay is still off (not merely short), so the <audio> control was
+# never hidden or auto-triggered in the first place and remains
+# visible/reachable for the user to press manually either way. The
+# `deferredPlaySrc` guard, now checked inside the event listener's
+# callback rather than inside apply() itself, still compares against the
+# LAST src this shim scheduled, not just "have we ever scheduled
+# anything", so a new audio src on a later submission is still picked up
+# even though Gradio reuses the same DOM node.
+#
+# HONESTY: whether audio actually plays - and whether the two voices
+# actually stop colliding - for a real screen-reader user can only be
+# confirmed in a real browser by a human; pytest never renders a DOM or
+# loads real media. See docs/ACCESSIBILITY.md's Known defects entry for
+# #47, which is not marked "confirmed fixed" until the owner re-tests.
 #
 # IMAGE LABELLING FIX (issue #48 / P5.4, reported from real screen-reader
 # use by the owner, Narrator on Windows): every image on the page - Gradio's
@@ -428,8 +440,10 @@ ARIA_LIVE_HEAD = f"""
     }}
     // Audio sequencing fix (issue #47 / P5.3): the <audio> element has
     // autoplay=False (see build_interface), so playback never starts on
-    // its own - start it deliberately, after a delay, once this run
-    // actually produced audio (structural: a src is present at all).
+    // its own - start it deliberately, after a delay, once a real media
+    // load event says a source is actually there (see the
+    // a11yMediaListenerAttached block below for why this is no longer a
+    // check of "does audioEl.src look truthy right now").
     const audioEl = document.querySelector("#{AUDIO_ELEM_ID} audio");
     // User-gesture play delay (issue #52 / P5.5) - see the module comment
     // above this shim for the full reasoning. Wrap .play() ONCE per
@@ -456,21 +470,71 @@ ARIA_LIVE_HEAD = f"""
         }});
       }};
     }}
-    if (audioEl && audioEl.src && audioEl.dataset.deferredPlaySrc !== audioEl.src) {{
-      audioEl.dataset.deferredPlaySrc = audioEl.src;
-      audioEl.dataset.a11yAutoplayPending = "1";
-      setTimeout(() => {{
-        audioEl.dataset.a11yAutoplayPending = "0";
-        // Calls the captured NATIVE play directly (not the wrapped
-        // audioEl.play above) so this automatic attempt is never
-        // double-delayed by the user-gesture wrapper.
-        //
-        // If the browser blocks programmatic playback (autoplay policies
-        // vary), swallow the rejection: the control stays visible and
-        // reachable so the user can press play manually instead of the
-        // page throwing a silent, uncaught error.
-        (audioEl._a11yNativePlay || audioEl.play)().catch(() => {{}});
-      }}, {AUDIO_PLAY_DELAY_MS});
+    if (audioEl && !audioEl.dataset.a11yMediaListenerAttached) {{
+      audioEl.dataset.a11yMediaListenerAttached = "1";
+      // REGRESSION FIX (found by the owner in a real browser, NOT by this
+      // test suite - the suite passed 484 tests while audio was completely
+      // broken on main): the block used to be gated on `audioEl.src` being
+      // truthy at the moment apply() ran. Gradio's Svelte player assigns
+      // `audio.src` as a JS PROPERTY, and a property assignment produces NO
+      // DOM mutation - so the childList/subtree observer above (the one
+      // constructed at the bottom of this IIFE) never had a reliable
+      // reason to re-run apply() at the moment a src
+      // actually became available, and the gate was, in practice, never
+      // satisfied. Audio never played at all.
+      //
+      // FIX: attach ONE real media-load event listener to the element
+      // instead of relying on apply() happening to observe src. Chose
+      // "loadeddata" (fires once the browser actually has decoded data for
+      // the current playback position - a genuine "a source is here and
+      // usable" signal) over "canplay" (fires later, requires enough
+      // buffered to estimate uninterrupted playback - an unnecessary bar
+      // for a short spoken description) and over "durationchange" (fires
+      // on metadata alone, before there is necessarily any audio DATA to
+      // play - could schedule playback before the browser is actually
+      // ready to render sound).
+      //
+      // PRELOAD: "loadeddata" only fires once the browser actually FETCHES
+      // data. Left at the browser/Gradio default, `preload` can be "none"
+      // or "metadata", either of which can leave the element never
+      // fetching audio data until playback is attempted - which would make
+      // this whole fix a silent no-op. Force eager loading so the event is
+      // guaranteed to fire once Gradio assigns a real src.
+      audioEl.preload = "auto";
+      // Guarded by a11yMediaListenerAttached above (same guard discipline
+      // as every other check in apply()) so a DOM node Gradio reuses across
+      // submissions never accumulates a second listener - one loadeddata
+      // event would otherwise schedule N overlapping play attempts.
+      //
+      // RE-ARMS PER RESULT: this listener is attached ONCE, but it fires
+      // on EVERY load (Gradio reuses the same <audio> node across
+      // submissions, and "loadeddata" fires again each time a new src is
+      // loaded into it) - so a second, third, ... submission's audio is
+      // scheduled too, not just the first. The per-src dedupe check below
+      // runs INSIDE the callback (not as a gate on attaching the listener)
+      // precisely so it re-evaluates against the CURRENT src on every load
+      // instead of only ever firing once.
+      audioEl.addEventListener("loadeddata", () => {{
+        if (audioEl.src && audioEl.dataset.deferredPlaySrc !== audioEl.src) {{
+          audioEl.dataset.deferredPlaySrc = audioEl.src;
+          audioEl.dataset.a11yAutoplayPending = "1";
+          setTimeout(() => {{
+            audioEl.dataset.a11yAutoplayPending = "0";
+            // Calls the captured NATIVE play directly (not the wrapped
+            // audioEl.play above) so this automatic attempt is never
+            // double-delayed by the user-gesture wrapper.
+            //
+            // If the browser blocks programmatic playback (autoplay
+            // policies vary), swallow the rejection: the control stays
+            // visible and reachable so the user can press play manually
+            // instead of the page throwing a silent, uncaught error, and
+            // this code never claims audio is playing when it isn't (see
+            // STATUS_SUCCESS_AUDIO's wording, which makes the same
+            // promise).
+            (audioEl._a11yNativePlay || audioEl.play)().catch(() => {{}});
+          }}, {AUDIO_PLAY_DELAY_MS});
+        }}
+      }});
     }}
     // Image labelling fix (issue #48 / P5.4) - see the comment above this
     // function for the full reasoning. Guard: `a11yImgDone` marks an image

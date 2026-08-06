@@ -156,6 +156,37 @@ These are being fixed:
   delayed. Whether this actually gives the announcement enough room to
   finish before a real screen reader is something only a human
   screen-reader pass can confirm; that has not happened yet.
+- **Audio never played at all - a regression from #47/#52's first
+  implementation.** After #47 and #52 shipped, the owner reported "the
+  spoken description doesn't start" - audio never played, period, not just
+  with imperfect timing. The deferred-playback trigger scheduled playback
+  by checking, inside the existing aria-live shim's `apply()`, whether the
+  `<audio>` element's `src` was truthy. That check was never satisfied in
+  practice: Gradio's Svelte player assigns `audio.src` as a JS PROPERTY,
+  and a property assignment produces no DOM mutation, so the
+  childList/subtree `MutationObserver` that re-runs `apply()` had no
+  reliable reason to fire at the moment a source actually became
+  available. Diagnosed by the owner in a real browser (Chrome DevTools):
+  `#audio-output audio` existed, but `getAttribute('src')` was `null`, the
+  `.src` property was `""`, and there were zero `<source>` children at the
+  moment `apply()` ran. **The full automated suite passed the entire time
+  this was broken** - this defect was found by a human, not by the suite,
+  which is exactly the honesty gap Owner decision D13 already flags for
+  this whole file (automated checks assert the shim's structure, never
+  that sound actually comes out of a speaker). **Fix attempted, not yet
+  confirmed by a human/browser pass:** the shim now attaches one real
+  `loadeddata` event listener to the `<audio>` element the first time it's
+  seen (guarded against double-attachment so Gradio reusing the same DOM
+  node across submissions doesn't stack listeners), forces
+  `audioEl.preload = "auto"` so that event is guaranteed to fire once a
+  source is assigned, and schedules the same `AUDIO_PLAY_DELAY_MS`-delayed
+  playback from inside that event instead of from an `audioEl.src` check.
+  The per-src dedupe runs inside the listener's callback (not as a gate on
+  attaching the listener itself), so a second, third, ... submission's
+  audio is scheduled too, not just the first. #52's user-gesture delay and
+  the immediate-pause guarantee are unchanged. Whether audio now actually
+  plays in a real browser is something only a human, driving the real
+  app, can confirm; that has not happened yet.
 
 ## Known limitations a user should know
 
