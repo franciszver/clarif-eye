@@ -100,7 +100,10 @@ prompting.fence_untrusted before it ever reaches a prompt (see analysis.py
 line ~176), the same fencing already applied to ocr_output.
 """
 
+import ipaddress
 import re
+import socket
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -111,6 +114,16 @@ QUERY_MAX_WORDS = 12
 # real hazard, not a hypothetical one.
 _FETCH_TIMEOUT_SECONDS = 8.0
 _MAX_PAGE_BYTES = 300_000
+
+# SSRF hardening: the fetched URL comes from a DuckDuckGo result for a query
+# derived from ocr_output - attacker-controlled by photographing arbitrary
+# text. Deployed on Hugging Face Spaces, a real cloud environment with a
+# link-local metadata endpoint (169.254.169.254). Only http(s) is fetched,
+# and redirects are followed manually (never httpx's follow_redirects=True)
+# so every hop can be re-validated - see _is_safe_url and _fetch_and_extract.
+_ALLOWED_SCHEMES = {"http", "https"}
+_MAX_REDIRECT_HOPS = 3
+_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 
 # Only the single top result is ever used - "fetch ONE page" (no crawling,
 # no retry across multiple results), so there is nothing useful in asking
@@ -205,8 +218,77 @@ def _extract_readable_text(html):
     return text
 
 
+def _is_blocked_address(ip):
+    """Return True if `ip` (an ipaddress.ip_address) must not be fetched from.
+
+    Uses ipaddress's own classification properties rather than a
+    hand-written CIDR list. `is_private` already covers loopback, RFC1918,
+    and IPv6 unique-local (fc00::/7) - verified directly:
+    `ipaddress.ip_address("fd00::1").is_private` is True in this Python's
+    stdlib, so no separate fc00::/7 check is needed. `is_link_local` is
+    still checked explicitly alongside it because that's the property that
+    covers the cloud metadata range (169.254.0.0/16, incl.
+    169.254.169.254) and fe80::/10.
+    """
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def _is_safe_url(url):
+    """Validate `url`'s scheme and every address its host resolves to.
+
+    Rejects anything other than http/https (no file:, ftp:, gopher:,
+    data:), and rejects any hostname that resolves to a loopback, private,
+    link-local, reserved, multicast, or unspecified address - this is what
+    blocks the cloud metadata endpoint, localhost, and RFC1918 ranges.
+    Called both before the first fetch and again after every redirect hop
+    in _fetch_and_extract, since a redirect can point anywhere.
+
+    DNS-REBINDING NOTE: this check and the connection httpx subsequently
+    makes are not atomic - a hostile DNS server could hand back a public IP
+    here and a private IP at actual connect time. Closing that gap would
+    require pinning the resolved IP into the connection itself (a custom
+    transport); this fix does not add that, and this comment says so
+    honestly rather than implying the gap is closed.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in _ALLOWED_SCHEMES:
+        return False
+    hostname = (parsed.hostname or "").rstrip(".").lower()
+    if not hostname:
+        return False
+    try:
+        addrinfo = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return False
+    if not addrinfo:
+        return False
+    for info in addrinfo:
+        ip = ipaddress.ip_address(info[4][0])
+        if _is_blocked_address(ip):
+            return False
+    return True
+
+
 def _fetch_and_extract(client, url):
-    """Fetch `url` (bounded by timeout and size) and return extracted text, or None.
+    """Fetch `url` (bounded by timeout, size, and redirect hops) and return
+    extracted text, or None.
+
+    Redirects are handled manually (client.stream(..., follow_redirects=False))
+    rather than via httpx's follow_redirects=True, so `_is_safe_url` can
+    re-validate the target host on every hop, not just the first - a public
+    URL that redirects to a blocked address is caught at the hop instead of
+    being fetched. Bounded to _MAX_REDIRECT_HOPS hops; exceeding it degrades
+    to None (empty scraper_data), same as any other failure here.
 
     Streamed rather than fetched in one shot so the size cap is enforced
     DURING download, not after the fact - a page that blows the cap is
@@ -215,21 +297,31 @@ def _fetch_and_extract(client, url):
     read at all, so a non-HTML response (PDF, image, ...) costs nothing
     beyond the response headers.
     """
-    with client.stream("GET", url, timeout=_FETCH_TIMEOUT_SECONDS, follow_redirects=True) as response:
-        if response.status_code >= 400:
+    for _hop in range(_MAX_REDIRECT_HOPS + 1):
+        if not _is_safe_url(url):
             return None
-        content_type = response.headers.get("content-type", "")
-        if "html" not in content_type.lower():
-            return None
-        chunks = []
-        total = 0
-        for chunk in response.iter_bytes():
-            total += len(chunk)
-            if total > _MAX_PAGE_BYTES:
+        with client.stream("GET", url, timeout=_FETCH_TIMEOUT_SECONDS, follow_redirects=False) as response:
+            if response.status_code in _REDIRECT_STATUS_CODES:
+                location = response.headers.get("location")
+                if not location:
+                    return None
+                url = urljoin(url, location)
+                continue
+            if response.status_code >= 400:
                 return None
-            chunks.append(chunk)
-        html = _decode(content_type, b"".join(chunks))
-    return _extract_readable_text(html)
+            content_type = response.headers.get("content-type", "")
+            if "html" not in content_type.lower():
+                return None
+            chunks = []
+            total = 0
+            for chunk in response.iter_bytes():
+                total += len(chunk)
+                if total > _MAX_PAGE_BYTES:
+                    return None
+                chunks.append(chunk)
+            html = _decode(content_type, b"".join(chunks))
+            return _extract_readable_text(html)
+    return None
 
 
 def run_research(ocr_output, scene_context, searcher=None, client=None):
