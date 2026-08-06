@@ -20,6 +20,7 @@ from clarif_eye.analysis import run_analysis
 from clarif_eye.research import run_research
 from clarif_eye.state import ClarifEyeState
 from clarif_eye.synth import run_fast_synth
+from clarif_eye.tts import run_tts
 from clarif_eye.vision import run_vision
 
 
@@ -109,10 +110,30 @@ def analysis_node(state, config=None, client=None):
     return run_analysis(state["ocr_output"], state["scene_context"], state["scraper_data"], client)
 
 
-def tts_node(state, config=None):
-    """Stub for the text-to-speech node (issue #8)."""
+def tts_node(state, config=None, provider=None):
+    """TTS node (issue #11/P3.1): turns final_output into an audio file.
+
+    The substantive logic (provider seam, file lifecycle, degradation)
+    lives in clarif_eye.tts.run_tts so this stays a thin adapter, the same
+    pattern the other nodes use. `provider` is injectable directly or via
+    config["configurable"]["tts_provider"]; when neither is supplied,
+    run_tts constructs a real EdgeTtsProvider lazily. The output directory
+    is injectable only via config["configurable"]["tts_out_dir"] (used by
+    tests driving the compiled graph, so audio never lands in a fixed path
+    or the repo); when absent, run_tts falls back to its own bounded
+    per-process temp directory. Deliberately a DIFFERENT configurable key
+    than "client" (used by vision_node/fast_synth_node/analysis_node for
+    their OpenRouterClient) - a TTS provider is a different type serving a
+    different purpose, and reusing the same key would silently hand the
+    wrong kind of object to whichever node ran second, the same reasoning
+    research_node's "research_client" key documents.
+    """
     _record(config, "tts")
-    return {"audio_file_path": "stub/audio/path.mp3"}
+    configurable = (config or {}).get("configurable", {})
+    if provider is None:
+        provider = configurable.get("tts_provider")
+    out_dir = configurable.get("tts_out_dir")
+    return run_tts(state["final_output"], provider=provider, out_dir=out_dir)
 
 
 def dynamic_router(state):
