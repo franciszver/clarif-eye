@@ -51,6 +51,7 @@ SCENARIOS = [
             "tests/test_benchmark_script.py",
             "tests/test_graph.py",
             "tests/test_pipeline_deadline.py",
+            "tests/test_failure_messages.py",
         ],
         "scenario_paths": [
             "scripts/live_smoke.py",

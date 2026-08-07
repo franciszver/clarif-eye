@@ -220,6 +220,30 @@ def test_openrouter_error_degrades_without_raising():
     assert_tts_safe(result["final_output"])
 
 
+# --- Degradation: category-specific messages (issue #18 / P6.2) -------------
+
+
+def test_payload_too_large_produces_a_message_distinct_from_config_error():
+    client = FakeSynthClient(exc=OpenRouterError("too large", status_code=413))
+
+    result = run_fast_synth("some text", "a scene", client)
+
+    message = result["final_output"].lower()
+    assert "photo" in message
+    assert "configuration" not in message
+    assert_tts_safe(result["final_output"])
+
+
+def test_config_error_never_tells_the_user_to_retry():
+    client = FakeSynthClient(exc=OpenRouterError("authentication failed", status_code=401))
+
+    result = run_fast_synth("some text", "a scene", client)
+
+    message = result["final_output"].lower()
+    assert "try again" not in message
+    assert "retry" not in message
+
+
 # --- Degradation: unexpected exception types --------------------------------
 
 
