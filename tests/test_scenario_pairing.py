@@ -128,9 +128,26 @@ SCENARIOS = [
             # thread_id against the live stack - see its docstring for what
             # that round trip proves and what it cannot.
             "tests/test_followup.py",
+            # Issue #83 / P9.4: drives the pause-and-ask flow (a run that
+            # stops because a number in the drafted script could not be
+            # traced back to the photo) with a recording fake client and a
+            # fake TTS provider.
+            #
+            # HONEST NOTE ON THIS PAIRING: scripts/ui_smoke.py exercises the
+            # real stack end to end, but it cannot MAKE a live model invent
+            # a number on demand, so it cannot be relied on to reach the
+            # paused branch. The real-model evidence for the gate itself is
+            # the second scenario path below - a recorded, verbatim reply
+            # from a real brain model, run through the production verifier
+            # on every test run, including a corrupted copy of it that must
+            # fail verification. That is what proves the check fires on
+            # genuine model text rather than only on text a test wrote to
+            # be caught.
+            "tests/test_ask_before_speaking.py",
         ],
         "scenario_paths": [
             "scripts/ui_smoke.py",
+            "tests/test_analysis_fixture_replay.py",
         ],
     },
 ]

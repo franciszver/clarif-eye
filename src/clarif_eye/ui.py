@@ -51,13 +51,22 @@ from dataclasses import dataclass, field
 
 import gradio as gr
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
 
 from clarif_eye.client import LadderExhaustedError, OpenRouterClient, OpenRouterError
 from clarif_eye.failure_messages import (
     message_for_ladder_exhausted,
     message_for_terminal_error,
 )
-from clarif_eye.graph import DEFAULT_PIPELINE_BUDGET_SECONDS, build_graph, next_node_after
+from clarif_eye.graph import (
+    DEFAULT_PIPELINE_BUDGET_SECONDS,
+    INTERRUPT_CHUNK_KEY,
+    RESUME_CONTINUE,
+    RESUME_RETAKE,
+    TTS_NODE,
+    build_graph,
+    next_node_after,
+)
 from clarif_eye.state import make_initial_state
 from clarif_eye.tts import DEFAULT_PROVIDER_CHAIN, is_chain_exhausted
 
@@ -90,6 +99,55 @@ NO_QUESTION_MESSAGE = (
     "No question was typed. Please type a question about the photo, then "
     "activate the ask button."
 )
+# The two answers to "a number could not be checked" (issue #83 / P9.4).
+# These are BUTTON LABELS, but they are declared here with the other spoken
+# constants and not beside their elem_ids, because they are quoted verbatim
+# inside two spoken messages below (the question itself, and the refusal
+# when a follow-up is typed while it is pending). A label and the sentence
+# telling a blind user which label to activate must never be able to drift
+# apart.
+RESUME_CONTINUE_LABEL = "Continue anyway"
+RESUME_RETAKE_LABEL = "I'll retake the photo"
+
+# Issue #83 / P9.4: a resume button was activated when no run is waiting on
+# an answer. Two different situations produce this and BOTH are honestly
+# covered by one message, so no guessing is needed to tell them apart:
+#   - a stray activation (the buttons were left visible after some other
+#     run finished, or a keyboard user tabbed onto one out of habit);
+#   - the pause is genuinely gone because THIS PROCESS restarted between
+#     the question and the answer. The pause lives in the checkpointer,
+#     which is an InMemorySaver (see build_resources) - it survives exactly
+#     as long as the process does, and Render's free tier spins the service
+#     down after ~15 minutes of no traffic. Nothing here pretends otherwise.
+# Detected STRUCTURALLY (graph.get_state(...).interrupts is empty), never by
+# catching an exception out of a resume attempt - see _run_resume_events.
+NOTHING_TO_RESUME_MESSAGE = (
+    "There is nothing waiting for an answer right now. If you were asked "
+    "about a number that could not be checked, please submit the photo "
+    "again."
+)
+# Issue #83 / P9.4: a follow-up question was typed while the app is still
+# waiting to be told whether to speak a number it could not check.
+#
+# THE DECIDED RULE IS TO REFUSE, and to refuse LOUDLY. The alternative -
+# letting the follow-up run - is what the code used to do by accident, and
+# it silently DESTROYED the pending question (LangGraph supersedes a
+# pending task when a new input arrives on the thread), leaving two answer
+# buttons on screen wired to a resume that would then find nothing to
+# resume. A safety question the user never answered must never be thrown
+# away by a side action.
+#
+# It restates the situation and NAMES BOTH BUTTONS, because a user who
+# cannot see the screen has no other way to find out what is blocking them
+# or how to get past it - "you can't do that right now" on its own would
+# be a dead end.
+QUESTION_PENDING_MESSAGE = (
+    "There is still a question waiting for your answer: a number in the "
+    "description could not be checked against the photo. Please activate "
+    f'"{RESUME_CONTINUE_LABEL}" to hear the description anyway, or '
+    f'"{RESUME_RETAKE_LABEL}" to take a new photo. Then you can ask your '
+    "question."
+)
 
 # --- Accessibility (issue #15 / P5.1) ---------------------------------------
 #
@@ -116,6 +174,13 @@ IMAGE_INPUT_ELEM_ID = "photo-input"
 # structurally, by id, rather than by guessing at a label string.
 QUESTION_INPUT_ELEM_ID = "question-input"
 ASK_BUTTON_ELEM_ID = "ask-button"
+# Issue #83 / P9.4: the two answers to "a number could not be checked".
+# Ordinary gr.Buttons, so they are ordinary tab stops with real labels the
+# moment they become visible - no custom keyboard wiring, nothing to get
+# wrong. They carry elem_ids for the same reason every other control here
+# does: so the accessibility tests find them structurally, by id.
+RESUME_CONTINUE_BUTTON_ELEM_ID = "resume-continue-button"
+RESUME_RETAKE_BUTTON_ELEM_ID = "resume-retake-button"
 
 # Accessible name given to the user's own uploaded/captured photo preview
 # (issue #48 / P5.4 - see ARIA_LIVE_HEAD's image-labelling comment below).
@@ -150,14 +215,15 @@ UPLOADED_PHOTO_ALT = "The photo you submitted"
 #   - tts.py: DEFAULT_PROVIDER_CHAIN is (EdgeTtsProvider, GttsProvider); if
 #     every provider fails, audio_file_path == "" and the UI falls back to
 #     text (see this module's "THE THREE OUTCOMES" docstring above).
-#   - verification.py (imported by analysis.py as _numbers_verified): on the
-#     deep-analysis path only, numbers_verified checks
-#     every number-like token in the drafted script against the
-#     photographed text (+ scene description + any web lookup) before it is
-#     spoken; a token that doesn't trace back degrades to a safe
-#     "could not be verified" message instead of risking a wrong number.
-#     fast_synth.py has no equivalent check - the text below says "on the
-#     deep-analysis path", not "always", so it stays true to that asymmetry.
+#   - verification.py (imported by analysis.py as _unverified_numbers): on
+#     the deep-analysis path only, every number-like token in the drafted
+#     script is checked against the photographed text (+ scene description
+#     + any web lookup) before it is spoken. A token that doesn't trace
+#     back now stops the run and asks the user (issue #83 / P9.4 - see
+#     graph.verify_numbers_node), rather than silently degrading to a
+#     "could not be verified" message. fast_synth.py has no equivalent
+#     check - the text below says "on the deep-analysis path", not
+#     "always", so it stays true to that asymmetry.
 #   - graph.py: DEFAULT_PIPELINE_BUDGET_SECONDS = 60.0, a total-pipeline
 #     deadline after which nodes degrade rather than block further (tts is
 #     deliberately exempt - see graph.py - so a blown deadline still ends in
@@ -210,9 +276,11 @@ code actually does with your photo.
    the search turned up.
 6. On that closer-look path, before anything is spoken, every number in the
    drafted script is checked against the photographed text. If a number
-   doesn't trace back to what the camera actually saw, the app reports that
-   the result could not be verified rather than risk reading a wrong amount
-   or date aloud.
+   doesn't trace back to what the camera actually saw, the app stops and
+   asks you: it reads out the description it wrote, tells you which number
+   it could not check, and offers two buttons - hear it anyway, or take a
+   new photo. Nothing is read aloud as fact until you choose. That question
+   is only ever asked about a number that failed this check.
 7. The final script is converted to speech.
 8. You can then type a question about that same photo. The app answers it
    from the text and scene description it already read, so it does not look
@@ -223,12 +291,14 @@ code actually does with your photo.
 
 This pipeline is built with [LangGraph](https://github.com/langchain-ai/langgraph)'s
 `StateGraph` (this app depends on `langgraph`, not `langchain` - there is no
-LangChain in this codebase). The graph state is a 9-key `TypedDict`:
+LangChain in this codebase). The graph state is a 10-key `TypedDict`:
 `image_data`, `ocr_output`, `scene_context`, `complexity_flag`,
-`scraper_data`, `final_output`, `audio_file_path`, `messages`, `question`.
+`scraper_data`, `final_output`, `audio_file_path`, `messages`, `question`,
+`verification_hold`.
 
-Seven nodes are registered: `entry`, `vision`, `fast_synth`, `research`,
-`analysis`, `followup`, and `tts`. Every run starts at `entry`, which does
+Eight nodes are registered: `entry`, `vision`, `fast_synth`, `research`,
+`analysis`, `verify_numbers`, `followup`, and `tts`. Every run starts at
+`entry`, which does
 no work of its own: it looks at whether this run carries a photo or a typed
 question and sends the run to `vision` or to `followup` accordingly, by
 returning a `Command` naming the next node.
@@ -236,6 +306,21 @@ returning a `Command` naming the next node.
 On the photo route, the step after `vision` is chosen by a conditional edge
 evaluated against `complexity_flag`: `False` goes to `fast_synth` then
 straight to `tts`; `True` goes to `research`, then `analysis`, then `tts`.
+
+`verify_numbers` is the one step that can PAUSE the whole run, and a second
+conditional edge decides whether it runs at all. When `analysis` writes a
+number it cannot trace back to the photographed text, it records that fact
+in the state, and the edge out of `analysis` sends the run to
+`verify_numbers` instead of straight to `tts`. That node raises a LangGraph
+interrupt carrying the drafted script and the numbers that failed, and the
+run stops there - before speech - until you answer. On every run where the
+numbers check out, the step is skipped entirely. Your answer resumes the same conversation thread exactly where it
+stopped. It sits after `analysis` rather than inside it on purpose:
+resuming re-runs the paused step from its start, so putting the question
+after the writing model means answering it never spends a second model
+call. A paused run lives in this server's memory only, so if the service
+restarts while it is waiting, the question is gone and you are asked to
+submit the photo again.
 That routing decision is evaluated locally in Python, with no model call -
 it is a deliberate design point, not an implementation shortcut: the router
 only ever needs to read text density and keywords, so it would be wasteful
@@ -281,7 +366,9 @@ ladder of free models tried in turn if an earlier one fails or times out:
   text.
 - On the closer-look (deep-analysis) path, numbers spoken aloud are checked
   against the photographed text before being read, as described above; this
-  check does not currently run on the quick-description path.
+  check does not currently run on the quick-description path. The app only
+  ever stops to ask you something when that specific check fails - never
+  because it is generally unsure.
 """
 
 # --- Pipeline diagram (issue #56 / P4.4) ------------------------------------
@@ -499,6 +586,12 @@ STATUS_NODE_TTS = "Turning it into speech."
 # being answered, and the user just typed that question so they know which
 # of the two they asked for.
 STATUS_NODE_ANSWERING = "Working out the answer."
+# The opening announcement for a resume (issue #83 / P9.4) - the equivalent
+# of STATUS_WORKING/STATUS_ASKING for the third way a run can start. Says
+# nothing about how long it will take because, unlike either of those, the
+# work left is only the speech at the end: the model call already happened
+# before the question was asked.
+STATUS_RESUMING = "Thank you. Finishing up now."
 
 # node name -> spoken phrase, for whichever node clarif_eye.graph.
 # next_node_after names as coming next. This is the ONLY topology
@@ -506,9 +599,9 @@ STATUS_NODE_ANSWERING = "Working out the answer."
 # runs next (the graph's edges/routing) lives entirely in next_node_after,
 # the single source of truth build_graph() itself uses.
 #
-# TWO NODES DELIBERATELY HAVE NO PHRASE, and a missing key means "announce
-# nothing" (see _run_pipeline_events, which looks this up with .get() and
-# skips a None):
+# THREE NODES DELIBERATELY HAVE NO PHRASE, and a missing key means
+# "announce nothing" (see _run_pipeline_events, which looks this up with
+# .get() and skips a None):
 #   - "vision": announced only as entry's successor, which happens the
 #     instant the run starts - STATUS_WORKING has just said "Photo received.
 #     Describing it now" and a second announcement a few milliseconds later
@@ -518,6 +611,14 @@ STATUS_NODE_ANSWERING = "Working out the answer."
 #     no phrase before issue #82 added a node in front of it. It also does
 #     no work worth narrating: it returns a Command(goto=...) and completes
 #     instantly, so "announcing" it would be narrating nothing.
+#   - "verify_numbers" (issue #83 / P9.4): entered only on a run that is
+#     about to stop and ask the user a question, and the question itself
+#     arrives as the very next announcement. A phrase here would be a
+#     sentence spoken over the top of the one that actually matters. On
+#     every other deep-analysis run the graph routes straight past this
+#     node (see clarif_eye.graph.analysis_destination), so nothing is
+#     announced for it there either - `analysis` completing still leads to
+#     "Turning it into speech", exactly as it did before this issue.
 # The TIMING-HONESTY comment above still holds exactly as written: every
 # phrase here is announced for the node that is ABOUT to run, at the moment
 # its predecessor's completion chunk arrives.
@@ -526,8 +627,57 @@ _NODE_PHRASE = {
     "fast_synth": STATUS_NODE_WRITING,
     "analysis": STATUS_NODE_WRITING,
     "followup": STATUS_NODE_ANSWERING,
-    "tts": STATUS_NODE_TTS,
+    TTS_NODE: STATUS_NODE_TTS,
 }
+
+
+# --- The spoken question (issue #83 / P9.4) --------------------------------
+#
+# THE PAYLOAD IS STRUCTURAL, THE QUESTION IS PROSE, and the two are kept
+# apart on purpose. clarif_eye.graph.verify_numbers_node interrupts with
+# {"reason", "script", "numbers"} - fields, not a sentence - so this is the
+# ONLY place that has to decide how any of it sounds, and nothing
+# downstream ever parses a number back out of English.
+#
+# WHAT IT MUST SAY, in this order, because a listener has no screen to
+# glance back at: what was read, that a number in it could not be checked,
+# which number, and what the two choices are (named with the EXACT button
+# labels, so "activate Continue anyway" points at something findable).
+INTERRUPT_QUESTION_TEMPLATE = (
+    "Here is the description that was written: {script} "
+    "One number in it could not be checked against the photo: {numbers}. "
+    'Activate "{continue_label}" to hear the description anyway, or '
+    '"{retake_label}" to take a new photo instead.'
+)
+# Used when the payload is not the shape this module expects. Should be
+# unreachable - the only thing that raises this interrupt is
+# verify_numbers_node, right next door - but this module's contract is
+# "never raise into Gradio", and a KeyError while building a sentence would
+# cost the user the whole run rather than one detail of it.
+INTERRUPT_QUESTION_FALLBACK = (
+    "A number in the description could not be checked against the photo. "
+    f'Activate "{RESUME_CONTINUE_LABEL}" to hear the description anyway, or '
+    f'"{RESUME_RETAKE_LABEL}" to take a new photo instead.'
+)
+
+
+def _interrupt_question(payload):
+    """Turn verify_numbers_node's structural interrupt payload into the
+    sentence a screen reader reads out. Never raises - see
+    INTERRUPT_QUESTION_FALLBACK."""
+    try:
+        script = (payload["script"] or "").strip()
+        numbers = ", ".join(str(number) for number in payload["numbers"])
+        if not script or not numbers:
+            return INTERRUPT_QUESTION_FALLBACK
+        return INTERRUPT_QUESTION_TEMPLATE.format(
+            script=script,
+            numbers=numbers,
+            continue_label=RESUME_CONTINUE_LABEL,
+            retake_label=RESUME_RETAKE_LABEL,
+        )
+    except Exception:
+        return INTERRUPT_QUESTION_FALLBACK
 
 # Gradio has no native aria-live prop (as of 6.22.0), so a minimal,
 # commented JS shim marks the status control's wrapper as a polite live
@@ -1051,26 +1201,57 @@ class ThreadRegistry(_BoundedLRU):
 # accumulated `messages` list and the latest run's scalar keys, and a
 # further invoke on the SAME thread still works and keeps accumulating.
 #
-# ONLY safe when no run is IN FLIGHT on that thread. A future interrupted
-# run (issue #83, upcoming - human-in-the-loop interrupts) will have a
-# PENDING checkpoint that is not the "final" one for that turn - resuming
-# from it requires the checkpoint chain interrupts rely on. Trimming down to
-# "the newest checkpoint" during an interrupt would not lose correctness
-# (the newest checkpoint IS the pending one), but issue #83 must re-examine
-# every call site here before introducing any code path that checkpoints
-# mid-run without going through a full graph.stream() to completion.
+# AUDITED FOR PAUSED RUNS (issue #83 / P9.4 - this block previously said
+# a future interrupt "must re-examine every call site here"; this is that
+# re-examination, and the answer is measured, not assumed).
 #
-# THE CALL SITES, all reached via _update_thread_state, and NO LONGER all
-# post-run (updated by issue #82 / P9.3 - this list said "only after a run
-# reaches its final outcome", which stopped being true):
+# EMPIRICALLY VERIFIED on langgraph 1.2.10: trimming a thread that is
+# PAUSED on an interrupt does NOT break the resume. The pending interrupt's
+# write is stored against the thread's NEWEST checkpoint - which is exactly
+# the one this function keeps - and only the writes belonging to the OLDER,
+# deleted checkpoints are dropped. After trimming (repeatedly, not once),
+# get_state().interrupts still reports the pending question and
+# graph.stream(Command(resume=...)) still completes the run. See
+# tests/test_ask_before_speaking.py's
+# test_resume_still_works_after_the_thread_is_trimmed, which is written to
+# fail if a future langgraph version changes that.
+#
+# THE ONE THING THAT IS NOT SAFE DURING A PAUSE is a BARE
+# graph.update_state(). Probe-confirmed: a state write while a task is
+# pending clears the pending interrupt's entry from get_state().interrupts
+# but leaves .next still naming the paused node - a ZOMBIE thread, neither
+# running nor resumable, with the UI's two answer buttons pointing at
+# nothing. This is not hypothetical; the cache-hit branch used to do
+# exactly that.
+#
+# THE RULE, therefore, for every state write on a thread that MIGHT be
+# paused: RESOLVE-THEN-WRITE. Decide what the user's action means as an
+# answer to the pending question, resolve the pause to that answer, and
+# only then write. Submitting another photo means an implicit RETAKE (the
+# user moved on), and passing as_node=TTS_NODE to _update_thread_state
+# resolves and writes in one go with no node executed - see the cache-hit
+# branch in _run_pipeline_events for the full reasoning and the rejected
+# alternative. The other two writes need no resolve: _record_turn only ever
+# runs after a run has COMPLETED (a paused run returns before reaching it -
+# see _run_pipeline_events' `paused` branch), and a follow-up on a paused
+# thread is refused before it can write anything at all.
+#
+# THE CALL SITES, all reached via _update_thread_state EXCEPT the last, and
+# NO LONGER all post-run (updated by issue #82 / P9.3 - this list said
+# "only after a run reaches its final outcome", which stopped being true):
 #   - _run_pipeline_events, after a photo run reaches its final outcome.
+#     NOT reached when that run paused to ask a question.
 #   - _run_followup_events, after a question run reaches its final outcome.
 #   - _run_pipeline_events' CACHE-HIT branch, which runs at the START of a
-#     request and trims before yielding. That is safe for the same reason
-#     the others are - a cache hit executes no graph at all, so there is no
-#     pending checkpoint of its own to preserve - but it is NOT a
-#     post-run call, and #83 must treat it as its own case rather than
-#     assuming every trim happens after a completed stream.
+#     request and trims before yielding. NOT a post-run call, and the one
+#     place a thread can genuinely still be PAUSED when a write lands -
+#     which is why that call passes as_node=TTS_NODE to resolve the pause
+#     first (see RESOLVE-THEN-WRITE above). Trimming after that resolve is
+#     safe like the others: there is no longer a pending checkpoint to
+#     preserve.
+#   - _run_resume_events (issue #83 / P9.4), called DIRECTLY (not via
+#     _update_thread_state) on the retake path, which completes a run
+#     without recording a turn and so has no state write to trim behind.
 def _trim_thread_to_latest_checkpoint(checkpointer, thread_id):
     """Delete every checkpoint/write/blob for `thread_id` except what its
     newest checkpoint (per checkpoint_ns) still references.
@@ -1319,9 +1500,19 @@ def _outcome_for(final_output, audio_path):
     return (None, final_output or UNEXPECTED_ERROR_MESSAGE)
 
 
-def _update_thread_state(graph, config, thread_id, update):
+def _update_thread_state(graph, config, thread_id, update, as_node=None):
     """Write `update` onto `thread_id`'s checkpoint, then bound that
     thread's checkpoint history.
+
+    `as_node` (issue #83 / P9.4) names the node LangGraph should record the
+    write as having come from. Omitted, LangGraph INFERS it from the last
+    node that updated the state - which is what every caller relied on
+    before this parameter existed, and which is unambiguous on a thread
+    whose last run completed (tts is the only node every path ends on).
+    It stops being unambiguous, and stops being safe, on a thread that is
+    PAUSED on an interrupt - see the caller in _run_pipeline_events'
+    cache-hit branch for the zombie that produced, and RESOLVE-THEN-WRITE
+    below for the rule.
 
     NEVER RAISES (deep-review BLOCKER fix, issue #81 / P9.2): this is
     bookkeeping - state for a LATER run - not part of THIS run's
@@ -1337,10 +1528,35 @@ def _update_thread_state(graph, config, thread_id, update):
     Works on a thread with NO prior checkpoint (verified empirically on
     langgraph 1.2.10 for issue #82's cache-hit fix): update_state creates
     the thread's first checkpoint and needs no `as_node` to do it, which is
-    exactly the case a second visitor's cache hit produces.
+    exactly the case a second visitor's cache hit produces. Verified again
+    for this issue with an explicit as_node="tts" on a thread that has
+    never run: it creates the first checkpoint just the same.
+
+    THE ONE THING THE NEVER-RAISE GUARD BELOW CAN HIDE is a WRONG `as_node`.
+    LangGraph validates the name against the compiled node set and raises
+    langgraph.errors.InvalidUpdateError("Node <name> does not exist"), which
+    the blanket except turns into "this write silently did nothing" - and
+    for the cache-hit caller that write is what stops a follow-up answering
+    about a different photo than the user was just told about (issue #82's
+    blocker). Two things keep that honest, and no third mechanism is added
+    here because neither production behaviour nor the never-raise contract
+    should change for a programming error:
+      - the name is not a literal at either end - it is
+        clarif_eye.graph.TTS_NODE, so a node rename is one edit;
+      - a wrong name is LOUD IN THE SUITE, verified by mutation, not
+        assumed: pointing as_node at a node that does not exist turns THREE
+        tests red - test_ask_before_speaking.py's paused-cache-hit test and
+        both of test_followup.py's cache-hit-then-follow-up tests, which are
+        the very tests #82's blocker was closed with. tests/test_graph.py
+        additionally pins TTS_NODE against the compiled graph's node set, so
+        a half-finished rename fails by name rather than through those three
+        indirect assertions.
     """
     try:
-        graph.update_state(config, update)
+        if as_node is None:
+            graph.update_state(config, update)
+        else:
+            graph.update_state(config, update, as_node=as_node)
         _trim_thread_to_latest_checkpoint(getattr(graph, "checkpointer", None), thread_id)
     except Exception:
         pass
@@ -1386,9 +1602,31 @@ def _narrate_stream(graph, state, config, result):
     so adding a node to the graph can never turn into a KeyError crash mid
     run, which for this app would mean losing an answer that was already
     half-computed.
+
+    THE THIRD EVENT KIND (issue #83 / P9.4): a chunk keyed
+    INTERRUPT_CHUNK_KEY means the run PAUSED to ask the user something -
+    clarif_eye.graph.verify_numbers_node is the only thing in this graph
+    that does it. Its value is a TUPLE of Interrupt objects, not a state
+    update, so it must be intercepted BEFORE the result.update() above (a
+    dict.update() with a tuple raises TypeError - this is not a
+    hypothetical: this loop would have crashed on the first real pause).
+    It yields ("interrupt", spoken_question) and the stream ends there;
+    LangGraph produces no further chunks until the run is resumed. The
+    caller is responsible for not treating a paused run as a finished one -
+    see _run_pipeline_events.
+
+    `state` is whatever graph.stream accepts as input: a full initial state,
+    a partial delta (a follow-up), or a langgraph Command(resume=...) (a
+    resumed run). This function does not care which - it only drives and
+    narrates.
     """
     for chunk in graph.stream(state, config=config, stream_mode="updates"):
         for node_name, update in chunk.items():
+            if node_name == INTERRUPT_CHUNK_KEY:
+                interrupts = update or ()
+                payload = interrupts[0].value if interrupts else {}
+                yield "interrupt", _interrupt_question(payload)
+                continue
             if update is not None:
                 result.update(update)
             # next_node_after is the single source of truth for this
@@ -1533,6 +1771,47 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
             # update, not two: `messages` goes through state.py's reducer
             # and appends, while the rest replace, so a single call is both
             # atomic and one checkpoint write instead of two.
+            # RESOLVE-THEN-WRITE (issue #83 / P9.4) - THE rule for any state
+            # write on a thread that might be paused, and the fix for a real
+            # zombie this branch used to create.
+            #
+            # A plain graph.update_state() on a thread paused at
+            # `verify_numbers` clears the pending interrupt's own write but
+            # leaves .next still naming the paused node - probe-confirmed.
+            # The thread was then neither running nor resumable: nothing
+            # would ever answer the question, and the two answer buttons
+            # were still on screen pointing at it.
+            #
+            # Submitting another photo IS an answer, though - an IMPLICIT
+            # RETAKE. The user moved on, which is exactly what the retake
+            # button means. So the pause is resolved as a retake rather than
+            # being asked about again, and `verification_hold` is cleared
+            # below with the same write, for the same reason `question` is:
+            # a draft held back for a photo the user has left behind must
+            # never divert the next run.
+            #
+            # RESOLVED WITH as_node=TTS_NODE, NOT by streaming
+            # Command(resume=RESUME_RETAKE). Both end identically
+            # (.next == (), no pending interrupt - both probed), but the
+            # resume path RUNS the graph's remaining nodes, which means
+            # verify_numbers plus a full tts synthesis of a retake
+            # confirmation nobody will hear - a real network round trip and
+            # a stray mp3, spent to reach a state the user is about to
+            # leave anyway. as_node=TTS_NODE reaches the same end state with
+            # NO node executed at all, and folds into the single write this
+            # branch was already making. It is also what this call was
+            # already doing implicitly: with no as_node, LangGraph infers
+            # the last node to update the state, which on a completed
+            # thread is tts. Naming it makes that true on a paused thread
+            # too, instead of quietly not being.
+            #
+            # THE NAME COMES FROM clarif_eye.graph.TTS_NODE, never a literal
+            # here: LangGraph validates as_node against the compiled node
+            # set and raises InvalidUpdateError("Node <name> does not
+            # exist") if it misses, which _update_thread_state's never-raise
+            # guard would turn into "this whole write silently did nothing"
+            # - i.e. the #82 wrong-photo blocker, back. See that function's
+            # docstring for the three tests that catch it anyway.
             if thread_id is not None:
                 configurable = dict(thread_configurable(resources, thread_id))
                 if configurable:
@@ -1541,6 +1820,7 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
                         "ocr_output": cached_ocr,
                         "scene_context": cached_scene,
                         "question": None,
+                        "verification_hold": None,
                     }
                     if cached_text:
                         update["messages"] = [{"role": "assistant", "content": cached_text}]
@@ -1549,6 +1829,7 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
                         {"configurable": configurable},
                         thread_id,
                         update,
+                        as_node=TTS_NODE,
                     )
             yield "outcome", (cached_audio_path or None, cached_text)
             return
@@ -1567,7 +1848,21 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
         config = {"configurable": configurable}
         graph = resources.graph
         result = dict(state)
-        yield from _narrate_stream(graph, state, config, result)
+        # DRAINED, not `yield from` (issue #83 / P9.4): this function has to
+        # SEE an ("interrupt", ...) event go past, not just forward it. A
+        # paused run has produced no outcome yet - final_output currently
+        # holds analysis's safe "could not be verified" script and there is
+        # no audio - so everything below (recording the turn, caching the
+        # result, mapping an outcome) would be recording a non-answer as
+        # this photo's answer. It gets none of that; the run resumes, or it
+        # doesn't.
+        paused = False
+        for kind, payload in _narrate_stream(graph, state, config, result):
+            if kind == "interrupt":
+                paused = True
+            yield kind, payload
+        if paused:
+            return
     except LadderExhaustedError as exc:
         # Every node already catches and degrades this internally (see
         # vision.py/synth.py/analysis.py); this branch only matters if the
@@ -1683,6 +1978,24 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
     clarif_eye.followup.NO_PHOTO_YET_MESSAGE is what gets spoken. That is
     the correct answer for that situation, reached through the ordinary
     path with no special case here.
+
+    A PENDING QUESTION BLOCKS THIS ENTIRELY (issue #83 / P9.4, and this is
+    a real bug fixed, not a precaution). Running a follow-up on a thread
+    that is paused waiting for an answer SUPERSEDES the pending task -
+    probe-confirmed on langgraph 1.2.10: get_state().next goes back to ()
+    and the interrupt is gone. So the question the app asked about an
+    unverified number would be silently destroyed by the user typing
+    something unrelated, while both answer buttons stayed on screen wired
+    to a resume that would then find nothing to resume. The rule is to
+    REFUSE and say so: see QUESTION_PENDING_MESSAGE. Checked BEFORE the
+    graph is touched, so the refusal costs no model call and writes no
+    state - the pause is left exactly as it was and can still be answered.
+
+    THE HOLD IS NOT CLEARED HERE, and does not need to be: `followup` never
+    routes through `verify_numbers` (the edge is out of `analysis` only), so
+    a stale verification_hold could not divert an answer even if one
+    existed - and after this guard, a follow-up cannot run on a thread that
+    has one at all.
     """
     if resources.client is None:
         yield "outcome", (None, resources.client_error or CONFIG_ERROR_MESSAGE)
@@ -1721,6 +2034,14 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
         configurable.update(thread_configurable(resources, thread_id))
         config = {"configurable": configurable}
         graph = resources.graph
+        # A pending safety question outranks a follow-up - see this
+        # function's docstring for what running one anyway used to destroy.
+        # Checked here, inside the try and after thread_configurable, so it
+        # reads the SAME config the run would have used and so a broken
+        # get_state can never raise into Gradio.
+        if _has_pending_interrupt(graph, config):
+            yield "outcome", (None, QUESTION_PENDING_MESSAGE)
+            return
         # The DELTA, and nothing else - see this function's docstring.
         state = {"question": question}
         result = dict(state)
@@ -1810,10 +2131,40 @@ def handle_submit(image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUD
     for kind, payload in _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=thread_id):
         if kind == "outcome":
             outcome = payload
+        elif kind == "interrupt":
+            # A paused run (issue #83 / P9.4) never produces an "outcome"
+            # event, so without this branch this function would return the
+            # generic UNEXPECTED_ERROR_MESSAGE default and tell the user
+            # something went wrong when nothing did. The question IS the
+            # result for this call; the caller resumes via
+            # handle_resume_staged. No audio - the question is spoken by
+            # the screen reader through the live region, not by TTS.
+            outcome = (None, payload)
     return outcome
 
 
-def _stage_events(opening_status, events):
+@dataclass
+class _PauseSignal:
+    """One mutable bit shared between a staged run and its Gradio wrapper:
+    did this run PAUSE to ask the user a question? (issue #83 / P9.4)
+
+    WHY A SIDE-CHANNEL AND NOT A FOURTH ELEMENT in the staged tuple: the
+    (status, audio, text) triple _stage_events yields is a contract every
+    existing caller and test in this repo unpacks by shape. Widening it
+    would rewrite all of them for one boolean that only ONE consumer -
+    build_interface, deciding whether to show the two resume buttons -
+    actually needs. It is set the moment the interrupt event arrives, which
+    is strictly before the final yield, so a wrapper reading it per-yield
+    always sees the right value on the yield that matters.
+
+    Optional everywhere: pass nothing and the staged behaviour is exactly
+    what it was.
+    """
+
+    paused: bool = False
+
+
+def _stage_events(opening_status, events, pause_signal=None):
     """THE staged yield contract, in one place.
 
     Turns an ("status"/"outcome", payload) event stream - from
@@ -1841,14 +2192,34 @@ def _stage_events(opening_status, events):
          once more after AUDIO_PLAY_DELAY_MS, now carrying the audio path -
          so Gradio only mounts the autoplaying player once the completion
          status has had time to be spoken.
+
+    A PAUSED RUN (issue #83 / P9.4) replaces steps 3 and 4 with a single
+    yield carrying the spoken question, and NEVER reaches status_for_result
+    or _outcome_for. That is structural, not a nicety: a paused run has no
+    audio and no finished answer, so _outcome_for would read its empty
+    audio path, consult is_chain_exhausted() - which reports on whatever
+    the LAST completed run did, not on this one, since no tts call happened
+    here at all - and quite possibly announce UNEXPECTED_ERROR_MESSAGE over
+    a run that is working exactly as designed. The question goes into BOTH
+    the status (which is the aria-live region, so a screen reader speaks it
+    without being asked) and the description text (so it can be re-read,
+    and so FOCUS_RESULT_JS lands the user on it).
     """
     yield opening_status, None, ""
     audio_path, text = None, ""
+    question = None
     for kind, payload in events:
         if kind == "status":
             yield payload, None, ""
+        elif kind == "interrupt":
+            question = payload
+            if pause_signal is not None:
+                pause_signal.paused = True
         else:
             audio_path, text = payload
+    if question is not None:
+        yield question, None, question
+        return
     status = status_for_result(audio_path, is_chain_exhausted())
     if not audio_path:
         yield status, audio_path, text
@@ -1858,8 +2229,136 @@ def _stage_events(opening_status, events):
     yield status, audio_path, text
 
 
+def _run_resume_events(answer, resources, pipeline_budget_seconds, thread_id=None):
+    """Generator: the resume sibling of _run_pipeline_events (issue #83 /
+    P9.4). Answers the question a paused run asked, and yields the same
+    ("status", phrase) / ("outcome", (audio, text)) event shape, so a
+    resumed run is staged exactly like a description or an answer.
+
+    NEVER RAISES (except KeyboardInterrupt/SystemExit) - same contract as
+    every other entry point in this module.
+
+    THE "NOTHING IS PAUSED" CASE IS DETECTED STRUCTURALLY, BEFORE RESUMING,
+    and that ordering is the whole guard (D15 - no exception-driven control
+    flow, and no prose matching). Verified empirically on langgraph 1.2.10:
+    graph.get_state(config).interrupts is a non-empty tuple exactly while a
+    run is waiting on an answer, and empty otherwise - on a thread that
+    completed, on a thread that never paused, and on a thread this process
+    has never seen (a restart between question and answer, since the pause
+    lives in an in-process InMemorySaver - see build_resources). Resuming
+    anyway is not harmless: on a thread with no stored state at all,
+    graph.stream(Command(resume=...)) raises KeyError from inside LangGraph
+    as the first node reads a key that was never written. So the check
+    comes first, and the answer is a spoken explanation - see
+    NOTHING_TO_RESUME_MESSAGE, which covers both situations honestly.
+
+    RECORDING (issue #93's neighbourhood): only a RESUME_CONTINUE that
+    produced something spoken records a turn. The caveated script IS this
+    photo's honest answer, so the thread should remember it. A retake is
+    NOT an answer about the photo - it is the user declining one - so
+    recording it would put "please take a new photo" into the history a
+    later follow-up reads back as if it described the document. Issue #93
+    owns the wider question of which degraded outcomes belong in that
+    history at all; this function deliberately does not settle it.
+
+    THE IMAGE CACHE IS NEVER WRITTEN HERE, even on a fully-spoken continue.
+    Caching is keyed on image CONTENT and this function never sees the
+    photo - the key would have to be smuggled across the pause through
+    session state. It is also not obviously desirable: replaying a cached
+    caveated script would answer the question ("continue anyway?") on
+    behalf of the NEXT person to submit that photo, who was never asked.
+    An interrupted photo simply costs its quota again, and asks again.
+    """
+    if resources.client is None:
+        yield "outcome", (None, resources.client_error or CONFIG_ERROR_MESSAGE)
+        return
+
+    try:
+        configurable = {
+            "client": resources.client,
+            "tts_providers": resources.tts_providers,
+            "deadline": time.monotonic() + pipeline_budget_seconds,
+        }
+        configurable.update(thread_configurable(resources, thread_id))
+        config = {"configurable": configurable}
+        graph = resources.graph
+        # No thread_id survived thread_configurable's pairing guard (no
+        # checkpointer, no registry, or no thread at all) - then nothing
+        # can be paused, because a pause only exists in a checkpoint.
+        if "thread_id" not in configurable or not _has_pending_interrupt(graph, config):
+            yield "outcome", (None, NOTHING_TO_RESUME_MESSAGE)
+            return
+        result = {}
+        yield from _narrate_stream(graph, Command(resume=answer), config, result)
+    except LadderExhaustedError as exc:
+        yield "outcome", (None, message_for_ladder_exhausted(exc))
+        return
+    except OpenRouterError as exc:
+        yield "outcome", (None, message_for_terminal_error(exc))
+        return
+    except Exception:
+        yield "outcome", (None, UNEXPECTED_ERROR_MESSAGE)
+        return
+
+    final_output = (result.get("final_output") or "").strip()
+    audio_path = result.get("audio_file_path") or ""
+
+    if answer == RESUME_CONTINUE and final_output:
+        _record_turn(graph, config, thread_id, [{"role": "assistant", "content": final_output}])
+    else:
+        # No turn to record, but the run DID complete, so this thread's
+        # checkpoint history still wants bounding - see
+        # _trim_thread_to_latest_checkpoint's measured defect. _record_turn
+        # trims as a side effect of writing; this is the same housekeeping
+        # without the write.
+        _trim_thread_to_latest_checkpoint(getattr(graph, "checkpointer", None), thread_id)
+
+    yield "outcome", _outcome_for(final_output, audio_path)
+
+
+def _has_pending_interrupt(graph, config):
+    """True if `config`'s thread is paused waiting on an answer.
+
+    STRUCTURAL (D15): reads graph.get_state(...).interrupts, the tuple
+    LangGraph itself populates from the pending task's interrupt writes -
+    never a flag this module maintains alongside it, which would be a
+    second source of truth able to disagree with the checkpointer.
+
+    Never raises: a graph with no checkpointer, a test double with no
+    get_state, or any other shape this module has not anticipated is
+    reported as "nothing is paused", which is both true (nothing that can
+    be resumed exists) and the safe answer - the caller then speaks
+    NOTHING_TO_RESUME_MESSAGE instead of losing the click to a traceback.
+    """
+    try:
+        return bool(graph.get_state(config).interrupts)
+    except Exception:
+        return False
+
+
+def handle_resume_staged(
+    answer, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUDGET_SECONDS, thread_id=None
+):
+    """The resume sibling of handle_submit_staged / handle_ask_staged
+    (issue #83 / P9.4): answers the question a paused run asked and yields
+    the SAME staged (status_text, audio_path_or_None, description_text)
+    contract, including the AUDIO_PLAY_DELAY_MS gap.
+
+    `answer` is RESUME_CONTINUE or RESUME_RETAKE (clarif_eye.graph). It is
+    passed through to the graph untouched and interpreted there, not here -
+    verify_numbers_node treats anything that is not RESUME_CONTINUE as a
+    retake, so a garbled value can never become consent to speak an
+    unverified number.
+    """
+    yield from _stage_events(
+        STATUS_RESUMING,
+        _run_resume_events(answer, resources, pipeline_budget_seconds, thread_id=thread_id),
+    )
+
+
 def handle_submit_staged(
-    image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUDGET_SECONDS, thread_id=None
+    image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUDGET_SECONDS, thread_id=None,
+    pause_signal=None,
 ):
     """Generator version of handle_submit that also drives the live-region
     status text (issue #15 / P5.1 scope item 3).
@@ -1899,10 +2398,15 @@ def handle_submit_staged(
     `thread_id` (issue #81 / P9.2) is OPTIONAL and defaults to None, same
     as _run_pipeline_events - build_interface passes each browser session's
     own minted thread_id (a gr.State) through here.
+
+    `pause_signal` (issue #83 / P9.4) is OPTIONAL and defaults to None - see
+    _PauseSignal for why the "did this run pause?" bit travels beside the
+    yields rather than inside them.
     """
     yield from _stage_events(
         STATUS_WORKING,
         _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=thread_id),
+        pause_signal=pause_signal,
     )
 
 
@@ -1938,8 +2442,32 @@ def build_interface(resources):
     state across that ONE visitor's runs.
     """
 
+    # The two resume buttons (issue #83 / P9.4) are hidden until a run
+    # actually pauses, so nothing appears in the tab order offering a choice
+    # about a question nobody was asked. _submit is the only handler that
+    # can reveal them; _resume always hides them again, whichever way the
+    # answer went.
+    #
+    # _ask does NOT touch them, and it no longer needs to: a follow-up
+    # typed while a question is pending is REFUSED before the graph is
+    # touched (see QUESTION_PENDING_MESSAGE and _run_followup_events), so
+    # the pause it would once have silently destroyed is still there and
+    # the buttons still point at something real. An earlier version of this
+    # comment claimed the follow-up left the pause alone; it did not - it
+    # superseded the pending task and left these two buttons wired to
+    # nothing. That is the bug the refusal fixes.
     def _submit(image, thread_id):
-        yield from handle_submit_staged(image, resources, thread_id=thread_id)
+        pause_signal = _PauseSignal()
+        for status, audio, text in handle_submit_staged(
+            image, resources, thread_id=thread_id, pause_signal=pause_signal
+        ):
+            visible = gr.update(visible=pause_signal.paused)
+            yield status, audio, text, visible, visible
+
+    def _resume(answer, thread_id):
+        hidden = gr.update(visible=False)
+        for status, audio, text in handle_resume_staged(answer, resources, thread_id=thread_id):
+            yield status, audio, text, hidden, hidden
 
     def _ask(question, thread_id):
         yield from handle_ask_staged(question, resources, thread_id=thread_id)
@@ -1989,6 +2517,26 @@ def build_interface(resources):
         audio_output = gr.Audio(label="Spoken description", autoplay=True, elem_id=AUDIO_ELEM_ID)
         text_output = gr.Textbox(label="Description (text)", lines=6, elem_id=RESULT_ELEM_ID)
 
+        # --- Answering the unverifiable-number question (issue #83 / P9.4)
+        #
+        # PLACED IMMEDIATELY AFTER the result text, which is where the
+        # question itself appears and where FOCUS_RESULT_JS has just put
+        # focus - so the two answers are the very next thing a keyboard or
+        # screen-reader user reaches by tabbing forward from the question
+        # they were just read. Ordinary gr.Buttons: real labels, real tab
+        # stops, Enter and Space activate them, nothing custom to get wrong.
+        #
+        # visible=False initially, and every handler that touches them sets
+        # visibility explicitly (see _submit/_resume above) - so they exist
+        # in the tab order only while there is genuinely a question waiting.
+        with gr.Row():
+            resume_continue_button = gr.Button(
+                RESUME_CONTINUE_LABEL, elem_id=RESUME_CONTINUE_BUTTON_ELEM_ID, visible=False
+            )
+            resume_retake_button = gr.Button(
+                RESUME_RETAKE_LABEL, elem_id=RESUME_RETAKE_BUTTON_ELEM_ID, visible=False
+            )
+
         # --- Follow-up question (issue #82 / P9.3) -----------------------
         #
         # PLACED AFTER the description output and BEFORE "How this works":
@@ -2033,15 +2581,38 @@ def build_interface(resources):
         # from silencing it.
         gr.HTML(PIPELINE_DIAGRAM_HTML, elem_id=DIAGRAM_ELEM_ID)
 
+        result_outputs = [status_output, audio_output, text_output]
+        # The two resume buttons are outputs of the photo and resume
+        # handlers only (issue #83 / P9.4) - see _submit/_resume above for
+        # why the ask handler is deliberately left out.
+        result_and_controls = result_outputs + [resume_continue_button, resume_retake_button]
+
         submit_event = submit_button.click(
             fn=_submit,
             inputs=[image_input, thread_state],
-            outputs=[status_output, audio_output, text_output],
+            outputs=result_and_controls,
         )
         # Runs client-side only after the handler above has produced its
         # final yield - see FOCUS_RESULT_JS's docstring for why that
-        # timing matters (never steals focus mid-interaction).
+        # timing matters (never steals focus mid-interaction). A PAUSED run
+        # gets this too, and should: the last yield put the question in the
+        # description box, so focus lands on the question rather than being
+        # left on the submit button the user has finished with.
         submit_event.then(fn=None, inputs=None, outputs=None, js=FOCUS_RESULT_JS)
+
+        # Each resume button sends its OWN fixed answer, as a gr.State
+        # constant rather than anything read back out of the page, so what
+        # the graph receives cannot depend on client-side state at all.
+        for resume_button, resume_answer in (
+            (resume_continue_button, RESUME_CONTINUE),
+            (resume_retake_button, RESUME_RETAKE),
+        ):
+            resume_event = resume_button.click(
+                fn=_resume,
+                inputs=[gr.State(resume_answer), thread_state],
+                outputs=result_and_controls,
+            )
+            resume_event.then(fn=None, inputs=None, outputs=None, js=FOCUS_RESULT_JS)
 
         # An answer replaces the SAME status/audio/description outputs a
         # description uses, so a screen-reader user hears it announced by
@@ -2053,12 +2624,12 @@ def build_interface(resources):
             ask_button.click(
                 fn=_ask,
                 inputs=[question_input, thread_state],
-                outputs=[status_output, audio_output, text_output],
+                outputs=result_outputs,
             ),
             question_input.submit(
                 fn=_ask,
                 inputs=[question_input, thread_state],
-                outputs=[status_output, audio_output, text_output],
+                outputs=result_outputs,
             ),
         ):
             ask_event.then(fn=None, inputs=None, outputs=None, js=FOCUS_RESULT_JS)

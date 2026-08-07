@@ -109,6 +109,28 @@ class ClarifEyeState(TypedDict):
     #     turn is RESET rather than surviving to divert the new photo run
     #     into `followup` - a stale question must never eat a fresh photo.
     question: str | None
+    # dict | None (issue #83 / P9.4): the drafted script the deep-analysis
+    # path is HOLDING BACK because a number in it could not be traced to
+    # the photographed text, plus which tokens failed:
+    #     {"script": "<the drafted spoken script>", "numbers": ["999.99"]}
+    # None means "nothing is being held" - a verified reply, or any path
+    # that never verifies numbers at all (fast_synth, followup).
+    #
+    # WHY THIS TRAVELS IN STATE RATHER THAN BEING RECOMPUTED where it is
+    # used: `verify_numbers` (clarif_eye.graph) is the node that asks the
+    # user about it, and LangGraph re-executes the WHOLE interrupted node
+    # when the run is resumed (verified empirically on langgraph 1.2.10 -
+    # see verify_numbers_node's docstring). Anything expensive ahead of the
+    # interrupt would therefore run TWICE. Keeping the brain model's draft
+    # here means the asking node does no work of its own beyond reading
+    # this key, so a resume costs nothing but the speech at the end.
+    #
+    # A PLAIN (non-reducer) KEY, like every other scalar here, and analysis
+    # writes it on EVERY return path (None when there is nothing to hold).
+    # That matters on a checkpointed thread: a hold left over from an
+    # earlier photo would otherwise survive into the next run and stop it
+    # to ask about a number nobody just heard.
+    verification_hold: dict | None
     # See "messages: the app's first LangGraph reducer" above.
     messages: Annotated[list, _keep_last_n_messages]
 
@@ -134,6 +156,12 @@ def make_initial_state(image_data):
         # stored question so the new photo run is not diverted into the
         # followup node. See ClarifEyeState.question.
         question=None,
+        # None = "nothing is being held back pending a question" - and, on
+        # a thread whose previous run was abandoned mid-question, this
+        # explicitly CLEARS that hold so the new photo run is not stopped
+        # to ask about the old photo's number. See
+        # ClarifEyeState.verification_hold.
+        verification_hold=None,
         # [] is safe to pass on every run, including a second run on an
         # already-checkpointed thread: add_messages merges an empty `right`
         # as "nothing new to append", never as "replace with []" - verified

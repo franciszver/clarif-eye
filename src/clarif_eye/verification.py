@@ -65,6 +65,38 @@ def _input_number_tokens(ocr_output, scene_context, scraper_data):
     return tokens
 
 
+def unverified_numbers(spoken_output, ocr_output, scene_context, scraper_data):
+    """The number-like tokens in `spoken_output` that do NOT trace back to
+    the inputs - in the order they were spoken, with duplicates collapsed.
+
+    THE STRUCTURAL HALF of this module (issue #83 / P9.4). numbers_verified
+    below answers "may this be spoken?" with a bool, which is all the
+    analysis node ever needed while the only response to a failure was to
+    refuse. Now that a failure can be turned into a QUESTION to the user
+    ("this number could not be checked - continue anyway?"), the caller
+    needs to know WHICH tokens failed, as tokens, so nothing downstream has
+    to parse them back out of a sentence. Same comparison rules as
+    numbers_verified - which is now defined in terms of this function, so
+    the two can never disagree about what counts as verified.
+
+    Tokens are returned in their ORIGINAL spoken form ("$999.99" keeps its
+    currency symbol) rather than the normalised form used for comparison:
+    what comes back here is read aloud to a user, so it should sound like
+    what they were about to be told.
+    """
+    tokens = _NUMBER_TOKEN_RE.findall(spoken_output)
+    if not tokens:
+        return []
+    input_tokens = _input_number_tokens(ocr_output, scene_context, scraper_data)
+    failing = []
+    for token in tokens:
+        if _strip_currency_punct(token) in input_tokens:
+            continue
+        if token not in failing:
+            failing.append(token)
+    return failing
+
+
 def numbers_verified(spoken_output, ocr_output, scene_context, scraper_data):
     """Check that every number-like token spoken aloud traces back to the input text.
 
@@ -80,9 +112,11 @@ def numbers_verified(spoken_output, ocr_output, scene_context, scraper_data):
     commas stripped from both sides) so "$104.95" in the output matches
     "104.95" in the OCR text. A reply with no numeric tokens at all has
     nothing to verify and trivially passes.
+
+    Defined in terms of unverified_numbers above (issue #83 / P9.4) rather
+    than repeating the comparison: two copies of this rule would be two
+    places for "what counts as verified" to drift, and the whole point of
+    the ask-first flow is that the question the user is asked names exactly
+    the tokens this predicate rejected.
     """
-    tokens = _NUMBER_TOKEN_RE.findall(spoken_output)
-    if not tokens:
-        return True
-    input_tokens = _input_number_tokens(ocr_output, scene_context, scraper_data)
-    return all(_strip_currency_punct(token) in input_tokens for token in tokens)
+    return not unverified_numbers(spoken_output, ocr_output, scene_context, scraper_data)
