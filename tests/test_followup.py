@@ -201,6 +201,122 @@ def test_follow_up_answers_from_stored_state_with_no_second_vision_call():
     assert CANNED_ANSWER in updates[-1][2]
 
 
+def test_a_new_photo_after_a_question_is_not_diverted_into_the_followup_node():
+    """A stale question must never eat the next photo.
+
+    `question` is a PLAIN (non-reducer) state key, so it survives on the
+    thread's checkpoint after a follow-up. If a photo run's input did not
+    seed question=None, clarif_eye.graph.entry_destination would still see
+    the previous turn's question and send the new photo straight to
+    `followup` - the user would upload a photo and be told about the old
+    one. make_initial_state seeding question=None is what prevents that;
+    this proves the seeding actually reaches the graph.
+    """
+    client = RecordingClient()
+    resources = _resources(client)
+    thread_id = "stale-question-session"
+
+    list(handle_submit_staged(FakeImage(content=b"first-photo"), resources, thread_id=thread_id))
+    list(handle_ask_staged(QUESTION, resources, thread_id=thread_id))
+    list(handle_submit_staged(FakeImage(content=b"second-photo"), resources, thread_id=thread_id))
+
+    # Two photos means two vision calls. One would mean the second photo was
+    # routed to `followup` and never looked at.
+    assert len(client.vision_calls()) == 2
+
+    state = resources.graph.get_state({"configurable": {"thread_id": thread_id}})
+    assert state.values["question"] is None
+
+
+def test_a_follow_ups_partial_input_preserves_the_threads_other_stored_keys():
+    """The mechanism the whole feature rests on, asserted directly.
+
+    A follow-up passes ONLY {"question": q} to the graph. Every key it does
+    NOT mention must survive from the photo run's checkpoint - if LangGraph
+    replaced unmentioned scalar keys with empty defaults instead, there
+    would be nothing to answer from. Verified empirically before this
+    feature was written; pinned here so a langgraph upgrade that changes it
+    fails loudly rather than silently turning every follow-up into the
+    no-photo-yet message.
+    """
+    client = RecordingClient()
+    resources = _resources(client)
+    thread_id = "partial-input-session"
+    config = {"configurable": {"thread_id": thread_id}}
+
+    list(handle_submit_staged(FakeImage(), resources, thread_id=thread_id))
+    stored_image_data = resources.graph.get_state(config).values["image_data"]
+    assert stored_image_data
+
+    list(handle_ask_staged(QUESTION, resources, thread_id=thread_id))
+
+    values = resources.graph.get_state(config).values
+    assert STORED_OCR_TEXT in values["ocr_output"]
+    assert STORED_SCENE_TEXT in values["scene_context"]
+    # image_data too: untouched by a follow-up, which never re-encodes or
+    # re-sends the photo.
+    assert values["image_data"] == stored_image_data
+
+
+def test_a_follow_up_records_both_the_question_and_the_answer_as_turns():
+    client = RecordingClient()
+    resources = _resources(client)
+    thread_id = "turn-recording-session"
+
+    list(handle_submit_staged(FakeImage(), resources, thread_id=thread_id))
+    list(handle_ask_staged(QUESTION, resources, thread_id=thread_id))
+
+    messages = resources.graph.get_state({"configurable": {"thread_id": thread_id}}).values["messages"]
+    # The photo run records one turn (the description); the follow-up
+    # records two (the typed question AND the answer) - see
+    # clarif_eye.ui._run_followup_events for why the user side is recorded
+    # here but not on a photo run.
+    assert len(messages) == 3
+    assert QUESTION in messages[1].content
+    assert CANNED_ANSWER in messages[2].content
+
+
+def test_a_follow_up_never_reads_or_writes_the_image_cache():
+    """The image cache is keyed on photo CONTENT and holds a whole photo's
+    result. Two different questions about one photo have different answers,
+    so a hit there would be a wrong answer read aloud with confidence."""
+    client = RecordingClient()
+    resources = _resources(client)
+    thread_id = "cache-untouched-session"
+
+    list(handle_submit_staged(FakeImage(), resources, thread_id=thread_id))
+    entries_after_photo = dict(resources.image_cache._entries)
+
+    list(handle_ask_staged(QUESTION, resources, thread_id=thread_id))
+    list(handle_ask_staged("and what is it made of?", resources, thread_id=thread_id))
+
+    assert dict(resources.image_cache._entries) == entries_after_photo
+    # Both questions really did reach the model - neither was served from
+    # anything - so the assertion above is about an untouched cache, not
+    # about two runs that never happened.
+    assert len(client.brain_calls()) == 2
+
+
+def test_a_blank_question_is_refused_without_running_the_graph():
+    """entry_destination routes on the question being non-blank, so a blank
+    one would fall through to `vision` and re-run the WHOLE photo pipeline -
+    a second vision call the user never asked for. clarif_eye.ui rejects it
+    first."""
+    from clarif_eye.ui import NO_QUESTION_MESSAGE
+
+    client = RecordingClient()
+    resources = _resources(client)
+    thread_id = "blank-question-session"
+
+    list(handle_submit_staged(FakeImage(), resources, thread_id=thread_id))
+    calls_after_photo = len(client.calls)
+
+    updates = list(handle_ask_staged("   ", resources, thread_id=thread_id))
+
+    assert len(client.calls) == calls_after_photo
+    assert updates[-1][2] == NO_QUESTION_MESSAGE
+
+
 def test_follow_up_before_any_photo_speaks_an_explanation_and_calls_no_model():
     client = RecordingClient()
     resources = _resources(client)

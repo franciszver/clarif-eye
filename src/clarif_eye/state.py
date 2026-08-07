@@ -87,6 +87,28 @@ class ClarifEyeState(TypedDict):
     scraper_data: str | None
     final_output: str
     audio_file_path: str
+    # str | None (issue #82 / P9.3): the typed follow-up question for THIS
+    # run, or None when the run is a photo run. This is the key
+    # clarif_eye.graph.entry_node reads to decide - via Command(goto=...) -
+    # whether the run goes to `vision` (a photo) or straight to `followup`
+    # (a question answered from what this thread already has stored).
+    #
+    # A PLAIN (non-reducer) KEY, ON PURPOSE, and that is what makes the
+    # reset below work. EMPIRICALLY RE-VERIFIED for this issue on langgraph
+    # 1.2.10 (the same fact issue #81 established for the other scalar
+    # keys): on a checkpointed thread, keys present in the input REPLACE
+    # the checkpointed value, and keys ABSENT from the input are preserved
+    # untouched. Both halves are load-bearing here:
+    #   - a follow-up passes ONLY {"question": q} (see
+    #     clarif_eye.ui._run_followup_events), so the thread's stored
+    #     ocr_output/scene_context survive to be answered from. Passing a
+    #     full make_initial_state() there would wipe them and there would
+    #     be nothing left to answer from.
+    #   - a photo run passes make_initial_state(), which seeds
+    #     question=None (below), so a question left over from the previous
+    #     turn is RESET rather than surviving to divert the new photo run
+    #     into `followup` - a stale question must never eat a fresh photo.
+    question: str | None
     # See "messages: the app's first LangGraph reducer" above.
     messages: Annotated[list, _keep_last_n_messages]
 
@@ -107,6 +129,11 @@ def make_initial_state(image_data):
         scraper_data=None,
         final_output="",
         audio_file_path="",
+        # None = "this is a photo run, not a question" - and, on a thread
+        # that already answered a question, this explicitly RESETS the
+        # stored question so the new photo run is not diverted into the
+        # followup node. See ClarifEyeState.question.
+        question=None,
         # [] is safe to pass on every run, including a second run on an
         # already-checkpointed thread: add_messages merges an empty `right`
         # as "nothing new to append", never as "replace with []" - verified

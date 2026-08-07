@@ -1,12 +1,41 @@
 """Compiling LangGraph skeleton for Clarif-Eye.
 
-Wires: vision -> dynamic_router -> fast_synth OR (research -> analysis) -> tts -> END
+Wires: entry -> vision -> dynamic_router -> fast_synth OR (research ->
+analysis) -> tts -> END, with entry -> followup -> tts as the second way in
+(issue #82 / P9.3 - a typed question about a photo this thread already
+described).
 
-Every node here is a STUB: it returns a state update with placeholder
-values and does not call a model, the network, or the filesystem. The
-router stub decides purely from state["complexity_flag"] so both paths can
-be driven deterministically in tests. Node functions are named and
-importable individually so later issues (#5-#8) can replace them one at a
+TWO ROUTING MECHANISMS, EACH WHERE IT FITS (issue #82 / P9.3)
+---------------------------------------------------------------
+Both of LangGraph's routing mechanisms are used in this graph, deliberately,
+and neither is a leftover:
+
+  - add_conditional_edges + dynamic_router (out of `vision`): a STATIC
+    branch on a flag some OTHER node already computed. vision_node writes
+    complexity_flag; a separate, pure function reads it and names the next
+    node. The decision and the state write live in different places, which
+    is exactly the shape a conditional edge expresses - the routing function
+    takes no part in producing state, so it can stay a tiny testable pure
+    function (see dynamic_router's own guards below) with no client, no
+    config, and no update to return.
+
+  - Command(goto=...) (returned by `entry`): a node that decides its OWN
+    successor. There is no upstream node to compute a flag for it - `entry`
+    IS the first thing that runs, and what it decides from (state["question"]
+    being None or a real question) is the run's own input. Expressed as a
+    conditional edge instead, `entry` would have to exist purely to do
+    nothing and hand off to a router function - a node whose only job is to
+    be somewhere for an edge to leave from. Command lets the decision live
+    in the node that owns it. It is also the mechanism that scales to the
+    case where a routing node must WRITE state as part of deciding
+    (Command(goto=..., update={...})), which a conditional edge cannot do at
+    all.
+
+Every node here is a thin adapter: it returns a state update with values
+computed by its own module and does not itself call a model, the network, or
+the filesystem. The router stub decides purely from state["complexity_flag"]
+so both paths can be driven deterministically in tests. Node functions are
+named and importable individually so later issues can replace them one at a
 time without restructuring the graph.
 
 Node visitation is observable via the compiled graph's own
@@ -20,8 +49,10 @@ side-channel, and needs nothing extra recorded by the nodes themselves.
 import time
 
 from langgraph.graph import END, StateGraph
+from langgraph.types import Command
 
 from clarif_eye.analysis import run_analysis
+from clarif_eye.followup import run_followup
 from clarif_eye.research import run_research
 from clarif_eye.state import ClarifEyeState
 from clarif_eye.synth import run_fast_synth
@@ -80,6 +111,55 @@ def _deadline_exceeded(config):
     if deadline is None:
         return False
     return time.monotonic() >= deadline
+
+
+def entry_destination(state):
+    """The node a run should START at: "followup" when this run carries a
+    typed question, "vision" when it carries a photo.
+
+    Pulled out of entry_node so next_node_after (this module's single source
+    of truth for topology, used by clarif_eye.ui's narration) can name the
+    same successor entry_node will actually go to, WITHOUT re-deriving the
+    rule. The same reasoning next_node_after already applies to the vision
+    branch by reusing dynamic_router itself rather than re-reading
+    complexity_flag.
+
+    Truthiness, not `is not None`, is deliberate and load-bearing: a blank
+    or whitespace-only question is not a question, and routing one to
+    `followup` would ask a model to answer nothing. clarif_eye.ui rejects a
+    blank question before the graph is ever called (see NO_QUESTION_MESSAGE
+    there), so this is the second line of defence, not the only one. Reads
+    with .get() because a follow-up run's input is a PARTIAL state delta -
+    on a thread that has never run, keys that no node has ever written are
+    genuinely absent from `state`, verified empirically on langgraph 1.2.10.
+    """
+    return "followup" if (state.get("question") or "").strip() else "vision"
+
+
+def entry_node(state):
+    """Entry node (issue #82 / P9.3): sends the run to `vision` or `followup`
+    by returning Command(goto=...).
+
+    Writes NO state of its own and makes no call of any kind - it completes
+    instantly. See this module's top-level "TWO ROUTING MECHANISMS" block
+    for why this decision is a Command returned by a node rather than a
+    conditional edge like the one out of `vision`.
+
+    EMPIRICALLY VERIFIED on langgraph 1.2.10 (issue #82, probed before
+    being written, not assumed):
+      - builder.set_entry_point("entry") works with a Command-returning
+        node; the graph starts here and honours the goto.
+      - add_node("entry", entry_node) needs NO `destinations=` argument for
+        the goto to resolve. Declaring it changes nothing about execution
+        (it is drawing/introspection metadata), so it is left off rather
+        than added as a second place to keep in sync with the real targets.
+      - A node that returns a bare Command with no `update` appears in
+        stream(stream_mode="updates") as {"entry": None} - the chunk VALUE
+        is None, not an empty dict. Every consumer of that stream in this
+        repo must tolerate it; see clarif_eye.ui._run_pipeline_events and
+        tests/_stream_helpers.py, both of which skip a None update.
+    """
+    return Command(goto=entry_destination(state))
 
 
 def vision_node(state, config=None, client=None):
@@ -198,6 +278,39 @@ def analysis_node(state, config=None, client=None):
     )
 
 
+def followup_node(state, config=None, client=None):
+    """Follow-up node (issue #82 / P9.3): answers state["question"] from the
+    ocr_output/scene_context this THREAD already has checkpointed.
+
+    The substantive logic (prompt building, the no-photo-yet case,
+    sanitisation, degradation) lives in clarif_eye.followup.run_followup so
+    this stays a thin adapter, the same pattern every other node here uses.
+    `client` is injectable directly or via config["configurable"]["client"] -
+    the SAME key vision_node/analysis_node use, because it is the same kind
+    of object (an OpenRouterClient); only role "brain" differs.
+
+    Reads state with .get(): a follow-up run's input is a PARTIAL state
+    delta (see clarif_eye.state.ClarifEyeState.question), so on a thread
+    that has never described a photo, ocr_output/scene_context are genuinely
+    ABSENT from `state` rather than empty strings - run_followup normalises
+    both cases to the same no-photo-yet answer.
+
+    Checks the total-pipeline deadline exactly like the other model-calling
+    nodes (see this module's top-level "Total-pipeline deadline" block) and
+    passes the result through, so a run that has already blown its budget
+    reads back what is known instead of spending a brain call.
+    """
+    if client is None:
+        client = (config or {}).get("configurable", {}).get("client")
+    return run_followup(
+        state.get("ocr_output"),
+        state.get("scene_context"),
+        state.get("question"),
+        client,
+        deadline_exceeded=_deadline_exceeded(config),
+    )
+
+
 def tts_node(state, config=None, provider=None, providers=None):
     """TTS node (issue #11/P3.1, chain added by #12/P3.2): turns final_output
     into an audio file, trying a provider chain in order.
@@ -284,13 +397,23 @@ def build_graph(checkpointer=None):
     """
     builder = StateGraph(ClarifEyeState)
 
+    builder.add_node("entry", entry_node)
     builder.add_node("vision", vision_node)
     builder.add_node("fast_synth", fast_synth_node)
     builder.add_node("research", research_node)
     builder.add_node("analysis", analysis_node)
+    builder.add_node("followup", followup_node)
     builder.add_node("tts", tts_node)
 
-    builder.set_entry_point("vision")
+    # entry has NO outgoing edge of any kind: it returns Command(goto=...)
+    # and routes itself. See this module's "TWO ROUTING MECHANISMS" block
+    # for why this one is a Command while vision's is a conditional edge,
+    # and entry_node's docstring for the empirically-verified fact that no
+    # `destinations=` declaration is needed on add_node for the goto to
+    # resolve on langgraph 1.2.10.
+    builder.set_entry_point("entry")
+    # A STATIC branch on a flag vision_node already computed - the shape a
+    # conditional edge fits (see "TWO ROUTING MECHANISMS" above).
     builder.add_conditional_edges(
         "vision",
         dynamic_router,
@@ -299,12 +422,16 @@ def build_graph(checkpointer=None):
     builder.add_edge("fast_synth", "tts")
     builder.add_edge("research", "analysis")
     builder.add_edge("analysis", "tts")
+    # A follow-up answer is spoken exactly like a description is: same tts
+    # node, same provider chain, same staged delivery in the UI.
+    builder.add_edge("followup", "tts")
     builder.add_edge("tts", END)
 
     return builder.compile(checkpointer=checkpointer)
 
 
-# Unconditional successor for every edge above EXCEPT the one out of
+# Unconditional successor for every edge above EXCEPT the ones out of
+# "entry" (self-routed by Command, resolved by entry_destination instead),
 # "vision" (a conditional edge, resolved by dynamic_router instead) and
 # "tts" (the last node - see next_node_after's END case below). Kept
 # literally next to build_graph()'s add_edge calls, which is the ONLY
@@ -316,6 +443,7 @@ _UNCONDITIONAL_SUCCESSOR = {
     "fast_synth": "tts",
     "research": "analysis",
     "analysis": "tts",
+    "followup": "tts",
 }
 
 
@@ -326,11 +454,15 @@ def next_node_after(node_name, state):
 
     Single source of truth for this graph's topology, used by
     clarif_eye.ui's per-node progress narration (issue #80 / P9.1) so it
-    never has to re-derive routing itself. The vision branch reuses
-    dynamic_router - the same function build_graph() wires as the actual
-    conditional edge - rather than re-reading state["complexity_flag"]
-    with separate logic that could drift from the real routing decision.
+    never has to re-derive routing itself. Each branch reuses the SAME
+    function the graph itself routes with, rather than re-deriving the rule
+    with separate logic that could drift: the vision branch reuses
+    dynamic_router (the function build_graph() wires as the conditional
+    edge), and the entry branch reuses entry_destination (the function
+    entry_node builds its Command(goto=...) from).
     """
+    if node_name == "entry":
+        return entry_destination(state)
     if node_name == "vision":
         return dynamic_router(state)
     if node_name == "tts":

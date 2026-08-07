@@ -81,6 +81,15 @@ UNEXPECTED_ERROR_MESSAGE = (
 AUDIO_UNAVAILABLE_NOTE = (
     "Audio isn't available right now, so here is the description as text."
 )
+# Issue #82 / P9.3: the ask button was activated with an empty question box.
+# Guarded here rather than left to the graph, for a reason that is not just
+# tidiness: clarif_eye.graph.entry_destination routes on the question being
+# non-blank, so a blank one would fall through to `vision` and re-run the
+# WHOLE photo pipeline - a second vision call the user never asked for.
+NO_QUESTION_MESSAGE = (
+    "No question was typed. Please type a question about the photo, then "
+    "activate the ask button."
+)
 
 # --- Accessibility (issue #15 / P5.1) ---------------------------------------
 #
@@ -101,6 +110,12 @@ STATUS_ELEM_CLASSES = ["live-status"]
 RESULT_ELEM_ID = "description-output"
 AUDIO_ELEM_ID = "audio-output"
 IMAGE_INPUT_ELEM_ID = "photo-input"
+# Issue #82 / P9.3: the follow-up question box and its own submit button.
+# Both carry elem_ids for the same reason every other control here does -
+# so the accessibility audit script and its tests can find them
+# structurally, by id, rather than by guessing at a label string.
+QUESTION_INPUT_ELEM_ID = "question-input"
+ASK_BUTTON_ELEM_ID = "ask-button"
 
 # Accessible name given to the user's own uploaded/captured photo preview
 # (issue #48 / P5.4 - see ARIA_LIVE_HEAD's image-labelling comment below).
@@ -193,23 +208,43 @@ code actually does with your photo.
    the result could not be verified rather than risk reading a wrong amount
    or date aloud.
 7. The final script is converted to speech.
+8. You can then type a question about that same photo. The app answers it
+   from the text and scene description it already read, so it does not look
+   at the photo again and you do not have to take another one. That answer
+   is spoken the same way the description is.
 
 ### Inside the LangGraph pipeline
 
 This pipeline is built with [LangGraph](https://github.com/langchain-ai/langgraph)'s
 `StateGraph` (this app depends on `langgraph`, not `langchain` - there is no
-LangChain in this codebase). The graph state is an 8-key `TypedDict`:
+LangChain in this codebase). The graph state is a 9-key `TypedDict`:
 `image_data`, `ocr_output`, `scene_context`, `complexity_flag`,
-`scraper_data`, `final_output`, `audio_file_path`, `messages`.
+`scraper_data`, `final_output`, `audio_file_path`, `messages`, `question`.
 
-Five nodes are registered: `vision`, `fast_synth`, `research`, `analysis`,
-and `tts`. Routing between them is a conditional edge out of `vision`,
+Seven nodes are registered: `entry`, `vision`, `fast_synth`, `research`,
+`analysis`, `followup`, and `tts`. Every run starts at `entry`, which does
+no work of its own: it looks at whether this run carries a photo or a typed
+question and sends the run to `vision` or to `followup` accordingly, by
+returning a `Command` naming the next node.
+
+On the photo route, the step after `vision` is chosen by a conditional edge
 evaluated against `complexity_flag`: `False` goes to `fast_synth` then
 straight to `tts`; `True` goes to `research`, then `analysis`, then `tts`.
 That routing decision is evaluated locally in Python, with no model call -
 it is a deliberate design point, not an implementation shortcut: the router
 only ever needs to read text density and keywords, so it would be wasteful
 and slower to spend a model call deciding whether to spend a bigger one.
+
+The two routing mechanisms are both used on purpose. A conditional edge
+suits the choice after `vision`, where one node works out a flag and a
+separate plain function reads it. A `Command` suits `entry`, which has no
+earlier node to work anything out for it and so decides its own next step
+from the run's own input.
+
+Each browser session gets its own conversation thread, kept in this
+server's memory for as long as the process runs, which is what lets a typed
+question be answered from the photo you already sent. Nothing is written to
+disk, and a restart clears every thread.
 
 ### The two model roles
 
@@ -291,7 +326,18 @@ DIAGRAM_DESC_ELEM_ID = "how-it-works-diagram-desc"
 
 PIPELINE_DIAGRAM_LABEL = "Diagram of the Clarif-Eye pipeline, from photo to spoken description"
 
+# SCOPE, STATED IN THE DESCRIPTION ITSELF (issue #82 / P9.3): the drawing
+# covers the PHOTO route only. The follow-up route (entry -> followup ->
+# text to speech) is described in words in the ordered list above instead
+# of being drawn, and the description below says so rather than letting a
+# reader assume the picture is the whole graph. Redrawing the boxes to fit
+# a second branch would buy a sighted reader little - the follow-up route
+# is three steps in a straight line - and the list, not the diagram, is
+# this section's accessible source of truth either way.
 PIPELINE_DIAGRAM_DESCRIPTION = (
+    "This diagram covers what happens to a photo. Answering a typed "
+    "follow-up question is a shorter route, described in the numbered list "
+    "above. "
     "A photo goes to the vision step, which reads any text and describes the "
     "scene. A router then checks how complex the result is, using plain "
     "Python with no model call. If the result is simple, fast synthesis "
@@ -385,6 +431,13 @@ STATUS_IDLE = 'Ready. Choose or take a photo, then activate "Describe this photo
 STATUS_WORKING = (
     "Photo received. Describing it now; this can take up to about 30 seconds."
 )
+# The follow-up equivalent of STATUS_WORKING (issue #82 / P9.3): the opening
+# announcement for a typed question. Shorter about the wait than
+# STATUS_WORKING is, because it is honest to be - a follow-up costs ONE
+# model call over already-stored text, with no vision call and no web
+# lookup, so the "up to about 30 seconds" warning a photo needs would
+# overstate it.
+STATUS_ASKING = "Question received. Working out the answer now."
 # SHORT ON PURPOSE (issue #47 / P5.3): when audio will play, the audio
 # itself is the completion signal - a long spoken status is redundant with
 # it and, worse, collides with it (two voices talking over each other; see
@@ -433,18 +486,40 @@ STATUS_NODE_RESEARCH = "Looking it up."
 # nothing from.
 STATUS_NODE_WRITING = "Writing the description."
 STATUS_NODE_TTS = "Turning it into speech."
+# Follow-up questions only (issue #82 / P9.3): the `followup` node reads the
+# stored description of the photo and works out an answer to what was typed.
+# Deliberately NOT reusing STATUS_NODE_WRITING ("Writing the description."),
+# which would be a lie here - no description is being written, a question is
+# being answered, and the user just typed that question so they know which
+# of the two they asked for.
+STATUS_NODE_ANSWERING = "Working out the answer."
 
 # node name -> spoken phrase, for whichever node clarif_eye.graph.
 # next_node_after names as coming next. This is the ONLY topology
 # knowledge ui.py keeps - which node a name maps to in words; WHICH node
 # runs next (the graph's edges/routing) lives entirely in next_node_after,
-# the single source of truth build_graph() itself uses. No "vision" key:
-# vision is never anyone's successor (it's the entry node), so a phrase
-# for it would be unreachable dead code, not just unused.
+# the single source of truth build_graph() itself uses.
+#
+# TWO NODES DELIBERATELY HAVE NO PHRASE, and a missing key means "announce
+# nothing" (see _run_pipeline_events, which looks this up with .get() and
+# skips a None):
+#   - "vision": announced only as entry's successor, which happens the
+#     instant the run starts - STATUS_WORKING has just said "Photo received.
+#     Describing it now" and a second announcement a few milliseconds later
+#     would be the same sentence twice, back to back, in a screen reader.
+#   - "entry": never anyone's successor (it is the first node), so nothing
+#     ever completes to trigger a phrase for it - the same reason vision had
+#     no phrase before issue #82 added a node in front of it. It also does
+#     no work worth narrating: it returns a Command(goto=...) and completes
+#     instantly, so "announcing" it would be narrating nothing.
+# The TIMING-HONESTY comment above still holds exactly as written: every
+# phrase here is announced for the node that is ABOUT to run, at the moment
+# its predecessor's completion chunk arrives.
 _NODE_PHRASE = {
     "research": STATUS_NODE_RESEARCH,
     "fast_synth": STATUS_NODE_WRITING,
     "analysis": STATUS_NODE_WRITING,
+    "followup": STATUS_NODE_ANSWERING,
     "tts": STATUS_NODE_TTS,
 }
 
@@ -1180,6 +1255,94 @@ def _encode_image(image):
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def _outcome_for(final_output, audio_path):
+    """Map a completed run's (final_output, audio_path) to the
+    (audio_path_or_None, text) tuple this module returns.
+
+    THE THREE OUTCOMES, told apart STRUCTURALLY - see this module's
+    top-level docstring. Shared by _run_pipeline_events and
+    _run_followup_events (issue #82 / P9.3) so a spoken ANSWER degrades
+    through exactly the same three branches a spoken DESCRIPTION does; two
+    copies would be two places for the audio-unavailable wording and the
+    is_chain_exhausted() ordering to drift apart.
+    """
+    if audio_path:
+        return (audio_path, final_output)
+    if is_chain_exhausted():
+        if final_output:
+            return (None, f"{final_output} {AUDIO_UNAVAILABLE_NOTE}")
+        return (None, AUDIO_UNAVAILABLE_NOTE)
+    return (None, final_output or UNEXPECTED_ERROR_MESSAGE)
+
+
+def _record_turn(graph, config, thread_id, messages):
+    """Record `messages` against `thread_id` at the conversation boundary,
+    then bound that thread's checkpoint history.
+
+    Called only after a run has fully COMPLETED and produced something worth
+    remembering - see _run_pipeline_events's "CONVERSATION-BOUNDARY
+    RECORDING" docstring section for the full reasoning, and
+    clarif_eye.graph.tts_node's docstring for why this lives at the boundary
+    rather than inside a node.
+
+    NEVER RAISES (deep-review BLOCKER fix, issue #81 / P9.2): this is
+    bookkeeping - accumulating conversation history for a LATER run - not
+    part of THIS run's deliverable, which was already computed before the
+    caller got here. A failure recording the turn (a stale/evicted thread_id
+    whose checkpoint ThreadRegistry deleted mid-run - see that class's
+    docstring for why that is tolerated - or any other unforeseen edge in
+    update_state/trim) must never cost the user the answer that already
+    exists. thread_configurable() is the FIRST line of defence (it declines
+    to thread a thread_id through to an uncheckpointed graph at all); this
+    is the second, catching whatever that guard doesn't.
+    """
+    try:
+        graph.update_state(config, {"messages": messages})
+        _trim_thread_to_latest_checkpoint(getattr(graph, "checkpointer", None), thread_id)
+    except Exception:
+        pass
+
+
+def _narrate_stream(graph, state, config, result):
+    """Drive one graph run to completion, merging each node's update into
+    `result` (in place, so the caller sees the finished state) and yielding
+    ("status", phrase) for each completed node that HAS a successor with a
+    phrase.
+
+    Shared by _run_pipeline_events (photo runs) and _run_followup_events
+    (issue #82 / P9.3): both need byte-identical narration behaviour, and
+    duplicating this loop would be one more place for the two to drift apart
+    - the follow-up path would silently stop narrating, or stop tolerating a
+    None update, the moment one copy was edited and the other wasn't.
+
+    A None `update` is SKIPPED, not merged: a node returning a bare
+    Command(goto=...) with no state update - clarif_eye.graph.entry_node
+    does exactly this - streams as {"entry": None}, and dict.update(None)
+    raises TypeError. Verified empirically on langgraph 1.2.10; see
+    entry_node's docstring.
+
+    A node with no entry in _NODE_PHRASE announces NOTHING (see that dict's
+    comment for which two nodes those are and why) - looked up with .get()
+    so adding a node to the graph can never turn into a KeyError crash mid
+    run, which for this app would mean losing an answer that was already
+    half-computed.
+    """
+    for chunk in graph.stream(state, config=config, stream_mode="updates"):
+        for node_name, update in chunk.items():
+            if update is not None:
+                result.update(update)
+            # next_node_after is the single source of truth for this
+            # graph's topology (clarif_eye.graph, right next to
+            # build_graph()'s edges) - this module only supplies the
+            # WORDING for whatever node it names.
+            next_node = next_node_after(node_name, result)
+            if next_node is None:
+                continue
+            phrase = _NODE_PHRASE.get(next_node)
+            if phrase is not None:
+                yield "status", phrase
+
+
 def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=None):
     """Generator: the ONE place that knows how to run a photo through the
     pipeline - guards, the image cache, graph execution, and the
@@ -1298,16 +1461,7 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
         config = {"configurable": configurable}
         graph = resources.graph
         result = dict(state)
-        for chunk in graph.stream(state, config=config, stream_mode="updates"):
-            for node_name, update in chunk.items():
-                result.update(update)
-                # next_node_after is the single source of truth for this
-                # graph's topology (clarif_eye.graph, right next to
-                # build_graph()'s edges) - this module only supplies the
-                # WORDING for whatever node it names.
-                next_node = next_node_after(node_name, result)
-                if next_node is not None:
-                    yield "status", _NODE_PHRASE[next_node]
+        yield from _narrate_stream(graph, state, config, result)
     except LadderExhaustedError as exc:
         # Every node already catches and degrades this internally (see
         # vision.py/synth.py/analysis.py); this branch only matters if the
@@ -1352,21 +1506,9 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
     # anticipated degrades to "the turn wasn't recorded" instead of "the
     # user got no answer at all".
     if thread_id is not None and final_output:
-        try:
-            graph.update_state(config, {"messages": [{"role": "assistant", "content": final_output}]})
-            _trim_thread_to_latest_checkpoint(getattr(graph, "checkpointer", None), thread_id)
-        except Exception:
-            pass
+        _record_turn(graph, config, thread_id, [{"role": "assistant", "content": final_output}])
 
-    if audio_path:
-        outcome = (audio_path, final_output)
-    elif is_chain_exhausted():
-        if final_output:
-            outcome = (None, f"{final_output} {AUDIO_UNAVAILABLE_NOTE}")
-        else:
-            outcome = (None, AUDIO_UNAVAILABLE_NOTE)
-    else:
-        outcome = (None, final_output or UNEXPECTED_ERROR_MESSAGE)
+    outcome = _outcome_for(final_output, audio_path)
 
     # The pipeline ran to completion (no exception above), but only a
     # real audio outcome is cached. Outcome (b) - description succeeded,
@@ -1381,6 +1523,141 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
     if audio_path:
         resources.image_cache.put(cache_key, outcome)
     yield "outcome", outcome
+
+
+def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id=None):
+    """Generator: the follow-up sibling of _run_pipeline_events (issue #82 /
+    P9.3). Answers a typed question about the photo this thread already
+    described, and yields the SAME ("status", phrase) / ("outcome", (audio,
+    text)) event shape, so handle_ask_staged can stage an answer exactly the
+    way handle_submit_staged stages a description.
+
+    A SIBLING, NOT A BRANCH INSIDE _run_pipeline_events: every guard at the
+    top of that function is about a PHOTO (no image, an unreadable image,
+    the image cache) and none of them apply here. Threading a "is this a
+    question?" flag through them would mean four dead branches per call and
+    a reader having to hold both flows in their head at once. What the two
+    genuinely share is factored out instead and called from both:
+    _narrate_stream, _record_turn, _outcome_for.
+
+    ONE MODEL CALL, NO VISION CALL. The input passed to the graph is ONLY
+    the delta {"question": question} - never a full make_initial_state().
+    That is not a micro-optimisation, it is the whole mechanism: on a
+    checkpointed thread, keys present in the input REPLACE the checkpointed
+    value and keys absent are preserved (verified empirically on langgraph
+    1.2.10; see clarif_eye.state.ClarifEyeState.question). Passing a full
+    initial state here would overwrite ocr_output/scene_context with empty
+    strings and there would be nothing left to answer from - the run would
+    correctly report that no photo has been described yet, on a thread that
+    just described one. clarif_eye.graph.entry_node then reads `question`
+    and returns Command(goto="followup"), so `vision` never runs at all.
+
+    THE IMAGE CACHE IS NEVER TOUCHED (neither read nor written): it is keyed
+    on image CONTENT and holds a whole photo's (audio, description) result.
+    Two different questions about the same photo have different answers, and
+    the same question on two different threads is about two different
+    photos, so the key that cache uses is meaningless here - a hit would be
+    a wrong answer read aloud with confidence.
+
+    NEVER RAISES (except KeyboardInterrupt/SystemExit) - same contract as
+    every other entry point in this module.
+
+    NO USABLE THREAD IS NOT AN ERROR: with thread_id=None, or an
+    AppResources whose thread_registry is None (an uncheckpointed graph -
+    see thread_configurable's pairing invariant), the graph runs with no
+    stored state, `followup` finds no ocr/scene, and
+    clarif_eye.followup.NO_PHOTO_YET_MESSAGE is what gets spoken. That is
+    the correct answer for that situation, reached through the ordinary
+    path with no special case here.
+    """
+    if resources.client is None:
+        yield "outcome", (None, resources.client_error or CONFIG_ERROR_MESSAGE)
+        return
+
+    # See NO_QUESTION_MESSAGE: a blank question must never reach the graph,
+    # because entry_destination would route it to `vision` and re-run the
+    # whole photo pipeline.
+    question = (question or "").strip()
+    if not question:
+        yield "outcome", (None, NO_QUESTION_MESSAGE)
+        return
+
+    try:
+        configurable = {
+            "client": resources.client,
+            "tts_providers": resources.tts_providers,
+            "deadline": time.monotonic() + pipeline_budget_seconds,
+        }
+        configurable.update(thread_configurable(resources, thread_id))
+        config = {"configurable": configurable}
+        graph = resources.graph
+        # The DELTA, and nothing else - see this function's docstring.
+        state = {"question": question}
+        result = dict(state)
+        yield from _narrate_stream(graph, state, config, result)
+    except LadderExhaustedError as exc:
+        yield "outcome", (None, message_for_ladder_exhausted(exc))
+        return
+    except OpenRouterError as exc:
+        yield "outcome", (None, message_for_terminal_error(exc))
+        return
+    except Exception:
+        yield "outcome", (None, UNEXPECTED_ERROR_MESSAGE)
+        return
+
+    final_output = (result.get("final_output") or "").strip()
+    audio_path = result.get("audio_file_path") or ""
+
+    # BOTH SIDES OF THE TURN are recorded, unlike a photo run (which records
+    # only the assistant's description - the "user" side of that turn is a
+    # photograph, not text, and the base64 JPEG is already in the checkpoint
+    # under image_data). Here the user's side IS text and is the thing that
+    # makes the assistant's answer make sense when read back.
+    if thread_id is not None and final_output:
+        _record_turn(
+            graph,
+            config,
+            thread_id,
+            [
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": final_output},
+            ],
+        )
+
+    yield "outcome", _outcome_for(final_output, audio_path)
+
+
+def handle_ask_staged(
+    question, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUDGET_SECONDS, thread_id=None
+):
+    """The follow-up sibling of handle_submit_staged (issue #82 / P9.3):
+    answers a typed question and yields the SAME staged (status_text,
+    audio_path_or_None, description_text) contract, including the
+    AUDIO_PLAY_DELAY_MS gap before the audio path appears.
+
+    Only the opening announcement differs (STATUS_ASKING rather than
+    STATUS_WORKING - see that constant for why the wait warning is not
+    repeated), because everything after it - per-node narration, the
+    status/text-then-audio split, the delay - must feel identical to a
+    photo run. A user who has just heard a description read aloud should not
+    have to learn a second interaction rhythm to ask about it.
+    """
+    yield STATUS_ASKING, None, ""
+    audio_path, text = None, ""
+    for kind, payload in _run_followup_events(
+        question, resources, pipeline_budget_seconds, thread_id=thread_id
+    ):
+        if kind == "status":
+            yield payload, None, ""
+        else:
+            audio_path, text = payload
+    status = status_for_result(audio_path, is_chain_exhausted())
+    if not audio_path:
+        yield status, audio_path, text
+        return
+    yield status, None, text
+    time.sleep(AUDIO_PLAY_DELAY_MS / 1000)
+    yield status, audio_path, text
 
 
 def handle_submit(image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUDGET_SECONDS, thread_id=None):
@@ -1515,6 +1792,9 @@ def build_interface(resources):
     def _submit(image, thread_id):
         yield from handle_submit_staged(image, resources, thread_id=thread_id)
 
+    def _ask(question, thread_id):
+        yield from handle_ask_staged(question, resources, thread_id=thread_id)
+
     with gr.Blocks(title="Clarif-Eye") as demo:
         thread_state = gr.State(value=lambda: str(uuid.uuid4()))
         gr.Markdown(
@@ -1560,6 +1840,35 @@ def build_interface(resources):
         audio_output = gr.Audio(label="Spoken description", autoplay=True, elem_id=AUDIO_ELEM_ID)
         text_output = gr.Textbox(label="Description (text)", lines=6, elem_id=RESULT_ELEM_ID)
 
+        # --- Follow-up question (issue #82 / P9.3) -----------------------
+        #
+        # PLACED AFTER the description output and BEFORE "How this works":
+        # asking about the photo is a FOLLOW-ON action, so it belongs after
+        # the thing it follows on from. Putting it above the result would
+        # sit an input the user cannot use yet between the live region and
+        # the answer it announces - the exact mistake #49's placement
+        # comment already argues against for the how-it-works section.
+        #
+        # IT MUST NOT STEAL FOCUS, and nothing here makes it: it is an
+        # ordinary Textbox with `autofocus` left at its default (off), and
+        # FOCUS_RESULT_JS keeps targeting `#{RESULT_ELEM_ID} textarea` and
+        # nothing else, so after either run focus still lands on the answer
+        # rather than on this box.
+        #
+        # KEYBOARD-REACHABLE, BY DEFAULT AND BY A SECOND ROUTE: this Textbox
+        # is interactive (not the disabled-textarea case ARIA_LIVE_HEAD has
+        # to repair for the read-only description output), so it is an
+        # ordinary tab stop with a real label. `.submit` fires on Enter
+        # inside the box, so a keyboard user never has to tab onward to the
+        # button - both events are wired to the SAME handler below.
+        question_input = gr.Textbox(
+            label="Question about the photo",
+            placeholder="For example: what is the expiry date?",
+            lines=1,
+            elem_id=QUESTION_INPUT_ELEM_ID,
+        )
+        ask_button = gr.Button("Ask about this photo", elem_id=ASK_BUTTON_ELEM_ID)
+
         # issue #49 / P4.3: placed AFTER the result area (never before it),
         # so it never delays someone who came to use the tool and never
         # sits between the live region and the result it announces. See
@@ -1584,5 +1893,25 @@ def build_interface(resources):
         # final yield - see FOCUS_RESULT_JS's docstring for why that
         # timing matters (never steals focus mid-interaction).
         submit_event.then(fn=None, inputs=None, outputs=None, js=FOCUS_RESULT_JS)
+
+        # An answer replaces the SAME status/audio/description outputs a
+        # description uses, so a screen-reader user hears it announced by
+        # the live region they already know and finds it where the last
+        # answer was - not in a second result area they have to go looking
+        # for. Both the button click and Enter-in-the-box run the same
+        # handler, and both get the same focus-the-answer follow-up.
+        for ask_event in (
+            ask_button.click(
+                fn=_ask,
+                inputs=[question_input, thread_state],
+                outputs=[status_output, audio_output, text_output],
+            ),
+            question_input.submit(
+                fn=_ask,
+                inputs=[question_input, thread_state],
+                outputs=[status_output, audio_output, text_output],
+            ),
+        ):
+            ask_event.then(fn=None, inputs=None, outputs=None, js=FOCUS_RESULT_JS)
 
     return demo

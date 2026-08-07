@@ -19,11 +19,17 @@ def drain_stream_collecting_trace(graph, state, config):
     what graph._record used to append to a caller-supplied trace list
     (removed by issue #80 / P9.1 - see clarif_eye.graph's module
     docstring).
+
+    A None `update` is skipped rather than merged (issue #82 / P9.3): a node
+    that returns a bare Command(goto=...) with no state update - the "entry"
+    node does exactly this - streams as {"entry": None}, and dict.update(None)
+    would raise. The node still counts as VISITED, so it stays in the trace.
     """
     result = dict(state)
     trace = []
     for chunk in graph.stream(state, config=config, stream_mode="updates"):
         for node_name, update in chunk.items():
-            result.update(update)
+            if update is not None:
+                result.update(update)
             trace.append(node_name)
     return result, trace
