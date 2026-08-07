@@ -51,7 +51,14 @@ class FakeImage:
 
 
 class FakeGraph:
-    """Records the config it was invoked with and returns a canned result."""
+    """Records the config it was invoked with and returns a canned result.
+
+    stream() (issue #80 / P9.1) yields exactly one chunk, keyed "tts" -
+    _run_pipeline_events always streams now (no invoke()/stream() fork),
+    and a real graph's LAST chunk is always tts's, so this is the minimal
+    shape that satisfies it; "tts" maps to no narration phrase, so every
+    staged-contract test in this file keeps its exact yield sequence.
+    """
 
     def __init__(self, result=None):
         self.result = result or {}
@@ -60,6 +67,9 @@ class FakeGraph:
     def invoke(self, state, config=None):
         self.invocations.append({"state": state, "config": config})
         return self.result
+
+    def stream(self, state, config=None, stream_mode="updates"):
+        yield {"tts": self.invoke(state, config=config)}
 
 
 def _resources(graph, client="fake-client"):

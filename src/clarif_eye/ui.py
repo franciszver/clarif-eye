@@ -55,7 +55,7 @@ from clarif_eye.failure_messages import (
     message_for_ladder_exhausted,
     message_for_terminal_error,
 )
-from clarif_eye.graph import DEFAULT_PIPELINE_BUDGET_SECONDS, build_graph
+from clarif_eye.graph import DEFAULT_PIPELINE_BUDGET_SECONDS, build_graph, next_node_after
 from clarif_eye.state import make_initial_state
 from clarif_eye.tts import DEFAULT_PROVIDER_CHAIN, is_chain_exhausted
 
@@ -407,15 +407,21 @@ STATUS_DEGRADED = "Finished, but with a limited result. See the text below for d
 # _run_pipeline_events below for how that's turned into these phrases.
 #
 # TIMING HONESTY: stream_mode="updates" tells you when a node COMPLETED,
-# never when one STARTED - there is no "vision has begun" event to hook a
+# never when one STARTED - there is no "X has begun" event to hook a
 # narration onto. What IS true and knowable without fabricating an observed
-# start: this graph's topology is fixed (vision always runs first; every
-# edge is unconditional except the one router choice out of vision), so the
-# instant one node's completion chunk arrives, its successor is exactly what
-# begins next. Each phrase below is therefore announced at that instant -
-# structurally honest about what just became true, never a claim that a
-# node "started" was actually observed.
-STATUS_NODE_VISION = "Reading the photo."
+# start: the instant one node's completion chunk arrives, its SUCCESSOR
+# (clarif_eye.graph.next_node_after) is exactly what begins next - so each
+# phrase below is announced for whatever node comes after the one that just
+# finished, never for the node currently running. This has one consequence
+# worth stating explicitly: vision - the entry node, nothing precedes it in
+# the stream - never gets a dedicated phrase of its own, because nothing
+# ever completes to trigger one. STATUS_WORKING above already tells the
+# user their photo was received and is being read, so nothing is lost by
+# not restating it a moment later. tts - the last node - is exactly the
+# opposite case: it DOES get announced (as the successor of fast_synth/
+# analysis), but next_node_after("tts", ...) returns None, so nothing is
+# ever announced AFTER it; the pipeline's actual completion is reported
+# separately, by status_for_result once the whole run is done.
 STATUS_NODE_RESEARCH = "Looking it up."
 # Shared by fast_synth and analysis - both are "the model is writing the
 # spoken script now", the honest description of either node from the
@@ -424,6 +430,20 @@ STATUS_NODE_RESEARCH = "Looking it up."
 # nothing from.
 STATUS_NODE_WRITING = "Writing the description."
 STATUS_NODE_TTS = "Turning it into speech."
+
+# node name -> spoken phrase, for whichever node clarif_eye.graph.
+# next_node_after names as coming next. This is the ONLY topology
+# knowledge ui.py keeps - which node a name maps to in words; WHICH node
+# runs next (the graph's edges/routing) lives entirely in next_node_after,
+# the single source of truth build_graph() itself uses. No "vision" key:
+# vision is never anyone's successor (it's the entry node), so a phrase
+# for it would be unreachable dead code, not just unused.
+_NODE_PHRASE = {
+    "research": STATUS_NODE_RESEARCH,
+    "fast_synth": STATUS_NODE_WRITING,
+    "analysis": STATUS_NODE_WRITING,
+    "tts": STATUS_NODE_TTS,
+}
 
 # Gradio has no native aria-live prop (as of 6.22.0), so a minimal,
 # commented JS shim marks the status control's wrapper as a polite live
@@ -862,38 +882,22 @@ def _encode_image(image):
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def _status_after_node(node_name, result):
-    """Given a just-COMPLETED node's name and the state accumulated so far
-    (including that node's own update), return the phrase for whatever
-    runs next - or None if nothing runs after it (node_name == "tts").
-
-    See STATUS_NODE_* above for the timing-honesty reasoning: this graph's
-    topology is fixed, so a node's completion chunk arriving IS the moment
-    its successor begins - vision routes to research or fast_synth
-    depending on the complexity_flag it just set; research always goes to
-    analysis; fast_synth and analysis both go to tts.
-    """
-    if node_name == "vision":
-        return STATUS_NODE_RESEARCH if result.get("complexity_flag") else STATUS_NODE_WRITING
-    if node_name == "research":
-        return STATUS_NODE_WRITING
-    if node_name in ("fast_synth", "analysis"):
-        return STATUS_NODE_TTS
-    return None  # node_name == "tts": it's the last node, nothing follows
-
-
 def _run_pipeline_events(image, resources, pipeline_budget_seconds):
     """Generator: the ONE place that knows how to run a photo through the
     pipeline - guards, the image cache, graph execution, and the
     exception/outcome mapping.
 
-    Yields ("status", phrase) once per completed graph node (only when the
-    injected graph actually supports real streaming - see below), followed
-    by exactly one final ("outcome", (audio_path_or_None, text)) item.
+    Yields ("status", phrase) once per completed graph node, followed by
+    exactly one final ("outcome", (audio_path_or_None, text)) item.
     handle_submit drains this and returns only that last item, so its
     return-tuple contract is unchanged; handle_submit_staged consumes it
     directly so each ("status", ...) item can become its own live yield
-    WHILE the graph is still running - the whole point of streaming.
+    WHILE the graph is still running - the whole point of streaming. Every
+    graph injected here - the real one from build_graph(), and every test
+    double that stands in for it - is expected to implement .stream(...,
+    stream_mode="updates"); there is no invoke()-only fallback, so an
+    incompatible double fails loudly (AttributeError) instead of silently
+    losing all narration.
 
     NEVER raises (except KeyboardInterrupt/SystemExit) - every failure mode
     yields a spoken-ready message instead, per the module docstring. The
@@ -950,29 +954,17 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds):
             }
         }
         graph = resources.graph
-        # hasattr guard, not a feature flag: real langgraph CompiledGraphs
-        # (see graph.build_graph()) expose .stream(); the minimal FakeGraph
-        # test doubles in tests/test_ui.py and tests/test_accessibility.py
-        # only implement .invoke() (they exist to pin handle_submit's
-        # return-tuple/error-mapping contract, not live per-node progress),
-        # so this falls back to the old blocking call for those rather than
-        # breaking every test that injects one.
-        if hasattr(graph, "stream"):
-            # vision always runs first (graph.build_graph()'s entry point),
-            # so its phase can honestly be announced right away - nothing
-            # is fabricated about an "observed start" here, this is just
-            # the graph's own fixed topology, the same knowledge
-            # _status_after_node relies on for every later phrase.
-            yield "status", STATUS_NODE_VISION
-            result = dict(state)
-            for chunk in graph.stream(state, config=config, stream_mode="updates"):
-                for node_name, update in chunk.items():
-                    result.update(update)
-                    phrase = _status_after_node(node_name, result)
-                    if phrase is not None:
-                        yield "status", phrase
-        else:
-            result = graph.invoke(state, config=config)
+        result = dict(state)
+        for chunk in graph.stream(state, config=config, stream_mode="updates"):
+            for node_name, update in chunk.items():
+                result.update(update)
+                # next_node_after is the single source of truth for this
+                # graph's topology (clarif_eye.graph, right next to
+                # build_graph()'s edges) - this module only supplies the
+                # WORDING for whatever node it names.
+                next_node = next_node_after(node_name, result)
+                if next_node is not None:
+                    yield "status", _NODE_PHRASE[next_node]
     except LadderExhaustedError as exc:
         # Every node already catches and degrades this internally (see
         # vision.py/synth.py/analysis.py); this branch only matters if the
@@ -1061,14 +1053,19 @@ def handle_submit_staged(image, resources, pipeline_budget_seconds=DEFAULT_PIPEL
     STAGING (issue #80 / P9.1 - real per-node progress): the first yield
     is always the honest "received and working, up to about 30 seconds"
     message (submission-received and still-working collapsed into one
-    announcement, since nothing has run yet). Then, for every graph node
-    that actually completes, _run_pipeline_events yields its own "status"
-    event (see STATUS_NODE_* / _status_after_node above for the phrase
-    mapping and the timing-honesty reasoning), which is forwarded here as
-    its own live yield - so a screen reader hears "Reading the photo",
-    then "Writing the description" or "Looking it up", and so on, as each
-    stage actually finishes, instead of one silent wait. A cache hit or an
-    early failure (no image, missing client, unreadable image) produces no
+    announcement, since nothing has run yet - this doubles as vision's own
+    "now reading the photo" announcement, since nothing ever completes to
+    trigger a dedicated one for the entry node - see STATUS_NODE_* above).
+    Then, for every graph node that completes and HAS a successor,
+    _run_pipeline_events yields its own "status" event (see STATUS_NODE_*
+    / _NODE_PHRASE above and clarif_eye.graph.next_node_after for the
+    phrase mapping and the timing-honesty reasoning), which is forwarded
+    here as its own live yield - so a screen reader hears "Looking it up"
+    or "Writing the description", then "Turning it into speech", as each
+    stage actually finishes, instead of one silent wait. A cache hit, an
+    early failure (no image, missing client, unreadable image), or a test
+    double whose graph reports its whole run as one opaque completion
+    (see FakeGraph's own docstring in tests/test_ui.py) produces no
     "status" events at all, so those cases still yield only the three
     tuples this function always ended with. Once the pipeline's final
     outcome arrives, the last two yields are unchanged from before

@@ -279,3 +279,37 @@ def build_graph():
     builder.add_edge("tts", END)
 
     return builder.compile()
+
+
+# Unconditional successor for every edge above EXCEPT the one out of
+# "vision" (a conditional edge, resolved by dynamic_router instead) and
+# "tts" (the last node - see next_node_after's END case below). Kept
+# literally next to build_graph()'s add_edge calls, which is the ONLY
+# reason this is safe to hand-maintain rather than deriving it from the
+# StateGraph itself: whoever changes an edge above must update this table
+# in the same diff, or next_node_after silently starts lying to callers
+# like clarif_eye.ui's per-node progress narration (issue #80 / P9.1).
+_UNCONDITIONAL_SUCCESSOR = {
+    "fast_synth": "tts",
+    "research": "analysis",
+    "analysis": "tts",
+}
+
+
+def next_node_after(node_name, state):
+    """The node that runs immediately after `node_name`, given `state` as
+    it stands once `node_name` has completed - or None if `node_name` is
+    the last node (tts) and nothing follows.
+
+    Single source of truth for this graph's topology, used by
+    clarif_eye.ui's per-node progress narration (issue #80 / P9.1) so it
+    never has to re-derive routing itself. The vision branch reuses
+    dynamic_router - the same function build_graph() wires as the actual
+    conditional edge - rather than re-reading state["complexity_flag"]
+    with separate logic that could drift from the real routing decision.
+    """
+    if node_name == "vision":
+        return dynamic_router(state)
+    if node_name == "tts":
+        return None
+    return _UNCONDITIONAL_SUCCESSOR[node_name]
