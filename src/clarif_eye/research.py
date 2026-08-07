@@ -59,36 +59,37 @@ picked by a search result, on a shared Hugging Face Space:
     exceeding it aborts the fetch entirely rather than truncating and
     returning a partial page (see _fetch_and_extract).
 
-THE #10 CONTRACT DECISION
-----------------------------
-scraper_data == "" currently means BOTH "fast path, research never ran" and
-"research ran and found nothing usable". This module deliberately does NOT
-disambiguate the two with a sentinel value threaded through scraper_data.
-Reasons:
-  1. analysis.py already documents (and tests) that "" means exactly one
-     thing to it either way: "no external context available - proceed using
-     ocr_output/scene_context alone, and do not hedge or leave the script
-     contentless just because the scrape is empty." Its behaviour for the
-     two causes is identical by design, so there is no decision downstream
-     that actually depends on telling them apart.
-  2. The state schema is capped at exactly 7 keys (state.py) - a sentinel
-     folded into scraper_data itself would only be safe if every consumer
-     checked for it structurally (the vision.is_degraded_scene pattern this
-     issue was pointed at). Introducing that constant+predicate pair here
-     with no consumer that needs to branch on it is exactly the kind of
-     speculative machinery CLAUDE.md's Simplicity First asks to avoid, and
-     it adds a NEW failure class this project has already had to fix twice:
-     a rewording or accidental substring match silently breaking detection,
-     or a caller that forgets to check the predicate and reads the sentinel
-     text aloud as if it were real scraped content.
-  3. A hedge like "no information was found" spoken into a script the model
+THE #10 CONTRACT DECISION (REVISED BY #81 / P9.2)
+----------------------------------------------------
+scraper_data == "" used to mean BOTH "fast path, research never ran" and
+"research ran and found nothing usable" - #10 deliberately did not
+disambiguate the two, reasoning that analysis.py never needed to (see
+below). #81/P9.2 is a schema-change moment for other reasons (adding the
+`messages` reducer) and takes the chance to fix the sentinel: state.py's
+make_initial_state now seeds scraper_data=None ("never ran"), while THIS
+module's own behaviour is UNCHANGED - every degrade-to-nothing branch below
+still returns {"scraper_data": ""} ("ran, found nothing usable"). Only the
+value a run STARTS from is now distinguishable from the value this module
+PRODUCES when it runs and comes up empty.
+
+This does not change anything analysis.py acts on:
+  1. analysis.py already documents (and tests) that both None and "" mean
+     exactly one thing to it either way: "no external context available -
+     proceed using ocr_output/scene_context alone, and do not hedge or
+     leave the script contentless just because the scrape is empty." Its
+     behaviour for the two causes is identical by design, so there is no
+     decision downstream that actually depends on telling them apart -
+     analysis.run_analysis's `scraper_data = scraper_data or ""` treats
+     both as falsy uniformly.
+  2. A hedge like "no information was found" spoken into a script the model
      might paraphrase is worse than the model simply not mentioning web
-     context at all - which is exactly what an empty "" already produces
-     via analysis.py's existing prompt construction (the "Additional
-     context from a web lookup" section is omitted entirely when
-     scraper_data is falsy - see analysis._build_messages).
-Collapsing both cases to "" therefore loses no information any consumer
-acts on, and keeps the contract exactly as simple as it needs to be.
+     context at all - which is exactly what a falsy scraper_data already
+     produces via analysis.py's existing prompt construction (the
+     "Additional context from a web lookup" section is omitted entirely
+     when scraper_data is falsy - see analysis._build_messages).
+The distinction exists only for callers that inspect state directly (a
+future feature, or a human debugging a run) - not because any consumer's
+spoken output depends on it.
 
 SECURITY - scraped text is UNTRUSTED
 ---------------------------------------

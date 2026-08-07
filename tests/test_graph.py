@@ -73,9 +73,14 @@ def test_make_initial_state_has_every_key_with_correct_types():
     assert state["ocr_output"] == ""
     assert state["scene_context"] == ""
     assert state["complexity_flag"] is False
-    assert state["scraper_data"] == ""
+    # None, not "" - issue #81 / P9.2's explicit sentinel: None means
+    # "research never ran yet" (this key), distinct from "" (research ran
+    # and found nothing usable) - see state.py's ClarifEyeState.scraper_data
+    # comment.
+    assert state["scraper_data"] is None
     assert state["final_output"] == ""
     assert state["audio_file_path"] == ""
+    assert state["messages"] == []
 
     expected_keys = {
         "image_data",
@@ -85,6 +90,7 @@ def test_make_initial_state_has_every_key_with_correct_types():
         "scraper_data",
         "final_output",
         "audio_file_path",
+        "messages",
     }
     assert set(state.keys()) == expected_keys
 
@@ -98,6 +104,7 @@ def test_state_typeddict_has_exactly_the_expected_keys():
         "scraper_data",
         "final_output",
         "audio_file_path",
+        "messages",
     }
 
 
@@ -194,8 +201,11 @@ def test_fast_path_populates_every_key_it_touches_scraper_data_stays_empty():
     assert result["audio_file_path"] != ""
     assert result["complexity_flag"] is False
     # Fast path never runs research_node, so scraper_data legitimately
-    # stays at its "" default - present, but not populated.
-    assert result["scraper_data"] == ""
+    # stays at its make_initial_state default - present, but not
+    # populated. That default is None (issue #81 / P9.2), not "": None
+    # means "research never ran", distinct from research.run_research's
+    # own "" ("ran, found nothing") - see state.py.
+    assert result["scraper_data"] is None
 
 
 # --- Fast path: complexity_flag False -----------------------------------

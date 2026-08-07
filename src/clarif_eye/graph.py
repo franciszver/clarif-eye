@@ -224,6 +224,16 @@ def tts_node(state, config=None, provider=None, providers=None):
     deliverable, so skipping it on a blown deadline would turn "degraded
     but spoken" into total silence - exactly the failure this pipeline
     exists to avoid.
+
+    Does NOT append to `messages` (issue #81 / P9.2's reducer, see
+    state.py) - an earlier version of this node did, but that put a
+    conversation-boundary concern (recording one turn per completed run)
+    inside a node whose job is turning text into audio. #82 (follow-ups)
+    and #84 (subgraph extraction) would then each have had to duplicate or
+    detour around that append. The turn is now recorded once, at the
+    boundary, by clarif_eye.ui._run_pipeline_events via
+    graph.update_state() after a run completes with a real thread_id - see
+    that function's docstring.
     """
     configurable = (config or {}).get("configurable", {})
     if providers is None:
@@ -257,8 +267,21 @@ def dynamic_router(state):
     return "research" if flag else "fast_synth"
 
 
-def build_graph():
-    """Build and compile the Clarif-Eye graph."""
+def build_graph(checkpointer=None):
+    """Build and compile the Clarif-Eye graph.
+
+    `checkpointer` (issue #81 / P9.2) is OPTIONAL and defaults to None -
+    every existing caller/test that calls build_graph() with no argument
+    keeps compiling an uncheckpointed graph, exactly today's behavior, and
+    can go on invoking it with no `thread_id` at all. When a checkpointer
+    IS supplied (clarif_eye.ui.build_resources passes a fresh
+    langgraph.checkpoint.memory.InMemorySaver - see that function's own
+    comment for its honest limits), LangGraph then REQUIRES
+    config["configurable"]["thread_id"] on every invoke()/stream() call
+    against the compiled graph (verified empirically: omitting it raises
+    ValueError) - clarif_eye.ui is responsible for minting one per browser
+    session and passing it through.
+    """
     builder = StateGraph(ClarifEyeState)
 
     builder.add_node("vision", vision_node)
@@ -278,7 +301,7 @@ def build_graph():
     builder.add_edge("analysis", "tts")
     builder.add_edge("tts", END)
 
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer)
 
 
 # Unconditional successor for every edge above EXCEPT the one out of

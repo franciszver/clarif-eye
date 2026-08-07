@@ -190,7 +190,11 @@ def run_once(graph, image_b64, *, label, run_index, client, searcher, research_c
         result.get("final_output", ""),
         result.get("ocr_output", ""),
         result.get("scene_context", ""),
-        result.get("scraper_data", ""),
+        # scraper_data can be None (issue #81 / P9.2: "research never ran",
+        # e.g. the fast path) - `or ""` normalises it the same way
+        # analysis.run_analysis does, rather than feeding None into an
+        # f-string as the literal text "None".
+        result.get("scraper_data") or "",
     )
 
     return RunResult(

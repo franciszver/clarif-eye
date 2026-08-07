@@ -677,3 +677,102 @@ def test_staged_submit_narrates_each_node_transition_in_order_deep_path():
         STATUS_NODE_WRITING,
         STATUS_NODE_TTS,
     ]
+
+
+# --- Checkpointed threads, driven through the real UI seam (issue #81 / -----
+# P9.2, simplify-gate follow-up)
+#
+# tests/test_checkpointing.py exercises the reducer/checkpointer mechanism
+# directly against a compiled graph (graph.invoke + graph.update_state).
+# Nothing there drives the ACTUAL seam a real browser session uses:
+# build_interface -> handle_submit_staged -> _run_pipeline_events, with a
+# real ThreadRegistry doing the touching and a real thread_id flowing all
+# the way through config["configurable"]. This test closes that gap - same
+# real-compiled-graph pattern the two tests above already use (not
+# FakeGraph, which only implements .invoke() and has no checkpointer to
+# exercise).
+def test_handle_submit_staged_accumulates_messages_on_one_thread_and_isolates_another():
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from clarif_eye.ui import ThreadRegistry
+
+    checkpointer = InMemorySaver()
+    thread_registry = ThreadRegistry(checkpointer)
+    resources = AppResources(
+        graph=build_graph(checkpointer=checkpointer),
+        client=_RoutingVisionClient(SHORT_OCR_TEXT, "a room"),
+        client_error=None,
+        tts_providers=[_FakeTtsProvider()],
+        searcher=_EmptySearcher(),
+        research_client=None,
+        thread_registry=thread_registry,
+    )
+
+    thread_id = "session-under-test"
+    # Distinct image content per call (issue #75's cache keys on DECODED
+    # image bytes) - two calls with the SAME content would cache-hit on the
+    # second and never reach the graph a second time, which would prove
+    # nothing about accumulation.
+    list(handle_submit_staged(FakeImage(content=b"turn-one-bytes"), resources, thread_id=thread_id))
+    list(handle_submit_staged(FakeImage(content=b"turn-two-bytes"), resources, thread_id=thread_id))
+
+    state = resources.graph.get_state({"configurable": {"thread_id": thread_id}})
+    assert len(state.values["messages"]) == 2
+
+    # The registry actually saw the thread (issue #81's ThreadRegistry /
+    # thread_configurable chokepoint), not just the checkpointer.
+    assert thread_id in thread_registry._entries
+
+    # A different thread_id sees no bleed-through, driven through the same
+    # real seam.
+    other_thread_id = "another-session"
+    list(handle_submit_staged(FakeImage(content=b"other-session-bytes"), resources, thread_id=other_thread_id))
+    other_state = resources.graph.get_state({"configurable": {"thread_id": other_thread_id}})
+    assert len(other_state.values["messages"]) == 1
+
+
+# --- Regression: a thread_id must never break the never-raise contract -----
+# (deep-review BLOCKER on issue #81 / P9.2)
+#
+# Reproduced before the fix: passing thread_id="..." to handle_submit_staged
+# against an AppResources whose graph is NOT actually checkpointed (either a
+# plain build_graph() with no checkpointer, or a FakeGraph test double with
+# no update_state method at all) let the conversation-boundary recording
+# block (graph.update_state + _trim_thread_to_latest_checkpoint) raise
+# straight through handle_submit_staged - a ValueError("No checkpointer
+# set") for the uncheckpointed real graph, an AttributeError for FakeGraph -
+# throwing away the outcome that had ALREADY been computed and violating
+# this module's own "never raise" contract. Both cases are exercised here.
+
+
+def test_staged_submit_with_thread_id_never_raises_when_graph_is_not_checkpointed():
+    resources = AppResources(
+        graph=build_graph(),  # no checkpointer - see build_graph's own docstring
+        client=_RoutingVisionClient(SHORT_OCR_TEXT, "a room"),
+        client_error=None,
+        tts_providers=[_FakeTtsProvider()],
+        searcher=_EmptySearcher(),
+        research_client=None,
+    )
+
+    updates = list(handle_submit_staged(FakeImage(), resources, thread_id="thread-with-no-checkpointer"))
+
+    # The staged contract still completes: at least one status yield plus a
+    # final result yield, and the run's actual outcome (audio produced) is
+    # not thrown away by the recording block blowing up after computing it.
+    assert updates
+    final_status, final_audio, final_text = updates[-1]
+    assert final_audio
+    assert final_text
+
+
+def test_staged_submit_with_thread_id_never_raises_against_a_graph_double_with_no_update_state():
+    graph = FakeGraph(result={"final_output": "A cat sits on a mat.", "audio_file_path": "/tmp/out.mp3"})
+    resources = _resources(graph)
+
+    updates = list(handle_submit_staged(FakeImage(), resources, thread_id="thread-against-fake-graph"))
+
+    assert updates
+    final_status, final_audio, final_text = updates[-1]
+    assert final_audio == "/tmp/out.mp3"
+    assert final_text == "A cat sits on a mat."

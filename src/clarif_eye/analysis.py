@@ -8,12 +8,15 @@ ceiling): vision.py and synth.py both call the `eyes` ladder; this module
 must call "brain".
 
 Inputs: ocr_output and scene_context (from vision.py, same as synth.py) plus
-scraper_data (from research.py's web lookup, which may be "" - see the
-module docstring in state.py: "" currently means both "research ran and
-found nothing" and "not applicable". For THIS node, "" is simply treated as
-"no external context available" and the model proceeds using ocr_output/
-scene_context alone - no sentinel is invented, and an empty scrape must
-never produce a hedged, contentless script).
+scraper_data (from research.py's web lookup, which may be None or "" - see
+state.py's ClarifEyeState.scraper_data comment: None means "research never
+ran" (fast path), "" means "research ran and found nothing" - a
+distinction issue #81 / P9.2 introduced). For THIS node, both are treated
+identically as "no external context available" (`scraper_data = scraper_data
+or ""` below normalises None to "" up front) and the model proceeds using
+ocr_output/scene_context alone - an empty scrape must never produce a
+hedged, contentless script, regardless of which of the two reasons it's
+empty for.
 
 THE CENTRAL RISK: hallucinated detail. A blind user cannot see the source
 document and cannot check the script against it, so the model inventing a
