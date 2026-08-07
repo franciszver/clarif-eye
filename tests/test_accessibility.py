@@ -32,7 +32,6 @@ from clarif_eye.ui import (
     STATUS_SUCCESS_TEXT_ONLY,
     STATUS_WORKING,
     build_interface,
-    build_resources,
     handle_submit_staged,
     status_for_result,
 )

@@ -15,8 +15,6 @@ Both get interpolated into model prompts. These tests pin two properties:
 No network calls anywhere in this file.
 """
 
-import re
-
 from clarif_eye import analysis, synth
 from clarif_eye.prompting import FENCE_CLOSE, FENCE_OPEN, fence_untrusted
 

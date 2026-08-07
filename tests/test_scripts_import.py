@@ -12,10 +12,6 @@ These tests ensure:
 """
 
 import json
-from pathlib import Path
-from unittest.mock import MagicMock
-
-import pytest
 
 import scripts.record_vision_fixture as record_vision_fixture
 
