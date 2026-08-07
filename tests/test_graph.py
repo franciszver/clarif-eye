@@ -184,7 +184,7 @@ def test_full_graph_routes_using_node_owned_complexity_flag_not_caller_value():
     result, trace = run(graph, state, client=client)
 
     assert result["complexity_flag"] is True
-    assert trace == ["entry", "vision", "research", "analysis", "verify_numbers", "tts"]
+    assert trace == ["entry", "vision", "research", "analysis", "tts"]
     assert "fast_synth" not in trace
 
 
@@ -343,5 +343,5 @@ def test_research_path_visits_vision_research_analysis_tts_only():
 
     _, trace = run(graph, state, client=client)
 
-    assert trace == ["entry", "vision", "research", "analysis", "verify_numbers", "tts"]
+    assert trace == ["entry", "vision", "research", "analysis", "tts"]
     assert "fast_synth" not in trace

@@ -52,8 +52,8 @@ from clarif_eye.ui import (
     NOTHING_TO_RESUME_MESSAGE,
     RESUME_CONTINUE_BUTTON_ELEM_ID,
     RESUME_RETAKE_BUTTON_ELEM_ID,
-    STATUS_NODE_CHECKING,
     STATUS_RESUMING,
+    STATUS_WORKING,
     ThreadRegistry,
     _PauseSignal,
     _trim_thread_to_latest_checkpoint,
@@ -313,16 +313,19 @@ def test_resume_retake_ends_clean_and_leaves_the_thread_ready_for_a_new_photo():
     result, trace = drain_stream_collecting_trace(
         graph, make_initial_state("second-photo"), fresh_config
     )
-    assert trace == ["entry", "vision", "research", "analysis", "verify_numbers", "tts"]
+    # Straight past the asking node: this photo's numbers all check out,
+    # so the conditional edge out of `analysis` never enters it.
+    assert trace == ["entry", "vision", "research", "analysis", "tts"]
     assert "$104.95" in result["final_output"]
 
 
 def test_verified_numbers_never_interrupt():
     """THE PRODUCT RULE (issue #83): a clean run must never ask anything.
 
-    MUTATION TARGET: removing the verification-failure gate in
-    verify_numbers_node (so it interrupts unconditionally) must turn this
-    test RED.
+    MUTATION TARGET: removing the verification-failure gate (making
+    clarif_eye.graph.numbers_need_asking return True unconditionally, so
+    every run routes into the asking node and stops) must turn this test
+    RED.
     """
     graph, _checkpointer, config = _graph_and_config("clean-thread")
     client = RecordingClient(HONEST_DRAFT)
@@ -334,7 +337,9 @@ def test_verified_numbers_never_interrupt():
 
     keys = [key for chunk in chunks for key in chunk]
     assert INTERRUPT_CHUNK_KEY not in keys, f"a clean run must never pause: {keys}"
-    assert keys == ["entry", "vision", "research", "analysis", "verify_numbers", "tts"]
+    # The asking node is not merely silent on a clean run - it is never
+    # ENTERED, so a clean run costs no extra checkpoint for it either.
+    assert keys == ["entry", "vision", "research", "analysis", "tts"]
 
     snapshot = graph.get_state(config)
     assert not snapshot.interrupts
@@ -442,8 +447,9 @@ def test_paused_run_stages_the_spoken_question_through_the_status_path():
     assert status == text, "the question must also be readable in the result box"
     # A paused run must NOT fall into the empty-final_output error branch.
     assert "Something went wrong" not in status
-    # The per-node narration announced the checking step on the way.
-    assert STATUS_NODE_CHECKING in [status for status, _a, _t in updates]
+    # The narration ran normally up to the pause - the question is not the
+    # first thing the user hears after submitting.
+    assert STATUS_WORKING == updates[0][0]
 
 
 def test_paused_run_records_no_turn_and_caches_nothing():

@@ -261,12 +261,14 @@ def run_analysis(ocr_output, scene_context, scraper_data, client=None, scraper_d
         # happened, and resuming an interrupt re-executes the whole node it
         # was raised in. Raising it here would re-run the brain call on
         # every resume - see verify_numbers_node's docstring.
-        return {
-            "final_output": _to_spoken_text(
-                "This description could not be verified against the photographed "
-                "text, so it is not safe to read aloud as fact. Please try again."
-            ),
-            "verification_hold": {"script": spoken, "numbers": failing_numbers},
-        }
+        # Built by _degraded, not by hand, so the wording and the
+        # to_spoken_text sanitising cannot drift from every other degraded
+        # return in this module - then the hold is attached on top.
+        held = _degraded(
+            "This description could not be verified against the photographed "
+            "text, so it is not safe to read aloud as fact. Please try again."
+        )
+        held["verification_hold"] = {"script": spoken, "numbers": failing_numbers}
+        return held
 
     return {"final_output": spoken, "verification_hold": None}

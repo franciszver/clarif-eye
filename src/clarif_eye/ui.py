@@ -274,14 +274,16 @@ returning a `Command` naming the next node.
 
 On the photo route, the step after `vision` is chosen by a conditional edge
 evaluated against `complexity_flag`: `False` goes to `fast_synth` then
-straight to `tts`; `True` goes to `research`, then `analysis`, then
-`verify_numbers`, then `tts`.
+straight to `tts`; `True` goes to `research`, then `analysis`, then `tts`.
 
-`verify_numbers` is the one step that can PAUSE the whole run. When
-`analysis` writes a number it cannot trace back to the photographed text,
-that node raises a LangGraph interrupt carrying the drafted script and the
-numbers that failed, and the run stops there - before speech - until you
-answer. Your answer resumes the same conversation thread exactly where it
+`verify_numbers` is the one step that can PAUSE the whole run, and a second
+conditional edge decides whether it runs at all. When `analysis` writes a
+number it cannot trace back to the photographed text, it records that fact
+in the state, and the edge out of `analysis` sends the run to
+`verify_numbers` instead of straight to `tts`. That node raises a LangGraph
+interrupt carrying the drafted script and the numbers that failed, and the
+run stops there - before speech - until you answer. On every run where the
+numbers check out, the step is skipped entirely. Your answer resumes the same conversation thread exactly where it
 stopped. It sits after `analysis` rather than inside it on purpose:
 resuming re-runs the paused step from its start, so putting the question
 after the writing model means answering it never spends a second model
@@ -553,13 +555,6 @@ STATUS_NODE_TTS = "Turning it into speech."
 # being answered, and the user just typed that question so they know which
 # of the two they asked for.
 STATUS_NODE_ANSWERING = "Working out the answer."
-# Deep-analysis path only (issue #83 / P9.4): announced when `analysis`
-# completes, i.e. for the `verify_numbers` node that is about to run. Worth
-# its own phrase rather than being left silent: this is the one step that
-# can stop and ask the user a question, and a pause that arrives right after
-# "Writing the description" with nothing in between would feel to a
-# screen-reader user like the app had simply stalled.
-STATUS_NODE_CHECKING = "Checking the numbers against the photo."
 # The opening announcement for a resume (issue #83 / P9.4) - the equivalent
 # of STATUS_WORKING/STATUS_ASKING for the third way a run can start. Says
 # nothing about how long it will take because, unlike either of those, the
@@ -573,9 +568,9 @@ STATUS_RESUMING = "Thank you. Finishing up now."
 # runs next (the graph's edges/routing) lives entirely in next_node_after,
 # the single source of truth build_graph() itself uses.
 #
-# TWO NODES DELIBERATELY HAVE NO PHRASE, and a missing key means "announce
-# nothing" (see _run_pipeline_events, which looks this up with .get() and
-# skips a None):
+# THREE NODES DELIBERATELY HAVE NO PHRASE, and a missing key means
+# "announce nothing" (see _run_pipeline_events, which looks this up with
+# .get() and skips a None):
 #   - "vision": announced only as entry's successor, which happens the
 #     instant the run starts - STATUS_WORKING has just said "Photo received.
 #     Describing it now" and a second announcement a few milliseconds later
@@ -585,6 +580,14 @@ STATUS_RESUMING = "Thank you. Finishing up now."
 #     no phrase before issue #82 added a node in front of it. It also does
 #     no work worth narrating: it returns a Command(goto=...) and completes
 #     instantly, so "announcing" it would be narrating nothing.
+#   - "verify_numbers" (issue #83 / P9.4): entered only on a run that is
+#     about to stop and ask the user a question, and the question itself
+#     arrives as the very next announcement. A phrase here would be a
+#     sentence spoken over the top of the one that actually matters. On
+#     every other deep-analysis run the graph routes straight past this
+#     node (see clarif_eye.graph.analysis_destination), so nothing is
+#     announced for it there either - `analysis` completing still leads to
+#     "Turning it into speech", exactly as it did before this issue.
 # The TIMING-HONESTY comment above still holds exactly as written: every
 # phrase here is announced for the node that is ABOUT to run, at the moment
 # its predecessor's completion chunk arrives.
@@ -593,7 +596,6 @@ _NODE_PHRASE = {
     "fast_synth": STATUS_NODE_WRITING,
     "analysis": STATUS_NODE_WRITING,
     "followup": STATUS_NODE_ANSWERING,
-    "verify_numbers": STATUS_NODE_CHECKING,
     "tts": STATUS_NODE_TTS,
 }
 

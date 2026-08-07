@@ -1,11 +1,14 @@
 """Compiling LangGraph skeleton for Clarif-Eye.
 
 Wires: entry -> vision -> dynamic_router -> fast_synth OR (research ->
-analysis -> verify_numbers) -> tts -> END, with entry -> followup -> tts as
-the second way in (issue #82 / P9.3 - a typed question about a photo this
-thread already described). `verify_numbers` (issue #83 / P9.4) is the one
-node that can PAUSE the run to ask the user a question - see its own
-section below for the narrow rule that governs when.
+analysis -> [verify_numbers]) -> tts -> END, with entry -> followup -> tts
+as the second way in (issue #82 / P9.3 - a typed question about a photo
+this thread already described). `verify_numbers` (issue #83 / P9.4) is in
+brackets because a second conditional edge decides whether it runs at all:
+it is entered ONLY when `analysis` could not trace a number in its draft
+back to the photographed text, and it is the one node that can PAUSE the
+run to ask the user about it - see its own section below for the narrow
+rule that governs when.
 
 TWO ROUTING MECHANISMS, EACH WHERE IT FITS (issue #82 / P9.3)
 ---------------------------------------------------------------
@@ -351,6 +354,47 @@ RETAKE_CONFIRMATION = (
 )
 
 
+def numbers_need_asking(state):
+    """True when `analysis` held a drafted script back because a number in
+    it could not be traced to the photographed text.
+
+    THE GATE the product rule above lives in, and the SINGLE place it is
+    expressed. Both the conditional edge out of `analysis`
+    (analysis_destination, below) and verify_numbers_node's own guard read
+    it, so "when does this app stop and ask?" can never be answered two
+    different ways by two pieces of code.
+
+    Reads with .get() for the same reason followup_node does: a run's input
+    can be a partial state delta, so a key no node has written yet is
+    genuinely ABSENT rather than None.
+    """
+    return bool(state.get("verification_hold"))
+
+
+def analysis_destination(state):
+    """The node that runs after `analysis`: "verify_numbers" when there is
+    something to ask the user about, "tts" when there is not.
+
+    A CONDITIONAL EDGE, not a straight line through the asking node, and
+    that is a deliberate application of this module's own "TWO ROUTING
+    MECHANISMS" rule (see the top of this file): this is a static branch on
+    a flag some OTHER node already computed - `analysis` writes
+    verification_hold, a separate pure function reads it - which is exactly
+    the shape a conditional edge expresses, the same shape dynamic_router
+    already has out of `vision`.
+
+    IT IS ALSO WHAT KEEPS THE COMMON PATH FREE. Every completed node is a
+    full checkpoint write, and each one stores the WHOLE state including
+    image_data's base64 JPEG - measured at ~134KB per invoke with a 50KB
+    photo (see clarif_eye.ui._trim_thread_to_latest_checkpoint's comment).
+    Routing every deep-analysis run through an extra node just to have it
+    look at an almost-always-empty dict would buy that write on every
+    request, on a 512MB instance, for nothing. Branching here means the
+    asking node is entered ONLY on the runs that actually ask.
+    """
+    return "verify_numbers" if numbers_need_asking(state) else "tts"
+
+
 def verify_numbers_node(state):
     """Ask the user before speaking a number that could not be checked
     (issue #83 / P9.4) - or pass straight through when there is nothing to
@@ -358,11 +402,12 @@ def verify_numbers_node(state):
 
     Reads ONE key, state["verification_hold"], which `analysis` wrote (see
     clarif_eye.analysis.run_analysis and state.py's own comment on that
-    key). Falsy - the overwhelmingly common case - means every number in
-    the drafted script traced back to the photographed text, so this node
-    returns an empty update and the run continues to tts untouched. This is
-    THE GATE the product rule above lives in: it is what stops the app
-    asking a question on a run that has nothing wrong with it.
+    key), via the shared numbers_need_asking predicate above. In the graph
+    this node is only ENTERED when that predicate is already true
+    (analysis_destination routes past it otherwise), so the guard below is
+    the second line of defence, not the gate: it keeps a direct call - a
+    unit test, a future caller - from raising on a state that holds
+    nothing, which this pipeline must never do.
     - RESUME_CONTINUE: the held draft IS spoken, with UNVERIFIED_NUMBER_CAVEAT
       in front of it. The user asked to hear it; hiding it now would be a
       second, quieter refusal.
@@ -382,10 +427,21 @@ def verify_numbers_node(state):
     ask a human a question is already outside any latency budget, and
     "degrade because the budget expired while the user was deciding" would
     throw away the answer they just gave.
+
+    HONEST COST OF PAUSING, stated because it is not free: while a run
+    waits here, its FULL checkpointed state stays live in this process's
+    memory - including image_data's base64 JPEG, and the drafted script
+    again in verification_hold - for as long as the user takes to answer.
+    That is inherent (there is nothing to resume otherwise), and it is
+    bounded by the same mechanisms every other thread is: MAX_LIVE_THREADS
+    evicts the least-recently-touched thread, and a process restart clears
+    everything. It does mean a paused thread holds more, for longer, than a
+    completed one - which is trimmed to its newest checkpoint the moment it
+    finishes.
     """
-    hold = state.get("verification_hold")
-    if not hold:
+    if not numbers_need_asking(state):
         return {}
+    hold = state["verification_hold"]
 
     answer = interrupt(
         {
@@ -551,10 +607,18 @@ def build_graph(checkpointer=None):
     builder.add_edge("fast_synth", "tts")
     builder.add_edge("research", "analysis")
     # Only the deep-analysis path verifies numbers at all (see
-    # clarif_eye.verification's module docstring), so only this path routes
-    # through the asking node. fast_synth and followup go straight to tts,
-    # unchanged.
-    builder.add_edge("analysis", "verify_numbers")
+    # clarif_eye.verification's module docstring), so only this path can
+    # route through the asking node - and only on the runs that have
+    # something to ask about. A conditional edge, for the reasons
+    # analysis_destination's docstring gives (the same "branch on a flag
+    # another node computed" shape as dynamic_router, and it keeps an extra
+    # checkpoint write off every clean run). fast_synth and followup go
+    # straight to tts, unchanged.
+    builder.add_conditional_edges(
+        "analysis",
+        analysis_destination,
+        {"verify_numbers": "verify_numbers", "tts": "tts"},
+    )
     builder.add_edge("verify_numbers", "tts")
     # A follow-up answer is spoken exactly like a description is: same tts
     # node, same provider chain, same staged delivery in the UI.
@@ -566,8 +630,9 @@ def build_graph(checkpointer=None):
 
 # Unconditional successor for every edge above EXCEPT the ones out of
 # "entry" (self-routed by Command, resolved by entry_destination instead),
-# "vision" (a conditional edge, resolved by dynamic_router instead) and
-# "tts" (the last node - see next_node_after's END case below). Kept
+# "vision" and "analysis" (conditional edges, resolved by dynamic_router
+# and analysis_destination instead) and "tts" (the last node - see
+# next_node_after's END case below). Kept
 # literally next to build_graph()'s add_edge calls, which is the ONLY
 # reason this is safe to hand-maintain rather than deriving it from the
 # StateGraph itself: whoever changes an edge above must update this table
@@ -576,7 +641,6 @@ def build_graph(checkpointer=None):
 _UNCONDITIONAL_SUCCESSOR = {
     "fast_synth": "tts",
     "research": "analysis",
-    "analysis": "verify_numbers",
     "verify_numbers": "tts",
     "followup": "tts",
 }
@@ -615,6 +679,8 @@ def next_node_after(node_name, state):
         return entry_destination(state)
     if node_name == "vision":
         return dynamic_router(state)
+    if node_name == "analysis":
+        return analysis_destination(state)
     if node_name == "tts":
         return None
     return _UNCONDITIONAL_SUCCESSOR.get(node_name)
