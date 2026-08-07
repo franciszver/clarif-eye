@@ -1,0 +1,18 @@
+# Render Blueprint for Clarif-Eye (issue #22). Render reads this file to
+# create and configure the service, so the setup lives in version control
+# instead of only in a dashboard. OPENROUTER_API_KEY is declared here but
+# not given a value: sync: false means Render prompts for it once, in the
+# dashboard, and never reads its value from this file.
+services:
+  - type: web
+    name: clarif-eye
+    runtime: python
+    plan: free
+    branch: main
+    buildCommand: pip install -e .
+    startCommand: python app.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: OPENROUTER_API_KEY
+        sync: false
