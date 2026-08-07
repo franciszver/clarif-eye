@@ -45,10 +45,12 @@ import io
 import os
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
 import gradio as gr
+from langgraph.checkpoint.memory import InMemorySaver
 
 from clarif_eye.client import LadderExhaustedError, OpenRouterClient, OpenRouterError
 from clarif_eye.failure_messages import (
@@ -117,7 +119,8 @@ UPLOADED_PHOTO_ALT = "The photo you submitted"
 #     see router.py's module docstring "computed locally with no model
 #     call, per the architecture doc's requirement that routing be pure
 #     Python").
-#   - state.py: ClarifEyeState is a 7-key TypedDict.
+#   - state.py: ClarifEyeState is an 8-key TypedDict (issue #81 / P9.2 added
+#     `messages`, the app's first LangGraph reducer).
 #   - registry.py / config/models.toml: the "eyes" and "brain" roles each
 #     hold an ORDERED ladder of free-only (":free", policy D10) model IDs,
 #     tried in turn on failure.
@@ -195,9 +198,9 @@ code actually does with your photo.
 
 This pipeline is built with [LangGraph](https://github.com/langchain-ai/langgraph)'s
 `StateGraph` (this app depends on `langgraph`, not `langchain` - there is no
-LangChain in this codebase). The graph state is a 7-key `TypedDict`:
+LangChain in this codebase). The graph state is an 8-key `TypedDict`:
 `image_data`, `ocr_output`, `scene_context`, `complexity_flag`,
-`scraper_data`, `final_output`, `audio_file_path`.
+`scraper_data`, `final_output`, `audio_file_path`, `messages`.
 
 Five nodes are registered: `vision`, `fast_synth`, `research`, `analysis`,
 and `tts`. Routing between them is a conditional edge out of `vision`,
@@ -801,6 +804,66 @@ class ImageResultCache:
             self._entries.pop(key, None)
 
 
+# --- Thread registry (issue #81 / P9.2) -------------------------------------
+#
+# A LangGraph checkpointer keeps every checkpointed thread's state in memory
+# for as long as the process (and, for InMemorySaver specifically, the
+# checkpointer instance) lives - see build_resources()'s InMemorySaver
+# comment for the honest limits of that. Nothing here ever ends a thread on
+# its own: a browser tab can be left open, or a visitor can simply not come
+# back, so without a bound the set of live threads (and, worse, each one's
+# full checkpointed state - see below) would grow for as long as the
+# process stays up.
+#
+# FOOTPRINT REALITY: every checkpoint stores the FULL graph state, including
+# image_data - a base64-encoded JPEG, easily tens of KB per photo - not just
+# the small scalar keys. On a free/512MB instance, a handful of large photos
+# multiplied across many live threads is a real memory hazard, not a
+# theoretical one. That is why THREADS themselves are capped here, not just
+# the messages list within one thread (see state.py's MAX_MESSAGES_PER_THREAD
+# for the complementary per-thread bound).
+#
+# CAP CHOICE: MAX_LIVE_THREADS=20, matching IMAGE_CACHE_MAX_ENTRIES above -
+# "a double-digit number of concurrent demo sessions" is a reasonable size
+# for a small free-tier demo app, and reusing the same order of magnitude as
+# the existing image cache bound keeps the two caps easy to reason about
+# together. Like every other cap in this codebase (IMAGE_CACHE_MAX_ENTRIES,
+# analysis._SCRAPER_DATA_CAP), this is a deliberate, documented guess, not a
+# measured optimum - retune it if real usage says otherwise.
+MAX_LIVE_THREADS = 20
+
+
+class ThreadRegistry:
+    """Tracks minted thread_ids LRU-style (by last-touched time, not
+    creation time), bounded to `max_threads`. When a touch would push the
+    registry over that bound, the LEAST-recently-touched thread_id is
+    evicted and its checkpointed state is deleted from `checkpointer` via
+    delete_thread - verified present and working on
+    langgraph.checkpoint.memory.InMemorySaver in langgraph 1.2.10 (see
+    build_resources()'s comment) - so eviction here actually frees the
+    checkpointer's memory, not just this registry's own bookkeeping.
+
+    Guarded by a single lock, same discipline as ImageResultCache above:
+    Gradio serves requests from a thread pool, so the touch/evict sequence
+    below is not safe to leave unguarded under concurrent access.
+    """
+
+    def __init__(self, checkpointer, max_threads=MAX_LIVE_THREADS):
+        self._checkpointer = checkpointer
+        self._max_threads = max_threads
+        self._ids = OrderedDict()
+        self._lock = threading.Lock()
+
+    def touch(self, thread_id):
+        with self._lock:
+            self._ids[thread_id] = None
+            self._ids.move_to_end(thread_id)
+            if len(self._ids) > self._max_threads:
+                oldest, _ = self._ids.popitem(last=False)
+                if self._checkpointer is not None:
+                    self._checkpointer.delete_thread(oldest)
+
+
 def _image_content_key(image_data):
     """Hash of the DECODED image bytes (the base64 JPEG _encode_image
     produces), never a filename/upload path - the same photo uploaded
@@ -822,6 +885,14 @@ class AppResources:
     searcher: object
     research_client: object
     image_cache: object = field(default_factory=ImageResultCache)
+    # None by default (issue #81 / P9.2): every existing test that builds
+    # an AppResources directly (test_ui.py's FakeGraph-based tests) never
+    # sets these, so they keep running an uncheckpointed graph with no
+    # thread_id, exactly today's behavior - see _run_pipeline_events, which
+    # only touches thread_registry / adds thread_id to config when a
+    # caller actually passes one in. build_resources() (the live app) sets
+    # both.
+    thread_registry: object = None
 
 
 def build_resources():
@@ -834,6 +905,31 @@ def build_resources():
     The research searcher/client are best-effort shared instances too (see
     module docstring); if either fails to construct, they're left None and
     research_node falls back to its own lazy per-call defaults.
+
+    CHECKPOINTING (issue #81 / P9.2): the live app compiles WITH a fresh
+    langgraph.checkpoint.memory.InMemorySaver, one per process (the same
+    "construct once at startup" discipline this function already follows
+    for the client/tts/searcher). HONEST LIMITS, stated here because this
+    is where a reader would look for them, not left to be discovered in
+    production:
+      - InMemorySaver keeps every checkpoint in this PROCESS's own memory -
+        nothing is written to disk or any external store. A process
+        restart (a redeploy, a crash, Hugging Face Spaces restarting the
+        container) loses every thread's history. This is fine for this
+        issue's scope (state surviving a run within one session) and is
+        never described to the user as more durable than that - no
+        user-facing text in this app claims otherwise.
+      - A free Hugging Face Space sleeps after ~15 minutes of no traffic;
+        waking it starts a NEW process, so the same loss happens on every
+        cold start a visitor's return happens to trigger.
+      - See ThreadRegistry / MAX_LIVE_THREADS above for how the number of
+        live threads (and, in turn, the checkpointer's own memory use) is
+        bounded while the process IS running.
+    Every existing caller of build_graph() with no arguments, and every
+    test in this repo that builds an AppResources directly instead of via
+    this function, is unaffected: build_graph()'s `checkpointer` param
+    defaults to None, so an uncheckpointed graph needs no thread_id at all
+    - only THIS function's live graph does.
     """
     try:
         client = OpenRouterClient()
@@ -858,13 +954,16 @@ def build_resources():
     except Exception:
         research_client = None
 
+    checkpointer = InMemorySaver()
+
     return AppResources(
-        graph=build_graph(),
+        graph=build_graph(checkpointer=checkpointer),
         client=client,
         client_error=client_error,
         tts_providers=tts_providers,
         searcher=searcher,
         research_client=research_client,
+        thread_registry=ThreadRegistry(checkpointer),
     )
 
 
@@ -882,7 +981,7 @@ def _encode_image(image):
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def _run_pipeline_events(image, resources, pipeline_budget_seconds):
+def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=None):
     """Generator: the ONE place that knows how to run a photo through the
     pipeline - guards, the image cache, graph execution, and the
     exception/outcome mapping.
@@ -905,6 +1004,18 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds):
     P9.1): with graph.stream() an exception can surface mid-iteration, not
     just from a single invoke() call, so the same discipline has to cover
     the whole loop, not just its start.
+
+    `thread_id` (issue #81 / P9.2) is OPTIONAL and defaults to None -
+    exactly today's behavior for every caller that doesn't pass one (the
+    entire existing test fleet, which drives an uncheckpointed
+    resources.graph). build_interface (below) mints one gr.State per
+    browser session and threads it through here; when it's not None, this
+    function (a) registers it with resources.thread_registry, if one is
+    configured, so a bounded live-thread count is maintained (see
+    ThreadRegistry above), and (b) adds it to
+    config["configurable"]["thread_id"], which is what a checkpointed
+    graph requires to persist/restore state across calls (verified
+    empirically - see build_graph's docstring).
     """
     if image is None:
         yield "outcome", (None, NO_IMAGE_MESSAGE)
@@ -944,15 +1055,18 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds):
 
     try:
         state = make_initial_state(image_data)
-        config = {
-            "configurable": {
-                "client": resources.client,
-                "tts_providers": resources.tts_providers,
-                "searcher": resources.searcher,
-                "research_client": resources.research_client,
-                "deadline": time.monotonic() + pipeline_budget_seconds,
-            }
+        configurable = {
+            "client": resources.client,
+            "tts_providers": resources.tts_providers,
+            "searcher": resources.searcher,
+            "research_client": resources.research_client,
+            "deadline": time.monotonic() + pipeline_budget_seconds,
         }
+        if thread_id is not None:
+            if resources.thread_registry is not None:
+                resources.thread_registry.touch(thread_id)
+            configurable["thread_id"] = thread_id
+        config = {"configurable": configurable}
         graph = resources.graph
         result = dict(state)
         for chunk in graph.stream(state, config=config, stream_mode="updates"):
@@ -1011,7 +1125,7 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds):
     yield "outcome", outcome
 
 
-def handle_submit(image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUDGET_SECONDS):
+def handle_submit(image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUDGET_SECONDS, thread_id=None):
     """Run one photo through the graph; return (audio_path_or_None, text).
 
     NEVER raises (except KeyboardInterrupt/SystemExit) - every failure
@@ -1029,6 +1143,10 @@ def handle_submit(image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUD
     graph.DEFAULT_PIPELINE_BUDGET_SECONDS but is overridable per call
     (e.g. by scripts/benchmark_pipeline.py sweeping it).
 
+    `thread_id` (issue #81 / P9.2) is OPTIONAL and defaults to None, same
+    as _run_pipeline_events - see that function's docstring for what
+    passing one actually does.
+
     All the actual work lives in _run_pipeline_events (issue #80 / P9.1) so
     handle_submit_staged can share it and turn its "status" events into
     live per-node progress yields; this just drains the generator and
@@ -1036,13 +1154,15 @@ def handle_submit(image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUD
     same return-tuple contract as before streaming existed.
     """
     outcome = (None, UNEXPECTED_ERROR_MESSAGE)
-    for kind, payload in _run_pipeline_events(image, resources, pipeline_budget_seconds):
+    for kind, payload in _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=thread_id):
         if kind == "outcome":
             outcome = payload
     return outcome
 
 
-def handle_submit_staged(image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUDGET_SECONDS):
+def handle_submit_staged(
+    image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUDGET_SECONDS, thread_id=None
+):
     """Generator version of handle_submit that also drives the live-region
     status text (issue #15 / P5.1 scope item 3).
 
@@ -1077,10 +1197,14 @@ def handle_submit_staged(image, resources, pipeline_budget_seconds=DEFAULT_PIPEL
     spoken - see AUDIO_PLAY_DELAY_MS's comment for why this replaced an
     earlier, broken JS-only attempt at the same gap. A screen reader hears
     each yield in order via aria-live="polite" on the status control.
+
+    `thread_id` (issue #81 / P9.2) is OPTIONAL and defaults to None, same
+    as _run_pipeline_events - build_interface passes each browser session's
+    own minted thread_id (a gr.State) through here.
     """
     yield STATUS_WORKING, None, ""
     audio_path, text = None, ""
-    for kind, payload in _run_pipeline_events(image, resources, pipeline_budget_seconds):
+    for kind, payload in _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=thread_id):
         if kind == "status":
             yield payload, None, ""
         else:
@@ -1117,12 +1241,24 @@ def build_interface(resources):
     and FOCUS_RESULT_JS moves focus to the description text once (and
     only once) a result is ready, via .then(js=...) chained after the
     submit click's fn resolves.
+
+    PER-SESSION THREAD_ID (issue #81 / P9.2): thread_state below is a
+    gr.State whose value is a callable, `lambda: str(uuid.uuid4())` -
+    Gradio calls it once per browser session (see gr.State's own
+    docstring: "If a callable is provided, the function will be called
+    whenever the app loads to set the initial value of the state"), which
+    is exactly "one thread_id minted per session" with no extra wiring.
+    It never appears in the UI itself (no label, not one of the
+    click's declared `outputs`) - it exists purely to be threaded through
+    to handle_submit_staged so a checkpointed resources.graph can persist
+    state across that ONE visitor's runs.
     """
 
-    def _submit(image):
-        yield from handle_submit_staged(image, resources)
+    def _submit(image, thread_id):
+        yield from handle_submit_staged(image, resources, thread_id=thread_id)
 
     with gr.Blocks(title="Clarif-Eye") as demo:
+        thread_state = gr.State(value=lambda: str(uuid.uuid4()))
         gr.Markdown(
             "# Clarif-Eye\n"
             "Clarif-Eye describes a photo aloud for visually impaired users. "
@@ -1183,7 +1319,7 @@ def build_interface(resources):
 
         submit_event = submit_button.click(
             fn=_submit,
-            inputs=image_input,
+            inputs=[image_input, thread_state],
             outputs=[status_output, audio_output, text_output],
         )
         # Runs client-side only after the handler above has produced its
