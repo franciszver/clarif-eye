@@ -27,11 +27,8 @@ regularly (see vision.py's module docstring):
     passed straight through as final_output.
 """
 
-from clarif_eye.client import LadderExhaustedError, OpenRouterClient, OpenRouterError
-from clarif_eye.failure_messages import (
-    message_for_ladder_exhausted,
-    message_for_terminal_error,
-)
+from clarif_eye.client import OpenRouterClient
+from clarif_eye.ladder import call_ladder
 from clarif_eye.prompting import fence_untrusted
 from clarif_eye.speech import to_spoken_text as _to_spoken_text
 from clarif_eye.vision import is_degraded_scene
@@ -146,32 +143,22 @@ def run_fast_synth(ocr_output, scene_context, client=None, deadline_exceeded=Fal
     if deadline_exceeded:
         return _degrade_from_known(ocr_output, scene_context)
 
-    owns_client = client is None
-    if owns_client:
-        try:
-            client = _default_client()
-        except OpenRouterError as exc:
-            return _degraded(message_for_terminal_error(exc))
-    try:
-        try:
-            result = client.complete("eyes", _build_messages(ocr_output, scene_context))
-        except LadderExhaustedError as exc:
-            return _degraded(message_for_ladder_exhausted(exc))
-        except OpenRouterError as exc:
-            return _degraded(message_for_terminal_error(exc))
-        except Exception:
-            # Contract (module docstring): no raw exception may escape into
-            # the graph. Catches everything else an injected client could
-            # raise, without swallowing KeyboardInterrupt/SystemExit, which
-            # derive from BaseException, not Exception.
-            return _degraded(
-                "The spoken description could not be prepared because of an "
-                "unexpected internal error. Please try again, and tell "
-                "whoever set this up if it keeps happening."
-            )
-    finally:
-        if owns_client:
-            client.close()
+    # One shared, never-raising ladder call (see clarif_eye.ladder for why
+    # this block is no longer written out here three times). `_default_client`
+    # is passed by NAME so the existing per-module monkeypatch seam in the
+    # tests keeps working; the catch-all wording stays here, at the call
+    # site, because it is the one thing the three callers genuinely differ on.
+    result, failure_message = call_ladder(
+        "eyes",
+        _build_messages(ocr_output, scene_context),
+        client,
+        _default_client,
+        "The spoken description could not be prepared because of an "
+        "unexpected internal error. Please try again, and tell "
+        "whoever set this up if it keeps happening.",
+    )
+    if failure_message is not None:
+        return _degraded(failure_message)
 
     reply = result.content
     if not isinstance(reply, str) or not reply.strip():

@@ -127,15 +127,20 @@ UPLOADED_PHOTO_ALT = "The photo you submitted"
 # flow, and the LangGraph implementation, since this is a demo application.
 # Content below is checked against the source it describes, not against the
 # issue's own wording or the (older, no longer accurate) architecture doc:
-#   - graph.py: build_graph() registers exactly 5 nodes (vision, fast_synth,
-#     research, analysis, tts). "router" is NOT a 6th node - dynamic_router
-#     is the function evaluated by a conditional edge out of "vision"; it is
-#     plain Python (state["complexity_flag"] in/out, no client, no network -
-#     see router.py's module docstring "computed locally with no model
-#     call, per the architecture doc's requirement that routing be pure
-#     Python").
-#   - state.py: ClarifEyeState is an 8-key TypedDict (issue #81 / P9.2 added
-#     `messages`, the app's first LangGraph reducer).
+#   - graph.py: build_graph() registers exactly 7 nodes (entry, vision,
+#     fast_synth, research, analysis, followup, tts). "router" is NOT one of
+#     them - dynamic_router is the function evaluated by a conditional edge
+#     out of "vision"; it is plain Python (state["complexity_flag"] in/out,
+#     no client, no network - see router.py's module docstring "computed
+#     locally with no model call, per the architecture doc's requirement
+#     that routing be pure Python"). "entry" IS a real registered node, but
+#     it routes differently again: it returns Command(goto=...) and picks
+#     its own successor rather than having an edge evaluated for it (issue
+#     #82 / P9.3 - see graph.py's "TWO ROUTING MECHANISMS" block for why
+#     both mechanisms are in this graph deliberately).
+#   - state.py: ClarifEyeState is a 9-key TypedDict (issue #81 / P9.2 added
+#     `messages`, the app's first LangGraph reducer; issue #82 / P9.3 added
+#     `question`).
 #   - registry.py / config/models.toml: the "eyes" and "brain" roles each
 #     hold an ORDERED ladder of free-only (":free", policy D10) model IDs,
 #     tried in turn on failure.
@@ -145,7 +150,8 @@ UPLOADED_PHOTO_ALT = "The photo you submitted"
 #   - tts.py: DEFAULT_PROVIDER_CHAIN is (EdgeTtsProvider, GttsProvider); if
 #     every provider fails, audio_file_path == "" and the UI falls back to
 #     text (see this module's "THE THREE OUTCOMES" docstring above).
-#   - analysis.py: on the deep-analysis path only, _numbers_verified checks
+#   - verification.py (imported by analysis.py as _numbers_verified): on the
+#     deep-analysis path only, numbers_verified checks
 #     every number-like token in the drafted script against the
 #     photographed text (+ scene description + any web lookup) before it is
 #     spoken; a token that doesn't trace back degrades to a safe
@@ -1642,22 +1648,10 @@ def handle_ask_staged(
     photo run. A user who has just heard a description read aloud should not
     have to learn a second interaction rhythm to ask about it.
     """
-    yield STATUS_ASKING, None, ""
-    audio_path, text = None, ""
-    for kind, payload in _run_followup_events(
-        question, resources, pipeline_budget_seconds, thread_id=thread_id
-    ):
-        if kind == "status":
-            yield payload, None, ""
-        else:
-            audio_path, text = payload
-    status = status_for_result(audio_path, is_chain_exhausted())
-    if not audio_path:
-        yield status, audio_path, text
-        return
-    yield status, None, text
-    time.sleep(AUDIO_PLAY_DELAY_MS / 1000)
-    yield status, audio_path, text
+    yield from _stage_events(
+        STATUS_ASKING,
+        _run_followup_events(question, resources, pipeline_budget_seconds, thread_id=thread_id),
+    )
 
 
 def handle_submit(image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUDGET_SECONDS, thread_id=None):
@@ -1693,6 +1687,51 @@ def handle_submit(image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUD
         if kind == "outcome":
             outcome = payload
     return outcome
+
+
+def _stage_events(opening_status, events):
+    """THE staged yield contract, in one place.
+
+    Turns an ("status"/"outcome", payload) event stream - from
+    _run_pipeline_events for a photo, _run_followup_events for a question -
+    into the (status_text, audio_path_or_None, description_text) tuples
+    Gradio streams straight to the UI.
+
+    ONE COPY, ON PURPOSE: handle_submit_staged and handle_ask_staged
+    differed only in their opening announcement and which event generator
+    they drained, but each carried its own copy of this ending. The
+    AUDIO_PLAY_DELAY_MS gap is an accessibility contract measured against
+    the wording of STATUS_SUCCESS_AUDIO (see that constant's comment, and
+    AUDIO_PLAY_DELAY_MS's history of a broken JS-only attempt at the same
+    gap) - two copies of it is two chances for a future edit to fix the
+    timing for descriptions and silently leave answers talking over
+    themselves.
+
+    The sequence, unchanged from before this was extracted:
+      1. `opening_status` immediately, with no audio and no text - the
+         "received, working on it" announcement, before anything has run.
+      2. one yield per ("status", phrase) event, as each node completes.
+      3. the final status AND text but NO audio, so a screen-reader user
+         can read the answer straight away.
+      4. only when audio was actually produced, the SAME status and text
+         once more after AUDIO_PLAY_DELAY_MS, now carrying the audio path -
+         so Gradio only mounts the autoplaying player once the completion
+         status has had time to be spoken.
+    """
+    yield opening_status, None, ""
+    audio_path, text = None, ""
+    for kind, payload in events:
+        if kind == "status":
+            yield payload, None, ""
+        else:
+            audio_path, text = payload
+    status = status_for_result(audio_path, is_chain_exhausted())
+    if not audio_path:
+        yield status, audio_path, text
+        return
+    yield status, None, text
+    time.sleep(AUDIO_PLAY_DELAY_MS / 1000)
+    yield status, audio_path, text
 
 
 def handle_submit_staged(
@@ -1737,24 +1776,10 @@ def handle_submit_staged(
     as _run_pipeline_events - build_interface passes each browser session's
     own minted thread_id (a gr.State) through here.
     """
-    yield STATUS_WORKING, None, ""
-    audio_path, text = None, ""
-    for kind, payload in _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=thread_id):
-        if kind == "status":
-            yield payload, None, ""
-        else:
-            audio_path, text = payload
-    status = status_for_result(audio_path, is_chain_exhausted())
-    if not audio_path:
-        yield status, audio_path, text
-        return
-    # Status + text land immediately (screen reader can read the answer
-    # right away); the audio path is withheld for one more beat so
-    # Gradio's autoplaying player doesn't mount over the still-being-
-    # spoken completion announcement.
-    yield status, None, text
-    time.sleep(AUDIO_PLAY_DELAY_MS / 1000)
-    yield status, audio_path, text
+    yield from _stage_events(
+        STATUS_WORKING,
+        _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=thread_id),
+    )
 
 
 def build_interface(resources):

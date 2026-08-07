@@ -20,17 +20,23 @@ prompt with two modes and a scraper_data parameter that is always empty
 here - more branching than either case needs.
 
 NO NUMBER-VERIFICATION BACKSTOP HERE, AND THAT IS A JUDGMENT CALL WORTH
-STATING: analysis._numbers_verified rejects a script whose numeric tokens
-don't trace back to the photographed text. It is not reused here because
-this node's whole job is often to READ A NUMBER BACK ("what is the expiry
-date", "what's the total") - and the check's own docstring is explicit that
-it is a loose token-equality check, not a parser. A legitimate answer that
-reformats a date it read correctly ("the nineteenth of April") would be
-rejected by it, turning a correct answer into a refusal. The prompt below
-carries the same "reproduce exactly, never invent" instruction
+STATING: clarif_eye.verification.numbers_verified rejects a script whose
+numeric tokens don't trace back to the photographed text. It is not reused
+here because this node's whole job is often to READ A NUMBER BACK ("what is
+the expiry date", "what's the total") - and the check's own docstring is
+explicit that it is a loose token-equality check, not a parser. A legitimate
+answer that reformats a date it read correctly ("the nineteenth of April")
+would be rejected by it, turning a correct answer into a refusal. The prompt
+below carries the same "reproduce exactly, never invent" instruction
 ANALYSIS_PROMPT does, and the answer is drawn from text this same pipeline
-captured rather than from a web scrape. Reconsider if follow-ups are ever
-observed inventing figures.
+captured rather than from a web scrape.
+
+TRACKED AS ISSUE #92, not left as an opinion in a comment. That issue
+settles it alongside #83's ask-first mechanism, because the honest response
+to "this answer contains a number I cannot trace back" is probably to ASK
+the user to re-photograph the relevant line, which is exactly the mechanism
+#83 introduces - refusing outright, the only option available today, is the
+worse of the two. Do not wire the check in here ahead of that decision.
 
 Follows the same never-raise contract every other node module in this
 pipeline does: LadderExhaustedError, a terminal OpenRouterError, an
@@ -40,11 +46,8 @@ instead of an exception, so the graph can still reach tts/END. The output is
 SPOKEN, so it always goes through speech.to_spoken_text.
 """
 
-from clarif_eye.client import LadderExhaustedError, OpenRouterClient, OpenRouterError
-from clarif_eye.failure_messages import (
-    message_for_ladder_exhausted,
-    message_for_terminal_error,
-)
+from clarif_eye.client import OpenRouterClient
+from clarif_eye.ladder import call_ladder
 from clarif_eye.prompting import fence_untrusted
 from clarif_eye.speech import to_spoken_text as _to_spoken_text
 from clarif_eye.vision import is_degraded_scene
@@ -200,32 +203,22 @@ def run_followup(ocr_output, scene_context, question, client=None, deadline_exce
     if deadline_exceeded:
         return _degrade_from_known(ocr_output, scene_context)
 
-    owns_client = client is None
-    if owns_client:
-        try:
-            client = _default_client()
-        except OpenRouterError as exc:
-            return _degraded(message_for_terminal_error(exc))
-    try:
-        try:
-            result = client.complete("brain", _build_messages(ocr_output, scene_context, question))
-        except LadderExhaustedError as exc:
-            return _degraded(message_for_ladder_exhausted(exc))
-        except OpenRouterError as exc:
-            return _degraded(message_for_terminal_error(exc))
-        except Exception:
-            # Contract (module docstring): no raw exception may escape into
-            # the graph. Catches everything else an injected client could
-            # raise, without swallowing KeyboardInterrupt/SystemExit, which
-            # derive from BaseException, not Exception.
-            return _degraded(
-                "The answer could not be prepared because of an unexpected "
-                "internal error. Please try again, and tell whoever set this "
-                "up if it keeps happening."
-            )
-    finally:
-        if owns_client:
-            client.close()
+    # One shared, never-raising ladder call (see clarif_eye.ladder for why
+    # this block is no longer written out here three times). `_default_client`
+    # is passed by NAME so the existing per-module monkeypatch seam in the
+    # tests keeps working; the catch-all wording stays here, at the call
+    # site, because it is the one thing the three callers genuinely differ on.
+    result, failure_message = call_ladder(
+        "brain",
+        _build_messages(ocr_output, scene_context, question),
+        client,
+        _default_client,
+        "The answer could not be prepared because of an unexpected "
+        "internal error. Please try again, and tell whoever set this "
+        "up if it keeps happening.",
+    )
+    if failure_message is not None:
+        return _degraded(failure_message)
 
     reply = result.content
     if not isinstance(reply, str) or not reply.strip():

@@ -40,15 +40,17 @@ before being returned - never trust the model to actually follow the
 "no markup" instruction in the prompt.
 """
 
-import re
-
-from clarif_eye.client import LadderExhaustedError, OpenRouterClient, OpenRouterError
-from clarif_eye.failure_messages import (
-    message_for_ladder_exhausted,
-    message_for_terminal_error,
-)
+from clarif_eye.client import OpenRouterClient
+from clarif_eye.ladder import call_ladder
 from clarif_eye.prompting import fence_untrusted
 from clarif_eye.speech import to_spoken_text as _to_spoken_text
+# Moved to its own module by issue #82's simplify gate - it was never
+# analysis-specific (see clarif_eye.verification's docstring). Imported
+# under the old private name so every existing importer of
+# `clarif_eye.analysis._numbers_verified` (scripts/benchmark_ladders.py,
+# scripts/benchmark_pipeline.py, tests/test_analysis_fixture_replay.py)
+# keeps working untouched.
+from clarif_eye.verification import numbers_verified as _numbers_verified
 from clarif_eye.vision import is_degraded_scene
 
 # scraper_data can grow unboundedly (issue #10's web lookups); a large scrape
@@ -78,69 +80,6 @@ from clarif_eye.vision import is_degraded_scene
 # left to a future evaluation; this comment is not a claim either way on
 # that question.
 _SCRAPER_DATA_CAP = 1000
-
-# Number-like tokens (amounts, dates-as-digits, identifiers) that a spoken
-# script must be able to trace back to the source material. Deliberately
-# loose - it is a token-equality check, not a parser - because the goal is
-# to catch INVENTED numbers, not to validate formatting.
-_NUMBER_TOKEN_RE = re.compile(r"\$?\d[\d,\-./:]*\d|\d")
-
-# Separators that join multi-part identifiers (an account number like
-# "4471-2205-88", a time like "10:30") rather than a decimal point. Used
-# below to also register each digit-run of such an identifier as its own
-# verifiable token, so a model that legitimately speaks one part of an
-# identifier ("4471") still verifies. "." is deliberately excluded: it is
-# how decimal amounts are written, and registering "104" as a stand-in for
-# "104.95" would let a truncated dollar amount slip back through - exactly
-# the leniency this check exists to close.
-_IDENTIFIER_SPLIT_RE = re.compile(r"[-/:]")
-
-
-def _strip_currency_punct(text):
-    return text.replace("$", "").replace(",", "")
-
-
-def _input_number_tokens(ocr_output, scene_context, scraper_data):
-    """Whole number-like tokens (plus identifier sub-parts) from the inputs.
-
-    Each token is a value from the source text taken as a whole - not a
-    substring window into it - so "104.9" cannot pass by being contained in
-    "104.95". For tokens that are hyphen/slash/colon-separated identifiers,
-    the individual digit-runs are also added (see _IDENTIFIER_SPLIT_RE)
-    so a partial identifier mention still verifies.
-    """
-    haystack = f"{ocr_output} {scene_context} {scraper_data}"
-    tokens = set()
-    for raw in _NUMBER_TOKEN_RE.findall(haystack):
-        token = _strip_currency_punct(raw)
-        tokens.add(token)
-        for part in _IDENTIFIER_SPLIT_RE.split(token):
-            if part:
-                tokens.add(part)
-    return tokens
-
-
-def _numbers_verified(spoken_output, ocr_output, scene_context, scraper_data):
-    """Check that every number-like token spoken aloud traces back to the input text.
-
-    THE CENTRAL RISK (see module docstring) is a model inventing a
-    plausible-sounding amount, date, or identifier that a blind user cannot
-    check. The prompt asks the model not to do this, but a prompt is not
-    enforcement - this is the code-level backstop: every numeric token found
-    in `spoken_output` must EQUAL a whole number token from the combined
-    inputs the model was actually given (see _input_number_tokens) - not
-    merely appear as a substring of one, which would let a truncated amount
-    like "104.9" pass by virtue of being contained in "104.95". Comparison
-    is lenient (currency symbols and commas stripped from both sides) so
-    "$104.95" in the output matches "104.95" in the OCR text. A reply with
-    no numeric tokens at all has nothing to verify and trivially passes.
-    """
-    tokens = _NUMBER_TOKEN_RE.findall(spoken_output)
-    if not tokens:
-        return True
-    input_tokens = _input_number_tokens(ocr_output, scene_context, scraper_data)
-    return all(_strip_currency_punct(token) in input_tokens for token in tokens)
-
 
 ANALYSIS_PROMPT = (
     "You are the final stage of an assistant that describes photos aloud "
@@ -272,32 +211,22 @@ def run_analysis(ocr_output, scene_context, scraper_data, client=None, scraper_d
     if deadline_exceeded:
         return _degrade_from_known(ocr_output, scene_context)
 
-    owns_client = client is None
-    if owns_client:
-        try:
-            client = _default_client()
-        except OpenRouterError as exc:
-            return _degraded(message_for_terminal_error(exc))
-    try:
-        try:
-            result = client.complete("brain", _build_messages(ocr_output, scene_context, scraper_data, cap))
-        except LadderExhaustedError as exc:
-            return _degraded(message_for_ladder_exhausted(exc))
-        except OpenRouterError as exc:
-            return _degraded(message_for_terminal_error(exc))
-        except Exception:
-            # Contract (module docstring): no raw exception may escape into
-            # the graph. Catches everything else an injected client could
-            # raise, without swallowing KeyboardInterrupt/SystemExit, which
-            # derive from BaseException, not Exception.
-            return _degraded(
-                "The spoken description could not be prepared because of an "
-                "unexpected internal error. Please try again, and tell "
-                "whoever set this up if it keeps happening."
-            )
-    finally:
-        if owns_client:
-            client.close()
+    # One shared, never-raising ladder call (see clarif_eye.ladder for why
+    # this block is no longer written out here three times). `_default_client`
+    # is passed by NAME so the existing per-module monkeypatch seam in the
+    # tests keeps working; the catch-all wording stays here, at the call
+    # site, because it is the one thing the three callers genuinely differ on.
+    result, failure_message = call_ladder(
+        "brain",
+        _build_messages(ocr_output, scene_context, scraper_data, cap),
+        client,
+        _default_client,
+        "The spoken description could not be prepared because of an "
+        "unexpected internal error. Please try again, and tell "
+        "whoever set this up if it keeps happening.",
+    )
+    if failure_message is not None:
+        return _degraded(failure_message)
 
     reply = result.content
     if not isinstance(reply, str) or not reply.strip():
