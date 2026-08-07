@@ -132,8 +132,22 @@ def entry_destination(state):
     with .get() because a follow-up run's input is a PARTIAL state delta -
     on a thread that has never run, keys that no node has ever written are
     genuinely absent from `state`, verified empirically on langgraph 1.2.10.
+
+    TYPE-CHECKED, the same discipline dynamic_router applies to
+    complexity_flag and for the same reason: TypedDict gives no runtime
+    protection, and the two destinations differ by a whole model call and a
+    whole path. Without this, a non-string question (a number, a list, a
+    Gradio component someone wired up wrong) would raise a bare
+    AttributeError from .strip() deep inside a node, with nothing naming the
+    key or the value. Fail loudly and say what was wrong instead.
     """
-    return "followup" if (state.get("question") or "").strip() else "vision"
+    question = state.get("question")
+    if question is not None and not isinstance(question, str):
+        raise TypeError(
+            "entry_destination: state['question'] must be str or None, got "
+            f"{type(question).__name__} ({question!r})"
+        )
+    return "followup" if (question or "").strip() else "vision"
 
 
 def entry_node(state):
@@ -460,6 +474,17 @@ def next_node_after(node_name, state):
     dynamic_router (the function build_graph() wires as the conditional
     edge), and the entry branch reuses entry_destination (the function
     entry_node builds its Command(goto=...) from).
+
+    RETURNS None FOR ANY NAME THIS GRAPH DOES NOT KNOW, rather than raising
+    a KeyError. The caller is clarif_eye.ui's narration, which iterates over
+    whatever keys LangGraph's stream produces - and those are not all node
+    names. LangGraph emits RESERVED keys too: "__interrupt__" is the
+    concrete one coming in issue #83 (human-in-the-loop interrupts), and a
+    KeyError raised from shared narration code would take down a run that
+    was otherwise fine. A typo'd or renamed node name lands here as well and
+    degrades to "announce nothing for this step" - a quiet narration gap,
+    which is the right failure for a progress announcement, rather than
+    losing the user an answer that had already been computed.
     """
     if node_name == "entry":
         return entry_destination(state)
@@ -467,4 +492,4 @@ def next_node_after(node_name, state):
         return dynamic_router(state)
     if node_name == "tts":
         return None
-    return _UNCONDITIONAL_SUCCESSOR[node_name]
+    return _UNCONDITIONAL_SUCCESSOR.get(node_name)

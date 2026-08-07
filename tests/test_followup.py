@@ -41,6 +41,13 @@ from clarif_eye.ui import (
     handle_submit_staged,
 )
 
+# Reused, not re-declared: tests/test_ui.py already owns the stand-in for a
+# PIL Image (a `content=` per "photo" so two photos are told apart by
+# CONTENT, which is what issue #75's cache keys on). A second copy here
+# would be one more place to update if _encode_image's expectations ever
+# change.
+from tests.test_ui import FakeImage
+
 # No digits and no document keywords, so clarif_eye.router keeps the photo
 # run on the FAST path (vision -> fast_synth -> tts) and this file never has
 # to fake a search backend. The exact wording matters: the follow-up test
@@ -51,22 +58,6 @@ STORED_SCENE_TEXT = "a jar of jam on a kitchen counter"
 
 QUESTION = "what is the expiry date?"
 CANNED_ANSWER = "The label says best before next April."
-
-
-class FakeImage:
-    """Stand-in for a PIL Image good enough for base64 encoding - same
-    shape tests/test_ui.py's FakeImage uses."""
-
-    mode = "RGB"
-
-    def __init__(self, content=b"\xff\xd8\xff\xe0fakejpegbytes"):
-        self.content = content
-
-    def convert(self, mode):
-        return self
-
-    def save(self, buf, format=None):
-        buf.write(self.content)
 
 
 class RecordingClient:

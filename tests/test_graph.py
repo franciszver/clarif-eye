@@ -217,6 +217,37 @@ def test_entry_node_treats_a_blank_question_as_a_photo_run():
     assert entry_destination({}) == "vision"
 
 
+def test_entry_destination_raises_a_named_type_error_on_a_non_string_question():
+    # Same discipline dynamic_router applies to complexity_flag: without an
+    # explicit check this would be a bare AttributeError from .strip(),
+    # raised deep inside a node with nothing naming the key or the value.
+    from clarif_eye.graph import entry_destination
+
+    with pytest.raises(TypeError) as excinfo:
+        entry_destination({"question": 42})
+    assert "question" in str(excinfo.value)
+
+    with pytest.raises(TypeError):
+        entry_destination({"question": ["what is the expiry date?"]})
+
+
+# --- next_node_after: unknown stream keys must not crash narration --------
+#
+# clarif_eye.ui's narration iterates over whatever keys LangGraph's stream
+# produces, and those are not all node names - LangGraph emits RESERVED keys
+# too. "__interrupt__" is the concrete one arriving with issue #83
+# (human-in-the-loop interrupts). A KeyError from this shared code would
+# take down a run whose answer had already been computed, so an unknown name
+# degrades to "no narration for this step" instead.
+
+
+def test_next_node_after_returns_none_for_an_unknown_stream_key():
+    from clarif_eye.graph import next_node_after
+
+    assert next_node_after("__interrupt__", {}) is None
+    assert next_node_after("not_a_real_node_name", {}) is None
+
+
 def test_a_question_run_skips_vision_entirely():
     from clarif_eye.client import CompletionResult
 
