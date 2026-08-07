@@ -1215,14 +1215,25 @@ class ThreadRegistry(_BoundedLRU):
 # test_resume_still_works_after_the_thread_is_trimmed, which is written to
 # fail if a future langgraph version changes that.
 #
-# THE ONE THING THAT IS NOT SAFE DURING A PAUSE is graph.update_state(),
-# which this module does NOT do on a paused thread and must not start
-# doing: a state write while a task is pending clears the pending
-# interrupt's own entry from get_state().interrupts, so the structural
-# "is anything paused?" check (_has_pending_interrupt) would then say no
-# and the user's answer would be refused. Every recording/caching path is
-# already skipped for a paused run - see _run_pipeline_events' `paused`
-# branch.
+# THE ONE THING THAT IS NOT SAFE DURING A PAUSE is a BARE
+# graph.update_state(). Probe-confirmed: a state write while a task is
+# pending clears the pending interrupt's entry from get_state().interrupts
+# but leaves .next still naming the paused node - a ZOMBIE thread, neither
+# running nor resumable, with the UI's two answer buttons pointing at
+# nothing. This is not hypothetical; the cache-hit branch used to do
+# exactly that.
+#
+# THE RULE, therefore, for every state write on a thread that MIGHT be
+# paused: RESOLVE-THEN-WRITE. Decide what the user's action means as an
+# answer to the pending question, resolve the pause to that answer, and
+# only then write. Submitting another photo means an implicit RETAKE (the
+# user moved on), and passing as_node="tts" to _update_thread_state
+# resolves and writes in one go with no node executed - see the cache-hit
+# branch in _run_pipeline_events for the full reasoning and the rejected
+# alternative. The other two writes need no resolve: _record_turn only ever
+# runs after a run has COMPLETED (a paused run returns before reaching it -
+# see _run_pipeline_events' `paused` branch), and a follow-up on a paused
+# thread is refused before it can write anything at all.
 #
 # THE CALL SITES, all reached via _update_thread_state EXCEPT the last, and
 # NO LONGER all post-run (updated by issue #82 / P9.3 - this list said
@@ -1231,10 +1242,12 @@ class ThreadRegistry(_BoundedLRU):
 #     NOT reached when that run paused to ask a question.
 #   - _run_followup_events, after a question run reaches its final outcome.
 #   - _run_pipeline_events' CACHE-HIT branch, which runs at the START of a
-#     request and trims before yielding. That is safe for the same reason
-#     the others are - a cache hit executes no graph at all, so there is no
-#     pending checkpoint of its own to preserve - but it is NOT a
-#     post-run call.
+#     request and trims before yielding. NOT a post-run call, and the one
+#     place a thread can genuinely still be PAUSED when a write lands -
+#     which is why that call passes as_node="tts" to resolve the pause
+#     first (see RESOLVE-THEN-WRITE above). Trimming after that resolve is
+#     safe like the others: there is no longer a pending checkpoint to
+#     preserve.
 #   - _run_resume_events (issue #83 / P9.4), called DIRECTLY (not via
 #     _update_thread_state) on the retake path, which completes a run
 #     without recording a turn and so has no state write to trim behind.
@@ -1486,9 +1499,19 @@ def _outcome_for(final_output, audio_path):
     return (None, final_output or UNEXPECTED_ERROR_MESSAGE)
 
 
-def _update_thread_state(graph, config, thread_id, update):
+def _update_thread_state(graph, config, thread_id, update, as_node=None):
     """Write `update` onto `thread_id`'s checkpoint, then bound that
     thread's checkpoint history.
+
+    `as_node` (issue #83 / P9.4) names the node LangGraph should record the
+    write as having come from. Omitted, LangGraph INFERS it from the last
+    node that updated the state - which is what every caller relied on
+    before this parameter existed, and which is unambiguous on a thread
+    whose last run completed (tts is the only node every path ends on).
+    It stops being unambiguous, and stops being safe, on a thread that is
+    PAUSED on an interrupt - see the caller in _run_pipeline_events'
+    cache-hit branch for the zombie that produced, and RESOLVE-THEN-WRITE
+    below for the rule.
 
     NEVER RAISES (deep-review BLOCKER fix, issue #81 / P9.2): this is
     bookkeeping - state for a LATER run - not part of THIS run's
@@ -1504,10 +1527,15 @@ def _update_thread_state(graph, config, thread_id, update):
     Works on a thread with NO prior checkpoint (verified empirically on
     langgraph 1.2.10 for issue #82's cache-hit fix): update_state creates
     the thread's first checkpoint and needs no `as_node` to do it, which is
-    exactly the case a second visitor's cache hit produces.
+    exactly the case a second visitor's cache hit produces. Verified again
+    for this issue with an explicit as_node="tts" on a thread that has
+    never run: it creates the first checkpoint just the same.
     """
     try:
-        graph.update_state(config, update)
+        if as_node is None:
+            graph.update_state(config, update)
+        else:
+            graph.update_state(config, update, as_node=as_node)
         _trim_thread_to_latest_checkpoint(getattr(graph, "checkpointer", None), thread_id)
     except Exception:
         pass
@@ -1722,6 +1750,39 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
             # update, not two: `messages` goes through state.py's reducer
             # and appends, while the rest replace, so a single call is both
             # atomic and one checkpoint write instead of two.
+            # RESOLVE-THEN-WRITE (issue #83 / P9.4) - THE rule for any state
+            # write on a thread that might be paused, and the fix for a real
+            # zombie this branch used to create.
+            #
+            # A plain graph.update_state() on a thread paused at
+            # `verify_numbers` clears the pending interrupt's own write but
+            # leaves .next still naming the paused node - probe-confirmed.
+            # The thread was then neither running nor resumable: nothing
+            # would ever answer the question, and the two answer buttons
+            # were still on screen pointing at it.
+            #
+            # Submitting another photo IS an answer, though - an IMPLICIT
+            # RETAKE. The user moved on, which is exactly what the retake
+            # button means. So the pause is resolved as a retake rather than
+            # being asked about again, and `verification_hold` is cleared
+            # below with the same write, for the same reason `question` is:
+            # a draft held back for a photo the user has left behind must
+            # never divert the next run.
+            #
+            # RESOLVED WITH as_node="tts", NOT by streaming
+            # Command(resume=RESUME_RETAKE). Both end identically
+            # (.next == (), no pending interrupt - both probed), but the
+            # resume path RUNS the graph's remaining nodes, which means
+            # verify_numbers plus a full tts synthesis of a retake
+            # confirmation nobody will hear - a real network round trip and
+            # a stray mp3, spent to reach a state the user is about to
+            # leave anyway. as_node="tts" reaches the same end state with
+            # NO node executed at all, and folds into the single write this
+            # branch was already making. It is also what this call was
+            # already doing implicitly: with no as_node, LangGraph infers
+            # the last node to update the state, which on a completed
+            # thread is tts. Naming it makes that true on a paused thread
+            # too, instead of quietly not being.
             if thread_id is not None:
                 configurable = dict(thread_configurable(resources, thread_id))
                 if configurable:
@@ -1730,6 +1791,7 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
                         "ocr_output": cached_ocr,
                         "scene_context": cached_scene,
                         "question": None,
+                        "verification_hold": None,
                     }
                     if cached_text:
                         update["messages"] = [{"role": "assistant", "content": cached_text}]
@@ -1738,6 +1800,7 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
                         {"configurable": configurable},
                         thread_id,
                         update,
+                        as_node="tts",
                     )
             yield "outcome", (cached_audio_path or None, cached_text)
             return
@@ -1886,6 +1949,24 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
     clarif_eye.followup.NO_PHOTO_YET_MESSAGE is what gets spoken. That is
     the correct answer for that situation, reached through the ordinary
     path with no special case here.
+
+    A PENDING QUESTION BLOCKS THIS ENTIRELY (issue #83 / P9.4, and this is
+    a real bug fixed, not a precaution). Running a follow-up on a thread
+    that is paused waiting for an answer SUPERSEDES the pending task -
+    probe-confirmed on langgraph 1.2.10: get_state().next goes back to ()
+    and the interrupt is gone. So the question the app asked about an
+    unverified number would be silently destroyed by the user typing
+    something unrelated, while both answer buttons stayed on screen wired
+    to a resume that would then find nothing to resume. The rule is to
+    REFUSE and say so: see QUESTION_PENDING_MESSAGE. Checked BEFORE the
+    graph is touched, so the refusal costs no model call and writes no
+    state - the pause is left exactly as it was and can still be answered.
+
+    THE HOLD IS NOT CLEARED HERE, and does not need to be: `followup` never
+    routes through `verify_numbers` (the edge is out of `analysis` only), so
+    a stale verification_hold could not divert an answer even if one
+    existed - and after this guard, a follow-up cannot run on a thread that
+    has one at all.
     """
     if resources.client is None:
         yield "outcome", (None, resources.client_error or CONFIG_ERROR_MESSAGE)
@@ -1924,6 +2005,14 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
         configurable.update(thread_configurable(resources, thread_id))
         config = {"configurable": configurable}
         graph = resources.graph
+        # A pending safety question outranks a follow-up - see this
+        # function's docstring for what running one anyway used to destroy.
+        # Checked here, inside the try and after thread_configurable, so it
+        # reads the SAME config the run would have used and so a broken
+        # get_state can never raise into Gradio.
+        if _has_pending_interrupt(graph, config):
+            yield "outcome", (None, QUESTION_PENDING_MESSAGE)
+            return
         # The DELTA, and nothing else - see this function's docstring.
         state = {"question": question}
         result = dict(state)
@@ -2328,12 +2417,16 @@ def build_interface(resources):
     # actually pauses, so nothing appears in the tab order offering a choice
     # about a question nobody was asked. _submit is the only handler that
     # can reveal them; _resume always hides them again, whichever way the
-    # answer went. _ask deliberately does NOT touch them (they are not among
-    # its outputs): a follow-up is about the photo, not about the pending
-    # question, and having it silently clear a pause the user has not
-    # answered would be a worse surprise than leaving the buttons up. A
-    # click on them after that lands in _run_resume_events' "nothing is
-    # paused" branch and is answered in words.
+    # answer went.
+    #
+    # _ask does NOT touch them, and it no longer needs to: a follow-up
+    # typed while a question is pending is REFUSED before the graph is
+    # touched (see QUESTION_PENDING_MESSAGE and _run_followup_events), so
+    # the pause it would once have silently destroyed is still there and
+    # the buttons still point at something real. An earlier version of this
+    # comment claimed the follow-up left the pause alone; it did not - it
+    # superseded the pending task and left these two buttons wired to
+    # nothing. That is the bug the refusal fixes.
     def _submit(image, thread_id):
         pause_signal = _PauseSignal()
         for status, audio, text in handle_submit_staged(

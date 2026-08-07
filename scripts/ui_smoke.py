@@ -36,7 +36,13 @@ from pathlib import Path
 
 from PIL import Image
 
-from clarif_eye.ui import build_resources, handle_ask_staged, handle_submit
+from clarif_eye.ui import (
+    _has_pending_interrupt,
+    build_resources,
+    handle_ask_staged,
+    handle_submit,
+    thread_configurable,
+)
 
 
 def main():
@@ -69,6 +75,29 @@ def main():
     if not text or not text.strip():
         print("FAIL: handle_submit returned no description text.", file=sys.stderr)
         raise SystemExit(1)
+
+    # A PAUSED RUN IS NOT A PASS (issue #83 / P9.4). If the model drafted a
+    # number that could not be traced back to the photographed text, the run
+    # stopped to ask the user about it: no audio was produced and nothing
+    # was described - `text` holds the QUESTION. Reporting "PASS:
+    # handle_submit produced a description" there would be simply untrue,
+    # and this script exists to tell a human the truth about a live run.
+    #
+    # Detected STRUCTURALLY, the same way the UI itself does it: ask the
+    # real graph whether this thread has a pending interrupt. Never by
+    # matching the wording of the question.
+    config = {"configurable": dict(thread_configurable(resources, thread_id))}
+    if _has_pending_interrupt(resources.graph, config):
+        print(
+            "PAUSED: the run stopped to ask about a number it could not "
+            "check against the photo. Nothing was described and no audio "
+            "was produced; the text above is the question. Answering it "
+            "needs the UI's resume buttons, which this script does not "
+            "drive."
+        )
+        # Not a failure: this is the feature working. Exit 0, but never
+        # claim a description was produced.
+        return
 
     print("PASS: handle_submit produced a description.")
 
