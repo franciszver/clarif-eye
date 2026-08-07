@@ -22,7 +22,11 @@ and neither is a leftover:
     is exactly the shape a conditional edge expresses - the routing function
     takes no part in producing state, so it can stay a tiny testable pure
     function (see dynamic_router's own guards below) with no client, no
-    config, and no update to return.
+    config, and no update to return. Issue #83 / P9.4 added a SECOND use of
+    this same mechanism, out of `analysis` (analysis_destination), for the
+    same reason and in the same shape: `analysis` writes verification_hold,
+    a separate pure function reads it to decide whether the run stops to
+    ask the user about a number it could not check.
 
   - Command(goto=...) (returned by `entry`): a node that decides its OWN
     successor. There is no upstream node to compute a flag for it - `entry`
