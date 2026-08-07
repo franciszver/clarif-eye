@@ -15,6 +15,8 @@ from clarif_eye.state import make_initial_state
 from clarif_eye import vision
 from clarif_eye.vision import _parse_reply, is_degraded_scene, run_vision
 
+from tests._stream_helpers import drain_stream_collecting_trace
+
 # 200 words, no data-density signals: trips only the router's long-document
 # word-count fallback (see clarif_eye.router), not the digit/currency/keyword
 # signals - i.e. exercises the "genuinely long document" branch of the
@@ -602,7 +604,7 @@ def test_full_compiled_graph_runs_end_to_end_with_fake_client_fast_path():
 
     result = graph.invoke(
         state,
-        config={"configurable": {"trace": [], "client": client, "tts_provider": _FakeTtsProvider()}},
+        config={"configurable": {"client": client, "tts_provider": _FakeTtsProvider()}},
     )
 
     assert result["ocr_output"] == "short text"
@@ -616,11 +618,9 @@ def test_full_compiled_graph_runs_end_to_end_with_fake_client_research_path():
     client = FakeVisionClient(content=well_formed_reply(LONG_TEXT, "a busy street"))
     graph = build_graph()
     state = make_initial_state("base64data")
-    trace = []
 
-    result = graph.invoke(
-        state,
-        config={"configurable": {"trace": trace, "client": client, "tts_provider": _FakeTtsProvider()}},
+    result, trace = drain_stream_collecting_trace(
+        graph, state, config={"configurable": {"client": client, "tts_provider": _FakeTtsProvider()}}
     )
 
     assert result["complexity_flag"] is True
@@ -633,11 +633,9 @@ def test_full_compiled_graph_degrades_gracefully_and_still_reaches_tts():
     client = FakeVisionClient(exc=LadderExhaustedError("eyes", ()))
     graph = build_graph()
     state = make_initial_state("base64data")
-    trace = []
 
-    result = graph.invoke(
-        state,
-        config={"configurable": {"trace": trace, "client": client, "tts_provider": _FakeTtsProvider()}},
+    result, trace = drain_stream_collecting_trace(
+        graph, state, config={"configurable": {"client": client, "tts_provider": _FakeTtsProvider()}}
     )
 
     assert trace[-1] == "tts"

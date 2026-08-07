@@ -17,15 +17,20 @@ import os
 import pytest
 
 from clarif_eye import tts as tts_module
-from clarif_eye.client import Attempt, LadderExhaustedError, OpenRouterError
+from clarif_eye.client import Attempt, CompletionResult, LadderExhaustedError, OpenRouterError
 from clarif_eye.failure_messages import BUSY_MESSAGE
 from clarif_eye.failure_messages import CONFIG_ERROR_MESSAGE as MAPPED_CONFIG_ERROR_MESSAGE
+from clarif_eye.graph import build_graph
 from clarif_eye.ui import (
     AppResources,
     AUDIO_UNAVAILABLE_NOTE,
     CONFIG_ERROR_MESSAGE,
     IMAGE_CACHE_MAX_ENTRIES,
     NO_IMAGE_MESSAGE,
+    STATUS_NODE_RESEARCH,
+    STATUS_NODE_TTS,
+    STATUS_NODE_WRITING,
+    STATUS_WORKING,
     UNEXPECTED_ERROR_MESSAGE,
     UNREADABLE_IMAGE_MESSAGE,
     build_resources,
@@ -67,7 +72,16 @@ class BrokenImage:
 
 
 class FakeGraph:
-    """Records the config it was invoked with and returns a canned result."""
+    """Records the config it was invoked with and returns a canned result.
+
+    stream() (issue #80 / P9.1) yields exactly one chunk, keyed "tts" -
+    _run_pipeline_events always streams now (no invoke()/stream() fork),
+    and a real graph's LAST chunk is always tts's, so this is the minimal
+    shape that satisfies it: invoke()'s own logic still runs (recording
+    the invocation, raising self.exc), and graph.next_node_after("tts", ...)
+    is None (nothing follows tts), so this maps to no narration phrase and
+    every existing staged-contract test keeps its exact yield sequence.
+    """
 
     def __init__(self, result=None, exc=None):
         self.result = result or {}
@@ -79,6 +93,9 @@ class FakeGraph:
         if self.exc is not None:
             raise self.exc
         return self.result
+
+    def stream(self, state, config=None, stream_mode="updates"):
+        yield {"tts": self.invoke(state, config=config)}
 
 
 class SequencedGraph:
@@ -95,6 +112,9 @@ class SequencedGraph:
         idx = len(self.invocations)
         self.invocations.append({"state": state, "config": config})
         return {"final_output": self.outputs[idx], "audio_file_path": ""}
+
+    def stream(self, state, config=None, stream_mode="updates"):
+        yield {"tts": self.invoke(state, config=config)}
 
 
 def _resources(graph, client="fake-client"):
@@ -450,6 +470,9 @@ class FileWritingGraph:
         self.audio_path.write_bytes(b"fake-mp3-bytes")
         return {"final_output": self.final_output, "audio_file_path": str(self.audio_path)}
 
+    def stream(self, state, config=None, stream_mode="updates"):
+        yield {"tts": self.invoke(state, config=config)}
+
 
 class SequencedTtsGraph:
     """Like SequencedGraph, but also plants tts_module's last-result state
@@ -469,6 +492,9 @@ class SequencedTtsGraph:
         final_output, audio_path, tts_result = self.outcomes[idx]
         tts_module._last_result_set(tts_result)
         return {"final_output": final_output, "audio_file_path": audio_path}
+
+    def stream(self, state, config=None, stream_mode="updates"):
+        yield {"tts": self.invoke(state, config=config)}
 
 
 def test_chain_exhausted_result_is_not_cached_a_retry_reruns_and_recovers(tmp_path):
@@ -539,3 +565,115 @@ def test_cache_hit_with_a_deleted_audio_file_reruns_the_pipeline(tmp_path):
     assert len(graph.invocations) == 2  # ran again - not a lying cache hit
     assert second_audio == str(audio_path)
     assert os.path.exists(second_audio)
+
+
+# --- Per-node stream progress (issue #80 / P9.1) ---------------------------
+#
+# handle_submit_staged used to fake progress with a single "working" status
+# because graph.invoke() is one opaque blocking call with no intermediate
+# hook. graph.stream(..., stream_mode="updates") yields one dict per
+# COMPLETED node (keyed by node name), so real per-node narration is now
+# possible - these tests drive a REAL compiled graph (not FakeGraph, which
+# only implements .invoke() and is intentionally left alone so every
+# existing FakeGraph-based test above keeps passing unchanged) and assert
+# the live-region status sequence carries one narration phrase per node
+# that actually ran, in execution order, for both router paths.
+
+
+class _RoutingVisionClient:
+    """Real vision-node reply shape (see tests/test_graph.py's
+    FakeVisionClient) whose OCR text length drives the router - long text
+    with no data-density signals trips only the router's word-count
+    fallback (same LONG_OCR_TEXT trick test_graph.py/test_pipeline_deadline.py
+    use), giving deterministic control over which path runs."""
+
+    def __init__(self, ocr, scene):
+        self.ocr = ocr
+        self.scene = scene
+
+    def complete(self, role, messages, **params):
+        if role == "eyes":
+            return CompletionResult(
+                content=f"OCR_TEXT: {self.ocr}\nSCENE: {self.scene}", model="fake-eyes-model:free"
+            )
+        return CompletionResult(content="A full analysis of the document.", model="fake-brain-model:free")
+
+    def close(self):
+        pass
+
+
+class _EmptySearcher:
+    """No results -> research_node's fetch step never runs -> no network."""
+
+    def text(self, query, **kwargs):
+        return []
+
+
+class _FakeTtsProvider:
+    """Same minimal double test_graph.py/test_vision.py use for tts_node's
+    provider seam - writes a minimal valid-looking mp3 (an ID3 tag) so
+    run_tts's own "looks like audio" check passes, without touching the
+    network via a real EdgeTtsProvider."""
+
+    def synthesize(self, text, out_path):
+        with open(out_path, "wb") as f:
+            f.write(b"ID3" + b"\x00" * 32)
+
+
+SHORT_OCR_TEXT = "short text"
+LONG_OCR_TEXT = " ".join(["x"] * 200)
+
+
+def _node_statuses(updates):
+    """The subsequence of yielded status strings that are node-narration
+    phrases, in the order they were yielded - excludes STATUS_WORKING (the
+    unconditional first yield) and the two final-result yields, which use
+    status_for_result's vocabulary, not the node-phrase vocabulary."""
+    node_phrases = {STATUS_NODE_RESEARCH, STATUS_NODE_WRITING, STATUS_NODE_TTS}
+    return [status for status, _audio, _text in updates if status in node_phrases]
+
+
+def test_staged_submit_narrates_each_node_transition_in_order_fast_path():
+    client = _RoutingVisionClient(SHORT_OCR_TEXT, "a room")
+    resources = AppResources(
+        graph=build_graph(),
+        client=client,
+        client_error=None,
+        tts_providers=[_FakeTtsProvider()],
+        searcher=_EmptySearcher(),
+        research_client=None,
+    )
+
+    updates = list(handle_submit_staged(FakeImage(), resources))
+
+    assert updates[0][0] == STATUS_WORKING
+    # Fast path executes vision -> fast_synth -> tts. vision itself gets no
+    # dedicated phrase (nothing precedes it in the stream to trigger one -
+    # STATUS_WORKING already covers it, see clarif_eye.ui's STATUS_NODE_*
+    # comment); a phrase is announced for whatever node comes next each
+    # time one completes: fast_synth's phrase when vision finishes, tts's
+    # phrase when fast_synth finishes.
+    assert _node_statuses(updates) == [STATUS_NODE_WRITING, STATUS_NODE_TTS]
+
+
+def test_staged_submit_narrates_each_node_transition_in_order_deep_path():
+    client = _RoutingVisionClient(LONG_OCR_TEXT, "a busy scene")
+    resources = AppResources(
+        graph=build_graph(),
+        client=client,
+        client_error=None,
+        tts_providers=[_FakeTtsProvider()],
+        searcher=_EmptySearcher(),
+        research_client=None,
+    )
+
+    updates = list(handle_submit_staged(FakeImage(), resources))
+
+    assert updates[0][0] == STATUS_WORKING
+    # Deep path executes vision -> research -> analysis -> tts; same
+    # successor-announcement pattern as the fast path above.
+    assert _node_statuses(updates) == [
+        STATUS_NODE_RESEARCH,
+        STATUS_NODE_WRITING,
+        STATUS_NODE_TTS,
+    ]

@@ -9,9 +9,12 @@ be driven deterministically in tests. Node functions are named and
 importable individually so later issues (#5-#8) can replace them one at a
 time without restructuring the graph.
 
-Node visitation is recorded into config["configurable"]["trace"] (a list
-supplied by the caller), not into the state schema itself - the state
-schema is exactly the 7 architecture-doc keys, nothing more.
+Node visitation is observable via the compiled graph's own
+`graph.stream(state, config=config, stream_mode="updates")` (issue #80 /
+P9.1) - one dict per COMPLETED node, keyed by node name - rather than a
+caller-supplied trace list threaded through config["configurable"]. That
+gives callers (and tests) real per-node progress instead of a debugging
+side-channel, and needs nothing extra recorded by the nodes themselves.
 """
 
 import time
@@ -66,12 +69,6 @@ from clarif_eye.vision import run_vision
 DEFAULT_PIPELINE_BUDGET_SECONDS = 60.0
 
 
-def _record(config, node_name):
-    trace = config.get("configurable", {}).get("trace") if config else None
-    if trace is not None:
-        trace.append(node_name)
-
-
 def _deadline_exceeded(config):
     """True if config["configurable"]["deadline"] (an absolute
     time.monotonic() timestamp) is set and has already passed.
@@ -101,15 +98,14 @@ def vision_node(state, config=None, client=None):
     clarif_eye.vision.run_vision so this stays a thin adapter. `client` is
     injectable directly (for unit tests calling this function) or via
     config["configurable"]["client"] (for tests driving the compiled
-    graph, the same pattern already used for `trace`); when neither is
-    supplied, run_vision constructs a real OpenRouterClient lazily.
+    graph); when neither is supplied, run_vision constructs a real
+    OpenRouterClient lazily.
 
     Checks the total-pipeline deadline (see _deadline_exceeded above) and
     passes the result to run_vision, which skips the eyes-ladder call
     entirely if it has already passed - see this module's top-level
     "Total-pipeline deadline" docstring block.
     """
-    _record(config, "vision")
     if client is None:
         client = (config or {}).get("configurable", {}).get("client")
     return run_vision(state["image_data"], client, deadline_exceeded=_deadline_exceeded(config))
@@ -130,7 +126,6 @@ def fast_synth_node(state, config=None, client=None):
     final_output straight from ocr_output/scene_context if it has already
     passed.
     """
-    _record(config, "fast_synth")
     if client is None:
         client = (config or {}).get("configurable", {}).get("client")
     return run_fast_synth(
@@ -158,7 +153,6 @@ def research_node(state, config=None, searcher=None, client=None):
     run_research, which skips the search+fetch entirely if it has already
     passed.
     """
-    _record(config, "research")
     configurable = (config or {}).get("configurable", {})
     if searcher is None:
         searcher = configurable.get("searcher")
@@ -191,7 +185,6 @@ def analysis_node(state, config=None, client=None):
     final_output straight from ocr_output/scene_context if it has already
     passed.
     """
-    _record(config, "analysis")
     configurable = (config or {}).get("configurable", {})
     if client is None:
         client = configurable.get("client")
@@ -232,7 +225,6 @@ def tts_node(state, config=None, provider=None, providers=None):
     but spoken" into total silence - exactly the failure this pipeline
     exists to avoid.
     """
-    _record(config, "tts")
     configurable = (config or {}).get("configurable", {})
     if providers is None:
         providers = configurable.get("tts_providers")
@@ -287,3 +279,37 @@ def build_graph():
     builder.add_edge("tts", END)
 
     return builder.compile()
+
+
+# Unconditional successor for every edge above EXCEPT the one out of
+# "vision" (a conditional edge, resolved by dynamic_router instead) and
+# "tts" (the last node - see next_node_after's END case below). Kept
+# literally next to build_graph()'s add_edge calls, which is the ONLY
+# reason this is safe to hand-maintain rather than deriving it from the
+# StateGraph itself: whoever changes an edge above must update this table
+# in the same diff, or next_node_after silently starts lying to callers
+# like clarif_eye.ui's per-node progress narration (issue #80 / P9.1).
+_UNCONDITIONAL_SUCCESSOR = {
+    "fast_synth": "tts",
+    "research": "analysis",
+    "analysis": "tts",
+}
+
+
+def next_node_after(node_name, state):
+    """The node that runs immediately after `node_name`, given `state` as
+    it stands once `node_name` has completed - or None if `node_name` is
+    the last node (tts) and nothing follows.
+
+    Single source of truth for this graph's topology, used by
+    clarif_eye.ui's per-node progress narration (issue #80 / P9.1) so it
+    never has to re-derive routing itself. The vision branch reuses
+    dynamic_router - the same function build_graph() wires as the actual
+    conditional edge - rather than re-reading state["complexity_flag"]
+    with separate logic that could drift from the real routing decision.
+    """
+    if node_name == "vision":
+        return dynamic_router(state)
+    if node_name == "tts":
+        return None
+    return _UNCONDITIONAL_SUCCESSOR[node_name]

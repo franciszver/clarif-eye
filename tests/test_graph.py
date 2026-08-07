@@ -5,9 +5,10 @@ filesystem). Tests assert on which nodes actually ran, not just on whether
 output ended up truthy - a truthy check would pass even if the routing
 were backwards.
 
-Node visitation is tracked via a mutable list passed through the run
-config's `configurable` dict (not through the state schema itself, which
-must contain exactly the 7 architecture-doc keys - see state.py).
+Node visitation is observed via graph.stream(..., stream_mode="updates")
+(issue #80 / P9.1), which yields one dict per COMPLETED node keyed by node
+name - see the `run()` helper below - rather than a caller-supplied trace
+list threaded through config["configurable"].
 """
 
 import pytest
@@ -15,6 +16,8 @@ import pytest
 from clarif_eye.client import CompletionResult
 from clarif_eye.graph import build_graph, dynamic_router, vision_node
 from clarif_eye.state import ClarifEyeState, make_initial_state
+
+from tests._stream_helpers import drain_stream_collecting_trace
 
 # vision_node now calls the real "eyes" ladder (see tests/test_vision.py for
 # the vision-specific behavior). The graph-shape tests below only care about
@@ -39,14 +42,15 @@ def _reply(ocr, scene):
 
 
 def run(graph, state, client=None, tts_provider=None):
-    trace = []
-    configurable = {"trace": trace}
+    """Assemble the configurable dict this file's tests need, then drain
+    the stream via the shared tests/_stream_helpers.py helper (issue #80 /
+    P9.1) - `visited` replaces the old trace-list config seam."""
+    configurable = {}
     if client is not None:
         configurable["client"] = client
     if tts_provider is not None:
         configurable["tts_provider"] = tts_provider
-    result = graph.invoke(state, config={"configurable": configurable})
-    return result, trace
+    return drain_stream_collecting_trace(graph, state, {"configurable": configurable})
 
 
 # Minimal fake for tts_node's provider seam (clarif_eye.tts) so tests that

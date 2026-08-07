@@ -33,6 +33,8 @@ from clarif_eye.graph import (
 )
 from clarif_eye.state import make_initial_state
 
+from tests._stream_helpers import drain_stream_collecting_trace
+
 
 def _reply(ocr, scene):
     return f"OCR_TEXT: {ocr}\nSCENE: {scene}"
@@ -170,12 +172,10 @@ def test_run_analysis_builds_from_known_state_when_deadline_exceeded():
 def test_graph_with_deadline_already_blown_still_produces_usable_output():
     graph = build_graph()
     state = make_initial_state("imgdata")
-    trace = []
     client = ExplosiveClient()
     searcher = ExplosiveSearcher()
     config = {
         "configurable": {
-            "trace": trace,
             "client": client,
             "searcher": searcher,
             "tts_provider": _FakeTtsProvider(),
@@ -183,7 +183,7 @@ def test_graph_with_deadline_already_blown_still_produces_usable_output():
         }
     }
 
-    result = graph.invoke(state, config=config)
+    result, trace = drain_stream_collecting_trace(graph, state, config)
 
     assert client.called_roles == []
     assert searcher.called is False
@@ -205,11 +205,9 @@ def test_graph_with_deadline_already_blown_still_produces_usable_output():
 def test_deadline_blown_midway_produces_output_from_known_state():
     graph = build_graph()
     state = make_initial_state("imgdata")
-    trace = []
     eyes_client = FakeEyesClient(_reply(LONG_OCR_TEXT, "a dense long document"))
     config = {
         "configurable": {
-            "trace": trace,
             "client": eyes_client,
             "searcher": SlowSearcher(delay=0.05),
             "tts_provider": _FakeTtsProvider(),
@@ -220,7 +218,7 @@ def test_deadline_blown_midway_produces_output_from_known_state():
         }
     }
 
-    result = graph.invoke(state, config=config)
+    result, trace = drain_stream_collecting_trace(graph, state, config)
 
     assert "vision" in trace
     assert "research" in trace
@@ -238,7 +236,6 @@ def test_deadline_blown_midway_produces_output_from_known_state():
 def test_generous_deadline_runs_full_quality_path_unskipped():
     graph = build_graph()
     state = make_initial_state("imgdata")
-    trace = []
 
     class RoleAwareClient:
         def __init__(self):
@@ -258,7 +255,6 @@ def test_generous_deadline_runs_full_quality_path_unskipped():
     client = RoleAwareClient()
     config = {
         "configurable": {
-            "trace": trace,
             "client": client,
             "searcher": SlowSearcher(delay=0.0),
             "tts_provider": _FakeTtsProvider(),
@@ -266,7 +262,7 @@ def test_generous_deadline_runs_full_quality_path_unskipped():
         }
     }
 
-    result = graph.invoke(state, config=config)
+    result, trace = drain_stream_collecting_trace(graph, state, config)
 
     assert client.calls == ["eyes", "brain"]
     assert "Full quality analysis" in result["final_output"]
@@ -277,7 +273,7 @@ def test_generous_deadline_runs_full_quality_path_unskipped():
 
 
 def test_no_deadline_key_present_calls_model_normally():
-    config = {"configurable": {"trace": []}}
+    config = {"configurable": {}}
     state = make_initial_state("imgdata")
     state["image_data"] = "imgdata"
 
@@ -295,7 +291,7 @@ def test_no_deadline_key_present_calls_model_normally():
 
 def test_vision_node_checks_deadline_itself():
     client = ExplosiveClient()
-    config = {"configurable": {"trace": [], "deadline": time.monotonic() - 1.0, "client": client}}
+    config = {"configurable": {"deadline": time.monotonic() - 1.0, "client": client}}
     state = make_initial_state("imgdata")
 
     result = vision_node(state, config=config)
@@ -308,7 +304,6 @@ def test_research_node_checks_deadline_itself():
     searcher = ExplosiveSearcher()
     config = {
         "configurable": {
-            "trace": [],
             "deadline": time.monotonic() - 1.0,
             "searcher": searcher,
             "research_client": None,
@@ -326,7 +321,7 @@ def test_research_node_checks_deadline_itself():
 
 def test_fast_synth_node_checks_deadline_itself():
     client = ExplosiveClient()
-    config = {"configurable": {"trace": [], "deadline": time.monotonic() - 1.0, "client": client}}
+    config = {"configurable": {"deadline": time.monotonic() - 1.0, "client": client}}
     state = make_initial_state("imgdata")
     state["ocr_output"] = "account 12345"
     state["scene_context"] = "a bill"
@@ -339,7 +334,7 @@ def test_fast_synth_node_checks_deadline_itself():
 
 def test_analysis_node_checks_deadline_itself():
     client = ExplosiveClient()
-    config = {"configurable": {"trace": [], "deadline": time.monotonic() - 1.0, "client": client}}
+    config = {"configurable": {"deadline": time.monotonic() - 1.0, "client": client}}
     state = make_initial_state("imgdata")
     state["ocr_output"] = "account 12345"
     state["scene_context"] = "a bill"
@@ -407,7 +402,7 @@ def test_analysis_node_reads_scraper_data_cap_from_config():
             pass
 
     client = RecordingClient()
-    config = {"configurable": {"trace": [], "client": client, "scraper_data_cap": 300}}
+    config = {"configurable": {"client": client, "scraper_data_cap": 300}}
     state = make_initial_state("imgdata")
     state["ocr_output"] = "ocr text"
     state["scene_context"] = "a scene"

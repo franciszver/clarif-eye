@@ -417,7 +417,7 @@ def test_full_compiled_graph_runs_end_to_end_on_fast_path_with_fake_client():
 
     result = graph.invoke(
         state,
-        config={"configurable": {"trace": [], "client": client, "tts_provider": _FakeTtsProvider()}},
+        config={"configurable": {"client": client, "tts_provider": _FakeTtsProvider()}},
     )
 
     assert result["complexity_flag"] is False

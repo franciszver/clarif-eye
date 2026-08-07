@@ -24,6 +24,8 @@ from clarif_eye.client import CompletionResult
 from clarif_eye.research import _derive_query, run_research
 from clarif_eye.state import make_initial_state
 
+from tests._stream_helpers import drain_stream_collecting_trace
+
 
 # --- Fakes -------------------------------------------------------------
 
@@ -417,19 +419,15 @@ def test_full_compiled_graph_runs_end_to_end_on_research_path_with_fakes():
 
     graph = build_graph()
     state = make_initial_state("base64data")
-    trace = []
+    config = {
+        "configurable": {
+            "client": vision_client,
+            "searcher": searcher,
+            "research_client": fetch_client,
+        }
+    }
 
-    result = graph.invoke(
-        state,
-        config={
-            "configurable": {
-                "trace": trace,
-                "client": vision_client,
-                "searcher": searcher,
-                "research_client": fetch_client,
-            }
-        },
-    )
+    result, trace = drain_stream_collecting_trace(graph, state, config)
 
     assert trace == ["vision", "research", "analysis", "tts"]
     assert result["scraper_data"] != ""

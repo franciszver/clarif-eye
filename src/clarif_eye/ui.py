@@ -55,7 +55,7 @@ from clarif_eye.failure_messages import (
     message_for_ladder_exhausted,
     message_for_terminal_error,
 )
-from clarif_eye.graph import DEFAULT_PIPELINE_BUDGET_SECONDS, build_graph
+from clarif_eye.graph import DEFAULT_PIPELINE_BUDGET_SECONDS, build_graph, next_node_after
 from clarif_eye.state import make_initial_state
 from clarif_eye.tts import DEFAULT_PROVIDER_CHAIN, is_chain_exhausted
 
@@ -396,6 +396,54 @@ STATUS_SUCCESS_AUDIO = "Description ready."
 # must say the text is a fallback, not just "ready".
 STATUS_SUCCESS_TEXT_ONLY = f"Description ready as text. {AUDIO_UNAVAILABLE_NOTE}"
 STATUS_DEGRADED = "Finished, but with a limited result. See the text below for details."
+
+# --- Per-node stream progress (issue #80 / P9.1) ----------------------------
+#
+# graph.invoke() used to be one opaque blocking call with no way to report
+# real progress, so STATUS_WORKING above was the only thing a screen reader
+# ever heard until the whole pipeline finished. graph.stream(...,
+# stream_mode="updates") (verified API on langgraph 1.2.10) yields one dict
+# per node the MOMENT it completes, keyed by node name - see
+# _run_pipeline_events below for how that's turned into these phrases.
+#
+# TIMING HONESTY: stream_mode="updates" tells you when a node COMPLETED,
+# never when one STARTED - there is no "X has begun" event to hook a
+# narration onto. What IS true and knowable without fabricating an observed
+# start: the instant one node's completion chunk arrives, its SUCCESSOR
+# (clarif_eye.graph.next_node_after) is exactly what begins next - so each
+# phrase below is announced for whatever node comes after the one that just
+# finished, never for the node currently running. This has one consequence
+# worth stating explicitly: vision - the entry node, nothing precedes it in
+# the stream - never gets a dedicated phrase of its own, because nothing
+# ever completes to trigger one. STATUS_WORKING above already tells the
+# user their photo was received and is being read, so nothing is lost by
+# not restating it a moment later. tts - the last node - is exactly the
+# opposite case: it DOES get announced (as the successor of fast_synth/
+# analysis), but next_node_after("tts", ...) returns None, so nothing is
+# ever announced AFTER it; the pipeline's actual completion is reported
+# separately, by status_for_result once the whole run is done.
+STATUS_NODE_RESEARCH = "Looking it up."
+# Shared by fast_synth and analysis - both are "the model is writing the
+# spoken script now", the honest description of either node from the
+# outside, and the issue's own phrase mapping treats them as one narration
+# step rather than inventing a distinction a screen-reader user gains
+# nothing from.
+STATUS_NODE_WRITING = "Writing the description."
+STATUS_NODE_TTS = "Turning it into speech."
+
+# node name -> spoken phrase, for whichever node clarif_eye.graph.
+# next_node_after names as coming next. This is the ONLY topology
+# knowledge ui.py keeps - which node a name maps to in words; WHICH node
+# runs next (the graph's edges/routing) lives entirely in next_node_after,
+# the single source of truth build_graph() itself uses. No "vision" key:
+# vision is never anyone's successor (it's the entry node), so a phrase
+# for it would be unreachable dead code, not just unused.
+_NODE_PHRASE = {
+    "research": STATUS_NODE_RESEARCH,
+    "fast_synth": STATUS_NODE_WRITING,
+    "analysis": STATUS_NODE_WRITING,
+    "tts": STATUS_NODE_TTS,
+}
 
 # Gradio has no native aria-live prop (as of 6.22.0), so a minimal,
 # commented JS shim marks the status control's wrapper as a polite live
@@ -834,41 +882,50 @@ def _encode_image(image):
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def handle_submit(image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUDGET_SECONDS):
-    """Run one photo through the graph; return (audio_path_or_None, text).
+def _run_pipeline_events(image, resources, pipeline_budget_seconds):
+    """Generator: the ONE place that knows how to run a photo through the
+    pipeline - guards, the image cache, graph execution, and the
+    exception/outcome mapping.
 
-    NEVER raises (except KeyboardInterrupt/SystemExit) - every failure
-    mode returns a spoken-ready message instead, per the module docstring.
-    `resources` is an AppResources built once by build_resources() and
-    passed through unchanged on every call, so the shared client/provider
-    chain/searcher are injected identically on every request.
+    Yields ("status", phrase) once per completed graph node, followed by
+    exactly one final ("outcome", (audio_path_or_None, text)) item.
+    handle_submit drains this and returns only that last item, so its
+    return-tuple contract is unchanged; handle_submit_staged consumes it
+    directly so each ("status", ...) item can become its own live yield
+    WHILE the graph is still running - the whole point of streaming. Every
+    graph injected here - the real one from build_graph(), and every test
+    double that stands in for it - is expected to implement .stream(...,
+    stream_mode="updates"); there is no invoke()-only fallback, so an
+    incompatible double fails loudly (AttributeError) instead of silently
+    losing all narration.
 
-    `pipeline_budget_seconds` (issue #17 / P6.1) sets the total-pipeline
-    deadline (see clarif_eye.graph's module docstring "Total-pipeline
-    deadline"): an absolute time.monotonic() timestamp computed fresh for
-    THIS request, `time.monotonic() + pipeline_budget_seconds`, and passed
-    through config["configurable"]["deadline"] - never a shared/reused
-    value, since each request needs its own clock start. Defaults to
-    graph.DEFAULT_PIPELINE_BUDGET_SECONDS but is overridable per call
-    (e.g. by scripts/benchmark_pipeline.py sweeping it).
+    NEVER raises (except KeyboardInterrupt/SystemExit) - every failure mode
+    yields a spoken-ready message instead, per the module docstring. The
+    try/except below wraps the ENTIRE graph-stream consumption (issue #80 /
+    P9.1): with graph.stream() an exception can surface mid-iteration, not
+    just from a single invoke() call, so the same discipline has to cover
+    the whole loop, not just its start.
     """
     if image is None:
-        return None, NO_IMAGE_MESSAGE
+        yield "outcome", (None, NO_IMAGE_MESSAGE)
+        return
 
     if resources.client is None:
-        return None, resources.client_error or CONFIG_ERROR_MESSAGE
+        yield "outcome", (None, resources.client_error or CONFIG_ERROR_MESSAGE)
+        return
 
     try:
         image_data = _encode_image(image)
     except Exception:
-        return None, UNREADABLE_IMAGE_MESSAGE
+        yield "outcome", (None, UNREADABLE_IMAGE_MESSAGE)
+        return
 
     # Issue #75: key on a hash of the DECODED image content (never the
     # upload path/filename - the same photo uploaded twice arrives at a
     # different temp path each time), so a repeat photo costs no quota. A
-    # hit returns the exact same (audio_path, text) a miss would have
-    # produced, so handle_submit_staged (which calls this) stages a hit
-    # identically to a miss - it has no idea whether this was cached.
+    # hit yields no "status" events at all - see this module's top-level
+    # "hits bypass the graph" docstring note - so handle_submit_staged
+    # stages a hit exactly like it did before streaming existed.
     cache_key = _image_content_key(image_data)
     cached = resources.image_cache.get(cache_key)
     if cached is not None:
@@ -881,7 +938,8 @@ def handle_submit(image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUD
         # screen. Treat a missing file as a miss: drop the stale entry and
         # fall through to run the pipeline for real.
         if not cached_audio_path or os.path.exists(cached_audio_path):
-            return cached
+            yield "outcome", cached
+            return
         resources.image_cache.discard(cache_key)
 
     try:
@@ -895,7 +953,18 @@ def handle_submit(image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUD
                 "deadline": time.monotonic() + pipeline_budget_seconds,
             }
         }
-        result = resources.graph.invoke(state, config=config)
+        graph = resources.graph
+        result = dict(state)
+        for chunk in graph.stream(state, config=config, stream_mode="updates"):
+            for node_name, update in chunk.items():
+                result.update(update)
+                # next_node_after is the single source of truth for this
+                # graph's topology (clarif_eye.graph, right next to
+                # build_graph()'s edges) - this module only supplies the
+                # WORDING for whatever node it names.
+                next_node = next_node_after(node_name, result)
+                if next_node is not None:
+                    yield "status", _NODE_PHRASE[next_node]
     except LadderExhaustedError as exc:
         # Every node already catches and degrades this internally (see
         # vision.py/synth.py/analysis.py); this branch only matters if the
@@ -905,11 +974,14 @@ def handle_submit(image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUD
         # collapsing into the generic UNEXPECTED_ERROR_MESSAGE below. Not
         # cached (issue #75): a quota/API failure must never be replayed
         # to the next visitor as if it were that photo's own answer.
-        return None, message_for_ladder_exhausted(exc)
+        yield "outcome", (None, message_for_ladder_exhausted(exc))
+        return
     except OpenRouterError as exc:
-        return None, message_for_terminal_error(exc)
+        yield "outcome", (None, message_for_terminal_error(exc))
+        return
     except Exception:
-        return None, UNEXPECTED_ERROR_MESSAGE
+        yield "outcome", (None, UNEXPECTED_ERROR_MESSAGE)
+        return
 
     final_output = (result.get("final_output") or "").strip()
     audio_path = result.get("audio_file_path") or ""
@@ -936,6 +1008,37 @@ def handle_submit(image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUD
     # outcome is left to retry next time.
     if audio_path:
         resources.image_cache.put(cache_key, outcome)
+    yield "outcome", outcome
+
+
+def handle_submit(image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUDGET_SECONDS):
+    """Run one photo through the graph; return (audio_path_or_None, text).
+
+    NEVER raises (except KeyboardInterrupt/SystemExit) - every failure
+    mode returns a spoken-ready message instead, per the module docstring.
+    `resources` is an AppResources built once by build_resources() and
+    passed through unchanged on every call, so the shared client/provider
+    chain/searcher are injected identically on every request.
+
+    `pipeline_budget_seconds` (issue #17 / P6.1) sets the total-pipeline
+    deadline (see clarif_eye.graph's module docstring "Total-pipeline
+    deadline"): an absolute time.monotonic() timestamp computed fresh for
+    THIS request, `time.monotonic() + pipeline_budget_seconds`, and passed
+    through config["configurable"]["deadline"] - never a shared/reused
+    value, since each request needs its own clock start. Defaults to
+    graph.DEFAULT_PIPELINE_BUDGET_SECONDS but is overridable per call
+    (e.g. by scripts/benchmark_pipeline.py sweeping it).
+
+    All the actual work lives in _run_pipeline_events (issue #80 / P9.1) so
+    handle_submit_staged can share it and turn its "status" events into
+    live per-node progress yields; this just drains the generator and
+    returns its final ("outcome", ...) item, ignoring any "status" events -
+    same return-tuple contract as before streaming existed.
+    """
+    outcome = (None, UNEXPECTED_ERROR_MESSAGE)
+    for kind, payload in _run_pipeline_events(image, resources, pipeline_budget_seconds):
+        if kind == "outcome":
+            outcome = payload
     return outcome
 
 
@@ -947,26 +1050,41 @@ def handle_submit_staged(image, resources, pipeline_budget_seconds=DEFAULT_PIPEL
     Gradio streams each yield straight to the UI as it's produced, which is
     what lets the live region announce progress at all.
 
-    STAGING: graph.invoke() is one synchronous, blocking call with no
-    intermediate progress hook (see graph.py), so there is no real
-    per-node progress to report without a larger restructure of the graph
-    itself - and inventing fake percentages was explicitly ruled out.
-    Instead this yields up to three times: once immediately with an honest
-    "received and working, up to about 30 seconds" message
-    (submission-received and still-working collapsed into one
-    announcement, since nothing observable happens between them); once
-    more when the blocking call returns, with the final status AND
-    description text but NO audio yet, so a screen-reader user can read
-    the answer immediately; and, only when audio was actually produced,
-    once more after a short delay with the SAME status/text plus the audio
-    path, so Gradio only mounts the (autoplaying) player once the
-    completion status has had time to be spoken - see AUDIO_PLAY_DELAY_MS's
-    comment for why this replaced an earlier, broken JS-only attempt at the
-    same gap. A screen reader hears each yield in order via
-    aria-live="polite" on the status control.
+    STAGING (issue #80 / P9.1 - real per-node progress): the first yield
+    is always the honest "received and working, up to about 30 seconds"
+    message (submission-received and still-working collapsed into one
+    announcement, since nothing has run yet - this doubles as vision's own
+    "now reading the photo" announcement, since nothing ever completes to
+    trigger a dedicated one for the entry node - see STATUS_NODE_* above).
+    Then, for every graph node that completes and HAS a successor,
+    _run_pipeline_events yields its own "status" event (see STATUS_NODE_*
+    / _NODE_PHRASE above and clarif_eye.graph.next_node_after for the
+    phrase mapping and the timing-honesty reasoning), which is forwarded
+    here as its own live yield - so a screen reader hears "Looking it up"
+    or "Writing the description", then "Turning it into speech", as each
+    stage actually finishes, instead of one silent wait. A cache hit, an
+    early failure (no image, missing client, unreadable image), or a test
+    double whose graph reports its whole run as one opaque completion
+    (see FakeGraph's own docstring in tests/test_ui.py) produces no
+    "status" events at all, so those cases still yield only the three
+    tuples this function always ended with. Once the pipeline's final
+    outcome arrives, the last two yields are unchanged from before
+    streaming existed: the final status AND description text but NO audio
+    yet, so a screen-reader user can read the answer immediately; and,
+    only when audio was actually produced, once more after a short delay
+    with the SAME status/text plus the audio path, so Gradio only mounts
+    the (autoplaying) player once the completion status has had time to be
+    spoken - see AUDIO_PLAY_DELAY_MS's comment for why this replaced an
+    earlier, broken JS-only attempt at the same gap. A screen reader hears
+    each yield in order via aria-live="polite" on the status control.
     """
     yield STATUS_WORKING, None, ""
-    audio_path, text = handle_submit(image, resources, pipeline_budget_seconds)
+    audio_path, text = None, ""
+    for kind, payload in _run_pipeline_events(image, resources, pipeline_budget_seconds):
+        if kind == "status":
+            yield payload, None, ""
+        else:
+            audio_path, text = payload
     status = status_for_result(audio_path, is_chain_exhausted())
     if not audio_path:
         yield status, audio_path, text
