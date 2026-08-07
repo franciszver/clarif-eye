@@ -121,6 +121,13 @@ SCENARIOS = [
         "mock_test_modules": [
             "tests/test_ui.py",
             "tests/test_accessibility.py",
+            # Issue #82 / P9.3: drives clarif_eye.ui.handle_ask_staged with
+            # a recording fake client and a fake TTS provider. Paired with
+            # the SAME scenario script, which now takes an optional
+            # follow-up question and runs photo-then-question on one
+            # thread_id against the live stack - see its docstring for what
+            # that round trip proves and what it cannot.
+            "tests/test_followup.py",
         ],
         "scenario_paths": [
             "scripts/ui_smoke.py",

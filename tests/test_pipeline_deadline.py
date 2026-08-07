@@ -22,12 +22,13 @@ hardcoded 4000.
 
 import time
 
-from clarif_eye import analysis, research, synth, vision
+from clarif_eye import analysis, followup, research, synth, vision
 from clarif_eye.client import CompletionResult
 from clarif_eye.graph import (
     analysis_node,
     build_graph,
     fast_synth_node,
+    followup_node,
     research_node,
     vision_node,
 )
@@ -142,6 +143,28 @@ def test_run_fast_synth_builds_from_known_state_when_deadline_exceeded():
     client = ExplosiveClient()
     result = synth.run_fast_synth(
         "account 12345 balance $9.00", "a bill", client=client, deadline_exceeded=True
+    )
+
+    assert client.called_roles == []
+    final_output = result["final_output"]
+    assert final_output != ""
+    assert "12345" in final_output or "9.00" in final_output
+
+
+def test_run_followup_builds_from_known_state_when_deadline_exceeded():
+    # Same contract as run_fast_synth/run_analysis above: with the budget
+    # already spent, no brain call is made and the answer is built from the
+    # ocr/scene this thread already has. Deliberately asserts the OCR text
+    # reaches the output - degrading to a generic "ran out of time" message
+    # would throw away real, already-captured state the question was
+    # probably about.
+    client = ExplosiveClient()
+    result = followup.run_followup(
+        "account 12345 balance $9.00",
+        "a bill",
+        "what is the balance?",
+        client=client,
+        deadline_exceeded=True,
     )
 
     assert client.called_roles == []
@@ -344,6 +367,27 @@ def test_analysis_node_checks_deadline_itself():
 
     assert client.called_roles == []
     assert result["final_output"] != ""
+
+
+def test_followup_node_checks_deadline_itself():
+    # The node-level half of the pair above: followup_node must read the
+    # deadline off config and pass it down, not leave run_followup to find
+    # out on its own. Hardcoding deadline_exceeded=False in followup_node
+    # survives every other test in the suite, so this is the one that
+    # catches it.
+    client = ExplosiveClient()
+    config = {"configurable": {"deadline": time.monotonic() - 1.0, "client": client}}
+    state = {
+        "ocr_output": "account 12345",
+        "scene_context": "a bill",
+        "question": "what is the balance?",
+    }
+
+    result = followup_node(state, config=config)
+
+    assert client.called_roles == []
+    assert result["final_output"] != ""
+
 
 
 # --- CHECK E: the scraped-context cap is config-driven ---------------------

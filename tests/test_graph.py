@@ -81,6 +81,11 @@ def test_make_initial_state_has_every_key_with_correct_types():
     assert state["final_output"] == ""
     assert state["audio_file_path"] == ""
     assert state["messages"] == []
+    # None, not "" (issue #82 / P9.3): None means "this is a photo run, not
+    # a question", and a photo run seeding it explicitly is what RESETS a
+    # question left over from the previous turn on a checkpointed thread -
+    # see state.py's ClarifEyeState.question comment.
+    assert state["question"] is None
 
     expected_keys = {
         "image_data",
@@ -91,6 +96,7 @@ def test_make_initial_state_has_every_key_with_correct_types():
         "final_output",
         "audio_file_path",
         "messages",
+        "question",
     }
     assert set(state.keys()) == expected_keys
 
@@ -105,6 +111,7 @@ def test_state_typeddict_has_exactly_the_expected_keys():
         "final_output",
         "audio_file_path",
         "messages",
+        "question",
     }
 
 
@@ -170,8 +177,98 @@ def test_full_graph_routes_using_node_owned_complexity_flag_not_caller_value():
     result, trace = run(graph, state, client=client)
 
     assert result["complexity_flag"] is True
-    assert trace == ["vision", "research", "analysis", "tts"]
+    assert trace == ["entry", "vision", "research", "analysis", "tts"]
     assert "fast_synth" not in trace
+
+
+# --- entry_node: the Command(goto) mechanism (issue #82 / P9.3) -----------
+#
+# This graph uses BOTH of LangGraph's routing mechanisms on purpose, each
+# where it fits (see clarif_eye.graph's "TWO ROUTING MECHANISMS" docstring
+# block). The conditional edge out of `vision` is already covered by the
+# dynamic_router tests and the two path-trace tests above; these cover the
+# other one. The assertion is on the Command OBJECT, not just on where the
+# run ended up, so replacing the mechanism with a conditional edge that
+# happens to route the same way would fail here rather than pass silently.
+
+
+def test_entry_node_routes_with_a_command_not_a_returned_state_update():
+    from langgraph.types import Command
+
+    from clarif_eye.graph import entry_node
+
+    photo_run = entry_node({"question": None})
+    assert isinstance(photo_run, Command)
+    assert photo_run.goto == "vision"
+
+    question_run = entry_node({"question": "what is the expiry date?"})
+    assert isinstance(question_run, Command)
+    assert question_run.goto == "followup"
+
+
+def test_entry_node_treats_a_blank_question_as_a_photo_run():
+    # Truthiness, not `is not None`: a blank question is not a question, and
+    # routing one to `followup` would ask a model to answer nothing.
+    from clarif_eye.graph import entry_destination
+
+    assert entry_destination({"question": "   "}) == "vision"
+    # A never-checkpointed thread's state has no `question` key at all -
+    # absent must behave like None, not raise.
+    assert entry_destination({}) == "vision"
+
+
+def test_entry_destination_raises_a_named_type_error_on_a_non_string_question():
+    # Same discipline dynamic_router applies to complexity_flag: without an
+    # explicit check this would be a bare AttributeError from .strip(),
+    # raised deep inside a node with nothing naming the key or the value.
+    from clarif_eye.graph import entry_destination
+
+    with pytest.raises(TypeError) as excinfo:
+        entry_destination({"question": 42})
+    assert "question" in str(excinfo.value)
+
+    with pytest.raises(TypeError):
+        entry_destination({"question": ["what is the expiry date?"]})
+
+
+# --- next_node_after: unknown stream keys must not crash narration --------
+#
+# clarif_eye.ui's narration iterates over whatever keys LangGraph's stream
+# produces, and those are not all node names - LangGraph emits RESERVED keys
+# too. "__interrupt__" is the concrete one arriving with issue #83
+# (human-in-the-loop interrupts). A KeyError from this shared code would
+# take down a run whose answer had already been computed, so an unknown name
+# degrades to "no narration for this step" instead.
+
+
+def test_next_node_after_returns_none_for_an_unknown_stream_key():
+    from clarif_eye.graph import next_node_after
+
+    assert next_node_after("__interrupt__", {}) is None
+    assert next_node_after("not_a_real_node_name", {}) is None
+
+
+def test_a_question_run_skips_vision_entirely():
+    from clarif_eye.client import CompletionResult
+
+    class _AnsweringClient:
+        def complete(self, role, messages, **params):
+            return CompletionResult(content="It says next April.", model="fake-brain-model:free")
+
+    graph = build_graph()
+    # A PARTIAL state, exactly what clarif_eye.ui._run_followup_events
+    # passes for a follow-up: the question plus whatever the thread already
+    # had. No image_data at all - if the run reached vision_node it would
+    # raise KeyError, so this also proves vision is genuinely skipped.
+    state = {
+        "ocr_output": "best before next April",
+        "scene_context": "a jar of jam",
+        "question": "what is the expiry date?",
+    }
+
+    _, trace = run(graph, state, client=_AnsweringClient(), tts_provider=_FakeTtsProvider())
+
+    assert trace == ["entry", "followup", "tts"]
 
 
 # --- Graph: end-to-end -----------------------------------------------------
@@ -221,7 +318,7 @@ def test_fast_path_visits_vision_fast_synth_tts_only():
 
     _, trace = run(graph, state, client=client)
 
-    assert trace == ["vision", "fast_synth", "tts"]
+    assert trace == ["entry", "vision", "fast_synth", "tts"]
     assert "research" not in trace
     assert "analysis" not in trace
 
@@ -239,5 +336,5 @@ def test_research_path_visits_vision_research_analysis_tts_only():
 
     _, trace = run(graph, state, client=client)
 
-    assert trace == ["vision", "research", "analysis", "tts"]
+    assert trace == ["entry", "vision", "research", "analysis", "tts"]
     assert "fast_synth" not in trace
