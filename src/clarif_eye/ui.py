@@ -765,43 +765,72 @@ def status_for_result(audio_path, chain_exhausted):
 IMAGE_CACHE_MAX_ENTRIES = 20
 
 
-class ImageResultCache:
-    """Tiny in-memory LRU cache from image-content hash -> (audio_path,
-    text) result, bounded to IMAGE_CACHE_MAX_ENTRIES entries.
+class _BoundedLRU:
+    """Shared bounded-LRU machinery: OrderedDict + lock + move_to_end +
+    conditional popitem, bounded to `max_entries`. ImageResultCache
+    (issue #75) and ThreadRegistry (issue #81 / P9.2) both need exactly
+    this - the same lock/eviction sequence duplicated in two classes would
+    be one more place to get subtly wrong (e.g. only one of them staying
+    thread-safe after a future edit). `on_evict(key, value)`, if given, is
+    called with the evicted (key, value) pair OUTSIDE the lock (never
+    while holding it, so an evict callback that itself takes time - e.g.
+    ThreadRegistry's checkpointer.delete_thread - can't create lock
+    contention or reentrancy issues).
 
-    Only successful results are ever stored here (see handle_submit) - a
-    quota/API failure must never be replayed to the next visitor as if it
-    were that photo's own answer.
-
-    Guarded by a single lock: Gradio serves requests from a thread pool,
-    and put()'s assign / move_to_end / conditional popitem sequence is not
-    atomic, so without one the size bound could be transiently exceeded
-    under concurrent access. One plain (non-reentrant) lock around each
-    method's compound operation - nothing fancier.
+    Guarded by a single (plain, non-reentrant) lock: Gradio serves
+    requests from a thread pool, and the assign / move_to_end /
+    conditional popitem sequence below is not atomic, so without one the
+    size bound could be transiently exceeded under concurrent access.
     """
 
-    def __init__(self, max_entries=IMAGE_CACHE_MAX_ENTRIES):
+    def __init__(self, max_entries, on_evict=None):
         self._max_entries = max_entries
+        self._on_evict = on_evict
         self._entries = OrderedDict()
         self._lock = threading.Lock()
 
-    def get(self, key):
+    def _get(self, key):
         with self._lock:
             if key not in self._entries:
                 return None
             self._entries.move_to_end(key)
             return self._entries[key]
 
-    def put(self, key, value):
+    def _touch(self, key, value=None):
+        evicted = None
         with self._lock:
             self._entries[key] = value
             self._entries.move_to_end(key)
             if len(self._entries) > self._max_entries:
-                self._entries.popitem(last=False)
+                evicted = self._entries.popitem(last=False)
+        if evicted is not None and self._on_evict is not None:
+            self._on_evict(*evicted)
 
-    def discard(self, key):
+    def _discard(self, key):
         with self._lock:
             self._entries.pop(key, None)
+
+
+class ImageResultCache(_BoundedLRU):
+    """Tiny in-memory LRU cache from image-content hash -> (audio_path,
+    text) result, bounded to IMAGE_CACHE_MAX_ENTRIES entries.
+
+    Only successful results are ever stored here (see handle_submit) - a
+    quota/API failure must never be replayed to the next visitor as if it
+    were that photo's own answer.
+    """
+
+    def __init__(self, max_entries=IMAGE_CACHE_MAX_ENTRIES):
+        super().__init__(max_entries)
+
+    def get(self, key):
+        return self._get(key)
+
+    def put(self, key, value):
+        self._touch(key, value)
+
+    def discard(self, key):
+        self._discard(key)
 
 
 # --- Thread registry (issue #81 / P9.2) -------------------------------------
@@ -821,7 +850,14 @@ class ImageResultCache:
 # multiplied across many live threads is a real memory hazard, not a
 # theoretical one. That is why THREADS themselves are capped here, not just
 # the messages list within one thread (see state.py's MAX_MESSAGES_PER_THREAD
-# for the complementary per-thread bound).
+# for the complementary per-thread bound) - AND why a single thread's OWN
+# checkpoint history is separately trimmed after every completed run (see
+# _trim_thread_to_latest_checkpoint below): capping thread COUNT alone does
+# nothing for a single long-lived thread that keeps getting invoked, and
+# capping messages alone does nothing about the checkpointer's own
+# unpruned per-invoke history (measured: ~134KB/invoke with a 50KB image,
+# 8MB after 10 invokes with a 400KB image, all on ONE thread, before this
+# fix - see _trim_thread_to_latest_checkpoint's own comment).
 #
 # CAP CHOICE: MAX_LIVE_THREADS=20, matching IMAGE_CACHE_MAX_ENTRIES above -
 # "a double-digit number of concurrent demo sessions" is a reasonable size
@@ -833,7 +869,7 @@ class ImageResultCache:
 MAX_LIVE_THREADS = 20
 
 
-class ThreadRegistry:
+class ThreadRegistry(_BoundedLRU):
     """Tracks minted thread_ids LRU-style (by last-touched time, not
     creation time), bounded to `max_threads`. When a touch would push the
     registry over that bound, the LEAST-recently-touched thread_id is
@@ -842,26 +878,135 @@ class ThreadRegistry:
     langgraph.checkpoint.memory.InMemorySaver in langgraph 1.2.10 (see
     build_resources()'s comment) - so eviction here actually frees the
     checkpointer's memory, not just this registry's own bookkeeping.
-
-    Guarded by a single lock, same discipline as ImageResultCache above:
-    Gradio serves requests from a thread pool, so the touch/evict sequence
-    below is not safe to leave unguarded under concurrent access.
     """
 
     def __init__(self, checkpointer, max_threads=MAX_LIVE_THREADS):
+        super().__init__(max_threads, on_evict=self._evict)
         self._checkpointer = checkpointer
-        self._max_threads = max_threads
-        self._ids = OrderedDict()
-        self._lock = threading.Lock()
+
+    def _evict(self, thread_id, _value):
+        if self._checkpointer is not None:
+            self._checkpointer.delete_thread(thread_id)
 
     def touch(self, thread_id):
-        with self._lock:
-            self._ids[thread_id] = None
-            self._ids.move_to_end(thread_id)
-            if len(self._ids) > self._max_threads:
-                oldest, _ = self._ids.popitem(last=False)
-                if self._checkpointer is not None:
-                    self._checkpointer.delete_thread(oldest)
+        self._touch(thread_id)
+
+
+# --- Per-thread checkpoint trimming (issue #81 / P9.2, measured defect) -----
+#
+# MEASURED: InMemorySaver.put() (langgraph/checkpoint/memory/__init__.py)
+# writes a NEW checkpoint entry into self.storage and new blob entries into
+# self.blobs on every single node completion, for every invoke - and NEVER
+# prunes the old ones. Confirmed empirically (see this issue's own report):
+# ~134KB/invoke with a 50KB image, 8MB after 10 invokes with a 400KB image,
+# all on ONE thread. Neither MAX_MESSAGES_PER_THREAD (state.py, bounds only
+# the `messages` key) nor MAX_LIVE_THREADS above (bounds only the number of
+# DIFFERENT threads) touches this - a single thread invoked repeatedly grows
+# without either of those caps ever engaging.
+#
+# THE FIX: after every COMPLETED run on a thread, trim that thread's stored
+# history down to just its newest checkpoint (per checkpoint_ns) - the only
+# one get_state()/a future invoke can ever need. InMemorySaver has NO public
+# API for this (delete_thread removes a thread entirely, not selectively) -
+# this function deliberately reaches into InMemorySaver's two internal dicts
+# (`storage`, `writes`, `blobs`; see langgraph.checkpoint.memory.InMemorySaver
+# for their documented shapes) because there is no supported alternative.
+# That is a real coupling to memory-checkpointer internals, so
+# test_checkpointing.py pins the assumption: a test asserts
+# InMemorySaver instances expose exactly these three attributes in exactly
+# this shape, and FAILS LOUDLY (not silently no-ops) if a langgraph upgrade
+# changes it, rather than this function silently stopping to trim anything.
+#
+# EMPIRICALLY VERIFIED (see this issue's report): after trimming,
+# checkpoint/write/blob counts for the trimmed thread stay FLAT across
+# repeated invokes (not growing), graph.get_state() still returns the
+# accumulated `messages` list and the latest run's scalar keys, and a
+# further invoke on the SAME thread still works and keeps accumulating.
+#
+# ONLY safe after a run has fully COMPLETED. A future interrupted run
+# (issue #83, upcoming - human-in-the-loop interrupts) will have a PENDING
+# checkpoint that is not the "final" one for that turn - resuming from it
+# requires the checkpoint chain interrupts rely on. Trimming down to "the
+# newest checkpoint" during an interrupt would not lose correctness (the
+# newest checkpoint IS the pending one), but issue #83 must re-examine this
+# function's call site (currently only _run_pipeline_events, only after a
+# run reaches its final outcome) before introducing any code path that
+# checkpoints mid-run without going through a full graph.stream() to
+# completion.
+def _trim_thread_to_latest_checkpoint(checkpointer, thread_id):
+    """Delete every checkpoint/write/blob for `thread_id` except what its
+    newest checkpoint (per checkpoint_ns) still references.
+
+    No-op if `checkpointer` is None (an uncheckpointed graph - see
+    build_graph's `checkpointer` param) or if `thread_id` has no stored
+    checkpoints yet (nothing to trim). Never raises: this is memory
+    housekeeping, not something a photo's own outcome should ever depend
+    on - a trim that failed for any reason should leave the (larger, but
+    still correct) untrimmed history in place rather than take down a run.
+    """
+    if checkpointer is None:
+        return
+    try:
+        thread_storage = checkpointer.storage.get(thread_id)
+        if not thread_storage:
+            return
+        for checkpoint_ns, ns_checkpoints in thread_storage.items():
+            if not ns_checkpoints:
+                continue
+            # Checkpoint IDs sort lexicographically by creation order - the
+            # SAME assumption InMemorySaver.get_tuple() itself relies on
+            # (`checkpoint_id = max(checkpoints.keys())` for "give me the
+            # latest checkpoint when none is specified"), not a new one
+            # introduced here.
+            latest_id = max(ns_checkpoints.keys())
+            checkpoint_bytes, metadata_bytes, _old_parent = ns_checkpoints[latest_id]
+            checkpoint = checkpointer.serde.loads_typed(checkpoint_bytes)
+            live_versions = checkpoint.get("channel_versions", {})
+
+            for old_id in [cid for cid in ns_checkpoints if cid != latest_id]:
+                del ns_checkpoints[old_id]
+                checkpointer.writes.pop((thread_id, checkpoint_ns, old_id), None)
+            # The retained checkpoint's parent no longer exists - clear the
+            # link rather than leave it dangling at a checkpoint_id that
+            # was just deleted.
+            ns_checkpoints[latest_id] = (checkpoint_bytes, metadata_bytes, None)
+
+            for blob_key in [
+                k for k in checkpointer.blobs if k[0] == thread_id and k[1] == checkpoint_ns
+            ]:
+                _t, _ns, channel, version = blob_key
+                if live_versions.get(channel) != version:
+                    del checkpointer.blobs[blob_key]
+    except Exception:
+        # Housekeeping only - see docstring. Never swallows
+        # KeyboardInterrupt/SystemExit (BaseException, not Exception), the
+        # same contract every node in this pipeline already follows.
+        pass
+
+
+def thread_configurable(resources, thread_id):
+    """The ONE chokepoint for every thread-scoped call into
+    resources.graph (issue #81 / P9.2). Touches resources.thread_registry
+    (if configured) so the live-thread LRU bound (MAX_LIVE_THREADS above)
+    stays accurate, and returns the config["configurable"] entries a
+    thread-scoped call needs - currently just {"thread_id": thread_id}.
+
+    Returns {} when `thread_id` is None, so callers can unconditionally
+    `configurable.update(thread_configurable(resources, thread_id))`
+    without an extra branch, and the uncheckpointed/no-thread_id case
+    (every existing test/caller) is unaffected.
+
+    FUTURE CALL SITES MUST GO THROUGH THIS, not resources.thread_registry
+    directly: #82 (follow-ups) and #83 (interrupts) will add more places
+    that invoke or otherwise touch a thread-scoped graph call, and a
+    registry that only some of them remember to touch would silently stop
+    bounding the live-thread count for the call sites that forgot.
+    """
+    if thread_id is None:
+        return {}
+    if resources.thread_registry is not None:
+        resources.thread_registry.touch(thread_id)
+    return {"thread_id": thread_id}
 
 
 def _image_content_key(image_data):
@@ -911,20 +1056,25 @@ def build_resources():
     "construct once at startup" discipline this function already follows
     for the client/tts/searcher). HONEST LIMITS, stated here because this
     is where a reader would look for them, not left to be discovered in
-    production:
+    production - this app deploys on Render (see render.yaml), not
+    Hugging Face Spaces:
       - InMemorySaver keeps every checkpoint in this PROCESS's own memory -
         nothing is written to disk or any external store. A process
-        restart (a redeploy, a crash, Hugging Face Spaces restarting the
-        container) loses every thread's history. This is fine for this
-        issue's scope (state surviving a run within one session) and is
-        never described to the user as more durable than that - no
-        user-facing text in this app claims otherwise.
-      - A free Hugging Face Space sleeps after ~15 minutes of no traffic;
-        waking it starts a NEW process, so the same loss happens on every
-        cold start a visitor's return happens to trigger.
-      - See ThreadRegistry / MAX_LIVE_THREADS above for how the number of
-        live threads (and, in turn, the checkpointer's own memory use) is
-        bounded while the process IS running.
+        restart (a redeploy, a crash, Render restarting the container)
+        loses every thread's history. This is fine for this issue's scope
+        (state surviving a run within one session) and is never described
+        to the user as more durable than that - no user-facing text in
+        this app claims otherwise.
+      - Render's free tier spins the service down after ~15 minutes of no
+        traffic (see README.md / docs/ACCESSIBILITY.md's "cold-start
+        loading page" note); waking it back up starts a NEW process, so
+        the same loss happens on every cold start a visitor's return
+        happens to trigger.
+      - See ThreadRegistry / MAX_LIVE_THREADS and
+        _trim_thread_to_latest_checkpoint above for how both the number of
+        live threads AND each thread's own unpruned checkpoint history
+        (measured defect - see that function's comment) are bounded while
+        the process IS running.
     Every existing caller of build_graph() with no arguments, and every
     test in this repo that builds an AppResources directly instead of via
     this function, is unaffected: build_graph()'s `checkpointer` param
@@ -1009,13 +1159,30 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
     exactly today's behavior for every caller that doesn't pass one (the
     entire existing test fleet, which drives an uncheckpointed
     resources.graph). build_interface (below) mints one gr.State per
-    browser session and threads it through here; when it's not None, this
-    function (a) registers it with resources.thread_registry, if one is
+    browser session and threads it through here; when it's not None,
+    thread_configurable(resources, thread_id) is the ONE chokepoint used
+    to (a) register it with resources.thread_registry, if one is
     configured, so a bounded live-thread count is maintained (see
-    ThreadRegistry above), and (b) adds it to
-    config["configurable"]["thread_id"], which is what a checkpointed
-    graph requires to persist/restore state across calls (verified
-    empirically - see build_graph's docstring).
+    ThreadRegistry above), and (b) add it to config["configurable"], which
+    is what a checkpointed graph requires to persist/restore state across
+    calls (verified empirically - see build_graph's docstring).
+
+    CONVERSATION-BOUNDARY RECORDING (issue #81 / P9.2): tts_node itself no
+    longer appends to `messages` (an earlier version did - see
+    clarif_eye.graph.tts_node's docstring for why that moved). Once a run
+    completes with a real thread_id AND a non-empty final_output, this
+    function records the turn exactly ONCE via
+    graph.update_state(config, {"messages": [...]}) - verified empirically
+    to route through state.py's reducer (accumulates, and coerces the
+    plain dict into a real message object) without needing `as_node`
+    (LangGraph infers it from the last node that updated the state, which
+    is unambiguous here - tts is the only node every path ends on).
+    Immediately after, _trim_thread_to_latest_checkpoint bounds that
+    thread's own checkpoint history (see that function's comment for the
+    measured defect this closes). Neither happens on a cache hit (nothing
+    ran) or an early/exception failure (no final_output was produced) -
+    same "no bleed of a bad run into cached/replayed state" discipline the
+    image cache above already follows.
     """
     if image is None:
         yield "outcome", (None, NO_IMAGE_MESSAGE)
@@ -1062,10 +1229,7 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
             "research_client": resources.research_client,
             "deadline": time.monotonic() + pipeline_budget_seconds,
         }
-        if thread_id is not None:
-            if resources.thread_registry is not None:
-                resources.thread_registry.touch(thread_id)
-            configurable["thread_id"] = thread_id
+        configurable.update(thread_configurable(resources, thread_id))
         config = {"configurable": configurable}
         graph = resources.graph
         result = dict(state)
@@ -1099,6 +1263,15 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
 
     final_output = (result.get("final_output") or "").strip()
     audio_path = result.get("audio_file_path") or ""
+
+    # Conversation-boundary recording (issue #81 / P9.2) - see this
+    # function's own docstring "CONVERSATION-BOUNDARY RECORDING". Only for
+    # a real thread_id (an uncheckpointed resources.graph has no
+    # update_state-worthy thread to record against) and only when the run
+    # actually produced something worth remembering.
+    if thread_id is not None and final_output:
+        graph.update_state(config, {"messages": [{"role": "assistant", "content": final_output}]})
+        _trim_thread_to_latest_checkpoint(getattr(graph, "checkpointer", None), thread_id)
 
     if audio_path:
         outcome = (audio_path, final_output)

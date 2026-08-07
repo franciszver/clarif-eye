@@ -1,18 +1,30 @@
 """Tests for checkpointed threads and the first reducer (issue #81 / P9.2).
 
-RED FIRST: at the time this file is committed, clarif_eye.graph.build_graph
-takes no `checkpointer` argument and ClarifEyeState has no `messages` key,
-so every test below fails (most with a TypeError from build_graph(checkpointer=...)
-or a KeyError from state["messages"]).
+RED FIRST (original commit): at the time this file was first committed,
+clarif_eye.graph.build_graph took no `checkpointer` argument and
+ClarifEyeState had no `messages` key, so every test here failed (most with
+a TypeError from build_graph(checkpointer=...) or a KeyError from
+state["messages"]).
 
 Fakes follow the same pattern tests/test_graph.py already uses
 (FakeVisionClient / _FakeTtsProvider) - no model or network call, so the
 graph can be driven deterministically and cheaply.
+
+BOUNDARY RECORDING (issue #81 / P9.2, simplify-gate follow-up): tts_node
+itself does not append to `messages` - clarif_eye.ui._run_pipeline_events
+records one turn per completed run via graph.update_state() at the
+conversation boundary (see that function's docstring). `_invoke` below
+mirrors that exact call so these tests keep exercising the real
+accumulate/isolate contract without importing all of ui.py's guards/cache/
+narration - the full UI-level seam (build_interface -> handle_submit_staged
+-> _run_pipeline_events with a real ThreadRegistry) is covered separately
+in tests/test_ui.py.
 """
 
 from clarif_eye.client import CompletionResult
 from clarif_eye.graph import build_graph
 from clarif_eye.state import make_initial_state
+from clarif_eye.ui import _trim_thread_to_latest_checkpoint
 
 
 class FakeVisionClient:
@@ -41,7 +53,13 @@ class _FakeTtsProvider:
             f.write(b"ID3" + b"\x00" * 32)
 
 
-def _invoke(graph, image_data, thread_id, ocr="short text", scene="a room"):
+def _invoke(graph, image_data, thread_id, ocr="short text", scene="a room", trim=False):
+    """Run one turn on `thread_id` and record it, mirroring exactly what
+    clarif_eye.ui._run_pipeline_events does at the conversation boundary
+    (graph.update_state after a completed run, `as_node` omitted - verified
+    empirically to resolve unambiguously to "tts", the only node every path
+    ends on). `trim=True` also calls the trim helper afterward, the same
+    order _run_pipeline_events uses."""
     state = make_initial_state(image_data)
     config = {
         "configurable": {
@@ -50,7 +68,13 @@ def _invoke(graph, image_data, thread_id, ocr="short text", scene="a room"):
             "tts_provider": _FakeTtsProvider(),
         }
     }
-    return graph.invoke(state, config=config)
+    result = graph.invoke(state, config=config)
+    final_output = (result.get("final_output") or "").strip()
+    if final_output:
+        graph.update_state(config, {"messages": [{"role": "assistant", "content": final_output}]})
+    if trim:
+        _trim_thread_to_latest_checkpoint(graph.checkpointer, thread_id)
+    return result
 
 
 def test_get_state_after_two_runs_on_same_thread_has_second_runs_scalar_keys_and_accumulated_messages():
@@ -92,3 +116,92 @@ def test_different_thread_id_sees_no_bleed_through():
     assert len(messages_b) == 1
     assert "thread b text" in messages_b[0].content
     assert "thread a text" not in messages_b[0].content
+
+
+# --- Internal-shape pin for _trim_thread_to_latest_checkpoint --------------
+#
+# _trim_thread_to_latest_checkpoint (clarif_eye.ui) reaches into
+# InMemorySaver's undocumented-as-public internals (`storage`, `writes`,
+# `blobs`) because InMemorySaver has no supported trim API. That is a real
+# coupling to a specific langgraph version's internals - this test pins the
+# assumption so a langgraph upgrade that changes the shape fails LOUDLY
+# here, instead of the trim function silently no-op'ing (it wraps its body
+# in try/except Exception, on purpose - see that function's docstring -
+# specifically so a housekeeping failure never takes down a real photo's
+# outcome; that same broad except would otherwise hide a shape change
+# forever).
+def test_in_memory_saver_internal_shape_matches_trim_helpers_assumptions():
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    saver = InMemorySaver()
+    assert hasattr(saver, "storage")
+    assert hasattr(saver, "writes")
+    assert hasattr(saver, "blobs")
+    assert hasattr(saver, "serde")
+    assert hasattr(saver.serde, "loads_typed")
+
+    graph = build_graph(checkpointer=saver)
+    _invoke(graph, "shape-probe-image", "shape-probe-thread")
+
+    # storage: thread_id -> checkpoint_ns -> checkpoint_id -> (ckpt_bytes, meta_bytes, parent_id)
+    ns_checkpoints = saver.storage["shape-probe-thread"][""]
+    assert ns_checkpoints, "expected at least one stored checkpoint after one invoke"
+    latest_id = max(ns_checkpoints.keys())
+    entry = ns_checkpoints[latest_id]
+    assert len(entry) == 3
+    checkpoint_bytes, metadata_bytes, _parent = entry
+    checkpoint = saver.serde.loads_typed(checkpoint_bytes)
+    assert "channel_versions" in checkpoint
+
+    # blobs: (thread_id, checkpoint_ns, channel, version) -> (type, bytes)
+    matching_blob_keys = [k for k in saver.blobs if k[0] == "shape-probe-thread" and k[1] == ""]
+    assert matching_blob_keys
+    assert all(len(k) == 4 for k in matching_blob_keys)
+
+    # writes: (thread_id, checkpoint_ns, checkpoint_id) -> {...}
+    assert all(len(k) == 3 for k in saver.writes)
+
+
+# --- Measured defect: unbounded per-thread checkpoint growth --------------
+#
+# MEASURED (issue #81's simplify-gate report): InMemorySaver.put() writes
+# new storage/writes/blobs entries on every node completion and never
+# prunes - ~134KB/invoke with a 50KB image, 8MB after 10 invokes with a
+# 400KB image, all on ONE thread. This test proves _trim_thread_to_latest_checkpoint
+# actually closes that: run several invokes on ONE thread, trimming after
+# each (the same order _run_pipeline_events uses), and assert the
+# checkpoint count for that thread stays flat at 1 rather than growing with
+# the invoke count.
+#
+# PROVEN TO FAIL WITHOUT THE FIX: manually verified by disabling the
+# `_trim_thread_to_latest_checkpoint` call inside `_invoke` (short-circuit
+# `if trim:` to never fire) and re-running this test - it goes red,
+# reporting 30 stored checkpoints (6 per invoke x 5 invokes) instead of 1.
+# Restored immediately after. Not committed as a permanently-skipped
+# variant since that would just be dead code here.
+def test_trimming_keeps_one_threads_checkpoint_count_flat_across_repeated_invokes():
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    saver = InMemorySaver()
+    graph = build_graph(checkpointer=saver)
+    thread_id = "growth-probe-thread"
+
+    for i in range(5):
+        _invoke(graph, f"image-payload-{i}", thread_id, ocr=f"text {i}", scene=f"scene {i}", trim=True)
+
+    ns_checkpoints = saver.storage[thread_id][""]
+    assert len(ns_checkpoints) == 1, (
+        f"expected exactly 1 stored checkpoint after trimming, found {len(ns_checkpoints)} - "
+        "checkpoint history is growing unbounded"
+    )
+
+    # The trim must not have broken anything: get_state still shows every
+    # accumulated message, and the graph still works for a further invoke.
+    config = {"configurable": {"thread_id": thread_id}}
+    state = graph.get_state(config)
+    assert len(state.values["messages"]) == 5
+
+    _invoke(graph, "image-payload-final", thread_id, ocr="final text", scene="final scene", trim=True)
+    state = graph.get_state(config)
+    assert len(state.values["messages"]) == 6
+    assert len(saver.storage[thread_id][""]) == 1
