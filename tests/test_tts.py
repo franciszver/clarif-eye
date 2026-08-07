@@ -244,14 +244,7 @@ def test_tts_node_degrades_cleanly_when_provider_raises(tmp_path):
 
     result = tts_node(state, provider=provider, config={"configurable": {"tts_out_dir": tmp_path}})
 
-    # issue #81 / P9.2: tts_node also appends one messages entry per run
-    # (see clarif_eye.graph.tts_node's docstring) regardless of whether the
-    # provider itself succeeded or degraded to "" - the run still produced
-    # a final_output that was shown/spoken to the user.
-    assert result == {
-        "audio_file_path": "",
-        "messages": [{"role": "assistant", "content": "Some spoken text."}],
-    }
+    assert result == {"audio_file_path": ""}
 
 
 # --- Full compiled graph, real nodes, fake client + fake provider ----------

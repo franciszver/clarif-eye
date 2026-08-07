@@ -225,19 +225,15 @@ def tts_node(state, config=None, provider=None, providers=None):
     but spoken" into total silence - exactly the failure this pipeline
     exists to avoid.
 
-    ALSO appends one entry to `messages` (issue #81 / P9.2 - the app's
-    first reducer, see state.py): {"role": "assistant", "content":
-    final_output}. tts is chosen as the ONE place this happens - not
-    fast_synth_node/analysis_node, which is where final_output is actually
-    written - because tts is the single point EVERY path (fast_synth->tts
-    and research->analysis->tts) converges on before END. Appending here
-    means exactly one entry per run regardless of which path was taken,
-    without duplicating the same two lines in both upstream nodes and
-    without risking one of them being updated to append while the other is
-    forgotten. Deliberately excludes image_data (never shown back to the
-    user as "the conversation") and audio_file_path (a filesystem path, not
-    a spoken/read deliverable) - `content` is exactly what the run already
-    shows the user: the final_output text.
+    Does NOT append to `messages` (issue #81 / P9.2's reducer, see
+    state.py) - an earlier version of this node did, but that put a
+    conversation-boundary concern (recording one turn per completed run)
+    inside a node whose job is turning text into audio. #82 (follow-ups)
+    and #84 (subgraph extraction) would then each have had to duplicate or
+    detour around that append. The turn is now recorded once, at the
+    boundary, by clarif_eye.ui._run_pipeline_events via
+    graph.update_state() after a run completes with a real thread_id - see
+    that function's docstring.
     """
     configurable = (config or {}).get("configurable", {})
     if providers is None:
@@ -245,9 +241,7 @@ def tts_node(state, config=None, provider=None, providers=None):
     if provider is None:
         provider = configurable.get("tts_provider")
     out_dir = configurable.get("tts_out_dir")
-    update = run_tts(state["final_output"], provider=provider, providers=providers, out_dir=out_dir)
-    update["messages"] = [{"role": "assistant", "content": state["final_output"]}]
-    return update
+    return run_tts(state["final_output"], provider=provider, providers=providers, out_dir=out_dir)
 
 
 def dynamic_router(state):
