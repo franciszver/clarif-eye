@@ -417,19 +417,23 @@ def test_full_compiled_graph_runs_end_to_end_on_research_path_with_fakes():
 
     graph = build_graph()
     state = make_initial_state("base64data")
-    trace = []
+    config = {
+        "configurable": {
+            "client": vision_client,
+            "searcher": searcher,
+            "research_client": fetch_client,
+        }
+    }
 
-    result = graph.invoke(
-        state,
-        config={
-            "configurable": {
-                "trace": trace,
-                "client": vision_client,
-                "searcher": searcher,
-                "research_client": fetch_client,
-            }
-        },
-    )
+    # Node visitation observed via stream(..., stream_mode="updates")
+    # (issue #80 / P9.1) - one chunk per COMPLETED node, keyed by node
+    # name - rather than the old config["configurable"]["trace"] seam.
+    result = dict(state)
+    trace = []
+    for chunk in graph.stream(state, config=config, stream_mode="updates"):
+        for node_name, update in chunk.items():
+            result.update(update)
+            trace.append(node_name)
 
     assert trace == ["vision", "research", "analysis", "tts"]
     assert result["scraper_data"] != ""

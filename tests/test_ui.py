@@ -589,6 +589,17 @@ class _EmptySearcher:
         return []
 
 
+class _FakeTtsProvider:
+    """Same minimal double test_graph.py/test_vision.py use for tts_node's
+    provider seam - writes a minimal valid-looking mp3 (an ID3 tag) so
+    run_tts's own "looks like audio" check passes, without touching the
+    network via a real EdgeTtsProvider."""
+
+    def synthesize(self, text, out_path):
+        with open(out_path, "wb") as f:
+            f.write(b"ID3" + b"\x00" * 32)
+
+
 SHORT_OCR_TEXT = "short text"
 LONG_OCR_TEXT = " ".join(["x"] * 200)
 

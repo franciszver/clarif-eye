@@ -595,6 +595,22 @@ class _FakeTtsProvider:
             f.write(b"ID3" + b"\x00" * 32)
 
 
+def _invoke_collecting_trace(graph, state, config):
+    """Run the compiled graph via stream(..., stream_mode="updates") and
+    return (final_state, visited_node_names_in_order) - replaces the old
+    config["configurable"]["trace"] seam (issue #80 / P9.1, same helper
+    shape as test_graph.py's `run()`): each stream chunk is keyed by the
+    node that just completed, so collecting those keys in arrival order is
+    a drop-in replacement for what graph._record used to append."""
+    result = dict(state)
+    trace = []
+    for chunk in graph.stream(state, config=config, stream_mode="updates"):
+        for node_name, update in chunk.items():
+            result.update(update)
+            trace.append(node_name)
+    return result, trace
+
+
 def test_full_compiled_graph_runs_end_to_end_with_fake_client_fast_path():
     client = FakeVisionClient(content=well_formed_reply("short text", "a room"))
     graph = build_graph()
@@ -602,7 +618,7 @@ def test_full_compiled_graph_runs_end_to_end_with_fake_client_fast_path():
 
     result = graph.invoke(
         state,
-        config={"configurable": {"trace": [], "client": client, "tts_provider": _FakeTtsProvider()}},
+        config={"configurable": {"client": client, "tts_provider": _FakeTtsProvider()}},
     )
 
     assert result["ocr_output"] == "short text"
@@ -616,11 +632,9 @@ def test_full_compiled_graph_runs_end_to_end_with_fake_client_research_path():
     client = FakeVisionClient(content=well_formed_reply(LONG_TEXT, "a busy street"))
     graph = build_graph()
     state = make_initial_state("base64data")
-    trace = []
 
-    result = graph.invoke(
-        state,
-        config={"configurable": {"trace": trace, "client": client, "tts_provider": _FakeTtsProvider()}},
+    result, trace = _invoke_collecting_trace(
+        graph, state, config={"configurable": {"client": client, "tts_provider": _FakeTtsProvider()}}
     )
 
     assert result["complexity_flag"] is True
@@ -633,11 +647,9 @@ def test_full_compiled_graph_degrades_gracefully_and_still_reaches_tts():
     client = FakeVisionClient(exc=LadderExhaustedError("eyes", ()))
     graph = build_graph()
     state = make_initial_state("base64data")
-    trace = []
 
-    result = graph.invoke(
-        state,
-        config={"configurable": {"trace": trace, "client": client, "tts_provider": _FakeTtsProvider()}},
+    result, trace = _invoke_collecting_trace(
+        graph, state, config={"configurable": {"client": client, "tts_provider": _FakeTtsProvider()}}
     )
 
     assert trace[-1] == "tts"

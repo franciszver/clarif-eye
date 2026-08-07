@@ -280,7 +280,6 @@ def test_full_compiled_graph_runs_end_to_end_on_fast_path_with_fake_provider(tmp
         state,
         config={
             "configurable": {
-                "trace": [],
                 "client": client,
                 "tts_provider": provider,
                 "tts_out_dir": tmp_path,
@@ -329,7 +328,6 @@ def test_full_compiled_graph_runs_end_to_end_on_research_path_with_fake_provider
         state,
         config={
             "configurable": {
-                "trace": [],
                 "client": client,
                 "searcher": FakeSearcher(),
                 "tts_provider": provider,
@@ -489,7 +487,6 @@ def test_full_compiled_graph_falls_through_provider_chain(tmp_path):
         state,
         config={
             "configurable": {
-                "trace": [],
                 "client": client,
                 "tts_providers": [first, second],
                 "tts_out_dir": tmp_path,
@@ -533,7 +530,6 @@ def test_full_compiled_graph_reaches_end_with_text_only_when_chain_exhausted(tmp
         state,
         config={
             "configurable": {
-                "trace": [],
                 "client": client,
                 "tts_providers": [first, second],
                 "tts_out_dir": tmp_path,

@@ -63,16 +63,15 @@ photo/cap combination (a run whose deadline_hit flag is True still
 
 PER-STAGE TIMING
 -------------------
-config["configurable"]["trace"] is normally just a list of node-name
-strings (see graph._record) - a caller only appends to it, never reads
-its shape, so subclassing list to also stamp time.monotonic() on every
-append is a drop-in fit for that seam, not a change to graph.py. graph.
-_record is called at each node's ENTRY, so a trace timestamp marks WHEN a
-node started, not when it finished - stage duration is therefore the gap
-until the NEXT node's timestamp (or, for the last node, until `end`, the
-wall-clock moment right after graph.invoke returns), giving
-vision/research/analysis/fast_synth/tts timings from a single
-instrumented run, not separate re-runs.
+graph.stream(state, config=config, stream_mode="updates") (issue #80 /
+P9.1) yields one dict per node the MOMENT it completes, keyed by node
+name - so this script times each stage by stamping time.monotonic() as
+each chunk arrives, giving vision/research/analysis/fast_synth/tts timings
+from a single instrumented run, not separate re-runs. A completion
+timestamp is the opposite of the old entry-based trace this replaced: a
+node's own duration is the gap SINCE the previous completion (or `start`,
+the wall-clock moment right before the run began, for the first node) -
+see _stage_durations below.
 
 Usage:
     OPENROUTER_API_KEY=... python scripts/benchmark_pipeline.py \\
@@ -98,16 +97,6 @@ from clarif_eye.tts import DEFAULT_PROVIDER_CHAIN
 MIN_RUNS = 5
 
 
-class TimestampedTrace(list):
-    """Drop-in for config["configurable"]["trace"]: graph._record only ever
-    calls .append(node_name) on it, so overriding append to also stamp
-    time.monotonic() records WHEN each node ran without touching graph.py.
-    """
-
-    def append(self, node_name):
-        super().append((node_name, time.monotonic()))
-
-
 @dataclass
 class RunResult:
     """One full graph.invoke() - total latency, per-stage latency, and an
@@ -122,23 +111,26 @@ class RunResult:
     deadline_hit: bool = False
 
 
-def _stage_durations(trace, end):
-    """Turn a TimestampedTrace into {node_name: duration_seconds}.
+def _stage_durations(completions, start):
+    """Turn a list of (node_name, completion_timestamp) - each stamped the
+    instant that node's stream_mode="updates" chunk arrived, i.e. when it
+    FINISHED, never when it started (langgraph's stream API tells you
+    completion, not start - see clarif_eye.graph's module docstring) -
+    into {node_name: duration_seconds}.
 
-    graph._record(config, name) stamps a node's timestamp at ENTRY (see
-    graph.py), i.e. trace[i] is WHEN node i started, not when it finished.
-    So the time node i actually spent is the gap until the NEXT timestamp -
-    trace[i+1] for all but the last node, and `end` (the wall-clock moment
-    right after graph.invoke returned, passed in by the caller) for the
-    last one - not the gap since the previous timestamp, which attributes
-    each node's own duration to whichever node runs after it (e.g. tts's
-    duration would otherwise never be measured at all, since nothing is
-    recorded after it starts).
+    A node's own duration is the gap SINCE the previous node's completion
+    (or `start`, the wall-clock moment right before the graph began, for
+    the first node) - not the gap to the NEXT completion, which would
+    attribute node i's duration to node i+1. Completion timestamps already
+    include the last node's own finish time, so - unlike the old
+    entry-based trace this replaced - no separate `end` value is needed to
+    measure it.
     """
     durations = {}
-    for i, (node_name, timestamp) in enumerate(trace):
-        next_timestamp = trace[i + 1][1] if i + 1 < len(trace) else end
-        durations[node_name] = next_timestamp - timestamp
+    previous = start
+    for node_name, timestamp in completions:
+        durations[node_name] = timestamp - previous
+        previous = timestamp
     return durations
 
 
@@ -175,9 +167,7 @@ def run_once(graph, image_b64, *, label, run_index, client, searcher, research_c
              scraper_data_cap, pipeline_budget_seconds):
     """Run the compiled graph once end to end, instrumented for stage timing."""
     state = make_initial_state(image_b64)
-    trace = TimestampedTrace()
     configurable = {
-        "trace": trace,
         "client": client,
         "searcher": searcher,
         "research_client": research_client,
@@ -188,7 +178,12 @@ def run_once(graph, image_b64, *, label, run_index, client, searcher, research_c
         configurable["scraper_data_cap"] = scraper_data_cap
 
     start = time.monotonic()
-    result = graph.invoke(state, config={"configurable": configurable})
+    result = dict(state)
+    completions = []
+    for chunk in graph.stream(state, config={"configurable": configurable}, stream_mode="updates"):
+        for node_name, update in chunk.items():
+            result.update(update)
+            completions.append((node_name, time.monotonic()))
     end = time.monotonic()
 
     verified = _numbers_verified(
@@ -202,7 +197,7 @@ def run_once(graph, image_b64, *, label, run_index, client, searcher, research_c
         label=label,
         run_index=run_index,
         total_s=end - start,
-        stage_s=_stage_durations(trace, end),
+        stage_s=_stage_durations(completions, start),
         verified=verified,
         final_output_len=len(result.get("final_output", "")),
         deadline_hit=time.monotonic() >= configurable["deadline"],

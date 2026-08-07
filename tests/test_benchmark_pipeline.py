@@ -1,33 +1,36 @@
 """Offline test for scripts/benchmark_pipeline.py's stage-timing math
-(issue P6.1 / #17).
+(issue P6.1 / #17; migrated to completion-based timing by issue #80 / P9.1).
 
-graph._record(config, name) stamps a node's timestamp at ENTRY (see
-graph.py), not at exit. Attributing duration as "gap since the previous
-timestamp" therefore charges each node's wait/duration to the node that
-runs AFTER it - vision reads as ~0s while its real time lands on research,
-research's lands on analysis, and so on, and the last node (tts) is never
-measured at all since nothing is recorded after it starts.
+graph.stream(..., stream_mode="updates") yields one chunk per node the
+MOMENT it completes, never when it started (see clarif_eye.graph's module
+docstring) - so this script stamps a node's timestamp at COMPLETION, the
+opposite of the old entry-based trace it replaced. Attributing duration as
+"gap since the previous completion" (or `start`, for the first node) is
+therefore the natural accounting: each node's own duration lands on itself,
+and the last node's duration comes for free from its own completion
+timestamp, with no separate `end` value needed to measure it.
 
-This test is purely offline: it builds a synthetic trace by hand and calls
-_stage_durations directly. It does NOT build or invoke the graph.
+This test is purely offline: it builds a synthetic completions list by hand
+and calls _stage_durations directly. It does NOT build or invoke the graph.
 """
 
 from scripts.benchmark_pipeline import _stage_durations
 
 
 def test_stage_durations_attributes_time_to_the_node_that_spent_it():
-    """Nodes recorded at t=0,1,4,10 with run end=12 must be attributed
-    1,3,6,2 (next-timestamp minus own timestamp, last node vs. `end`) -
-    NOT 0,1,3,6 (previous-timestamp math, the off-by-one bug)."""
-    trace = [
-        ("vision", 0),
-        ("research", 1),
-        ("analysis", 4),
-        ("tts", 10),
+    """Nodes completed at t=1,4,10,12 with start=0 must be attributed
+    1,3,6,2 (own completion minus previous completion, first node vs.
+    `start`) - each node's own duration, not the off-by-one entry-based
+    math this replaced."""
+    completions = [
+        ("vision", 1),
+        ("research", 4),
+        ("analysis", 10),
+        ("tts", 12),
     ]
-    end = 12
+    start = 0
 
-    durations = _stage_durations(trace, end)
+    durations = _stage_durations(completions, start)
 
     print(f"computed durations: {durations}")
 
@@ -36,11 +39,4 @@ def test_stage_durations_attributes_time_to_the_node_that_spent_it():
         "research": 3,
         "analysis": 6,
         "tts": 2,
-    }
-    # The bug this guards against, spelled out explicitly:
-    assert durations != {
-        "vision": 0,
-        "research": 1,
-        "analysis": 3,
-        "tts": 6,
     }

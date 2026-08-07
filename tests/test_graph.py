@@ -5,9 +5,10 @@ filesystem). Tests assert on which nodes actually ran, not just on whether
 output ended up truthy - a truthy check would pass even if the routing
 were backwards.
 
-Node visitation is tracked via a mutable list passed through the run
-config's `configurable` dict (not through the state schema itself, which
-must contain exactly the 7 architecture-doc keys - see state.py).
+Node visitation is observed via graph.stream(..., stream_mode="updates")
+(issue #80 / P9.1), which yields one dict per COMPLETED node keyed by node
+name - see the `run()` helper below - rather than a caller-supplied trace
+list threaded through config["configurable"].
 """
 
 import pytest
@@ -39,14 +40,23 @@ def _reply(ocr, scene):
 
 
 def run(graph, state, client=None, tts_provider=None):
-    trace = []
-    configurable = {"trace": trace}
+    """Run the compiled graph via stream(..., stream_mode="updates") and
+    return (final_state, visited_node_names_in_order) - visited replaces
+    the old trace-list config seam (issue #80 / P9.1): each stream chunk
+    is keyed by the node that just completed, so collecting those keys in
+    arrival order is a drop-in replacement for what _record used to do."""
+    configurable = {}
     if client is not None:
         configurable["client"] = client
     if tts_provider is not None:
         configurable["tts_provider"] = tts_provider
-    result = graph.invoke(state, config={"configurable": configurable})
-    return result, trace
+    result = dict(state)
+    visited = []
+    for chunk in graph.stream(state, config={"configurable": configurable}, stream_mode="updates"):
+        for node_name, update in chunk.items():
+            result.update(update)
+            visited.append(node_name)
+    return result, visited
 
 
 # Minimal fake for tts_node's provider seam (clarif_eye.tts) so tests that
