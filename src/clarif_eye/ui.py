@@ -1051,16 +1051,26 @@ class ThreadRegistry(_BoundedLRU):
 # accumulated `messages` list and the latest run's scalar keys, and a
 # further invoke on the SAME thread still works and keeps accumulating.
 #
-# ONLY safe after a run has fully COMPLETED. A future interrupted run
-# (issue #83, upcoming - human-in-the-loop interrupts) will have a PENDING
-# checkpoint that is not the "final" one for that turn - resuming from it
-# requires the checkpoint chain interrupts rely on. Trimming down to "the
-# newest checkpoint" during an interrupt would not lose correctness (the
-# newest checkpoint IS the pending one), but issue #83 must re-examine this
-# function's call site (currently only _run_pipeline_events, only after a
-# run reaches its final outcome) before introducing any code path that
-# checkpoints mid-run without going through a full graph.stream() to
-# completion.
+# ONLY safe when no run is IN FLIGHT on that thread. A future interrupted
+# run (issue #83, upcoming - human-in-the-loop interrupts) will have a
+# PENDING checkpoint that is not the "final" one for that turn - resuming
+# from it requires the checkpoint chain interrupts rely on. Trimming down to
+# "the newest checkpoint" during an interrupt would not lose correctness
+# (the newest checkpoint IS the pending one), but issue #83 must re-examine
+# every call site here before introducing any code path that checkpoints
+# mid-run without going through a full graph.stream() to completion.
+#
+# THE CALL SITES, all reached via _update_thread_state, and NO LONGER all
+# post-run (updated by issue #82 / P9.3 - this list said "only after a run
+# reaches its final outcome", which stopped being true):
+#   - _run_pipeline_events, after a photo run reaches its final outcome.
+#   - _run_followup_events, after a question run reaches its final outcome.
+#   - _run_pipeline_events' CACHE-HIT branch, which runs at the START of a
+#     request and trims before yielding. That is safe for the same reason
+#     the others are - a cache hit executes no graph at all, so there is no
+#     pending checkpoint of its own to preserve - but it is NOT a
+#     post-run call, and #83 must treat it as its own case rather than
+#     assuming every trim happens after a completed stream.
 def _trim_thread_to_latest_checkpoint(checkpointer, thread_id):
     """Delete every checkpoint/write/blob for `thread_id` except what its
     newest checkpoint (per checkpoint_ns) still references.
@@ -1502,18 +1512,43 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
             # to None for exactly the reason make_initial_state resets it on
             # a real photo run: a question left over from the previous turn
             # must not divert the next one.
+            #
+            # image_data IS BLANKED, DELIBERATELY: this cache stores text
+            # derived from the photo, never the base64 photo itself (see
+            # ImageResultCache's privacy note), so there is no real
+            # image_data to write here. Leaving the key alone would strand
+            # a DIFFERENT photo's base64 in the checkpoint right next to
+            # this photo's ocr/scene - probe-confirmed, and invisible to
+            # everyone until some future consumer reads the stored image
+            # and quietly gets the wrong one (#83's ask-first flows are the
+            # obvious candidate). "" is the loud answer: not available.
+            #
+            # THE DESCRIPTION IS RECORDED AS A TURN in the same write. Only
+            # real, successful, audio-bearing outcomes are ever cached (see
+            # ImageResultCache and the put site below - failures and
+            # text-only degradations are deliberately not), so cached_text
+            # is exactly what the user just heard, and a thread carrying
+            # ocr/scene with an empty history would be inconsistent for the
+            # consumers reading that history (#93, #83, #84). One combined
+            # update, not two: `messages` goes through state.py's reducer
+            # and appends, while the rest replace, so a single call is both
+            # atomic and one checkpoint write instead of two.
             if thread_id is not None:
                 configurable = dict(thread_configurable(resources, thread_id))
                 if configurable:
+                    update = {
+                        "image_data": "",
+                        "ocr_output": cached_ocr,
+                        "scene_context": cached_scene,
+                        "question": None,
+                    }
+                    if cached_text:
+                        update["messages"] = [{"role": "assistant", "content": cached_text}]
                     _update_thread_state(
                         resources.graph,
                         {"configurable": configurable},
                         thread_id,
-                        {
-                            "ocr_output": cached_ocr,
-                            "scene_context": cached_scene,
-                            "question": None,
-                        },
+                        update,
                     )
             yield "outcome", (cached_audio_path or None, cached_text)
             return

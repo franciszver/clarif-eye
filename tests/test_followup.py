@@ -376,9 +376,24 @@ def test_a_follow_up_after_a_cache_hit_on_a_fresh_thread_still_has_a_photo():
     client = RecordingClient(ocr_texts=["alpha label text"])
     resources = _resources(client)
 
-    list(handle_submit_staged(FakeImage(content=b"shared-photo"), resources, thread_id="visitor-one"))
+    first = list(handle_submit_staged(FakeImage(content=b"shared-photo"), resources, thread_id="visitor-one"))
+    spoken_description = first[-1][2]
+    assert spoken_description
+
     list(handle_submit_staged(FakeImage(content=b"shared-photo"), resources, thread_id="visitor-two"))
     assert len(client.vision_calls()) == 1, "visitor two should have been a cache hit"
+
+    # The hit left visitor two's own thread CONSISTENT, before any question
+    # is asked. Only real, successful, audio-bearing outcomes are ever
+    # cached, so the cached text IS what was just read aloud - a thread
+    # carrying this photo's ocr/scene with an empty history would be
+    # inconsistent for whatever reads that history later (#93, #83, #84).
+    values = resources.graph.get_state({"configurable": {"thread_id": "visitor-two"}}).values
+    assert len(values["messages"]) == 1
+    assert values["messages"][0].content == spoken_description
+    # And no OTHER photo's base64 is left stranded beside this photo's text:
+    # the cache never stores the image, so "" is the honest value.
+    assert values["image_data"] == ""
 
     updates = list(handle_ask_staged(QUESTION, resources, thread_id="visitor-two"))
 
@@ -390,6 +405,10 @@ def test_a_follow_up_after_a_cache_hit_on_a_fresh_thread_still_has_a_photo():
     assert CANNED_ANSWER in final_text
     _role, _has_image, prompt = client.brain_calls()[-1]
     assert "alpha label text" in prompt
+
+    # The description, then the follow-up's own two turns.
+    messages = resources.graph.get_state({"configurable": {"thread_id": "visitor-two"}}).values["messages"]
+    assert len(messages) == 3
 
 
 def test_follow_up_before_any_photo_speaks_an_explanation_and_calls_no_model():
