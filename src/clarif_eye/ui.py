@@ -40,9 +40,13 @@ discipline vision.is_degraded_scene already established.
 """
 
 import base64
+import hashlib
 import io
+import os
+import threading
 import time
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, field
 
 import gradio as gr
 
@@ -686,6 +690,77 @@ def status_for_result(audio_path, chain_exhausted):
     return STATUS_DEGRADED
 
 
+# --- Image content cache (issue #75) ----------------------------------------
+#
+# The same photo submitted twice used to cost two model calls against a
+# 1,000/day allowance. IMAGE_CACHE_MAX_ENTRIES bounds the cache small and
+# in-memory only - it is NEVER written to disk: these are photographs of
+# things a blind user cannot see, so persisting them is not acceptable.
+#
+# Kept <= tts.MAX_KEPT_FILES on purpose: this bound only avoids slots that
+# are CERTAIN to be dead. Cache eviction is LRU by ACCESS time (get()
+# calls move_to_end()); _prune_old_files deletes by mtime (write time),
+# which a cache hit never updates. Because the two structures evict on
+# different keys, satisfying this bound does NOT guarantee a live cache
+# entry keeps its file - a repeatedly-hit entry stays "live" here while
+# its mp3 can still age out of the MAX_KEPT_FILES most-recently-WRITTEN
+# set and get pruned. What actually makes this safe is the stale-file
+# guard in handle_submit (a missing file is treated as a miss, not a
+# lying hit). Sizing this past MAX_KEPT_FILES would add slots that can
+# NEVER be served even under the most generous access pattern, which is
+# the one case this bound does rule out. Not imported from tts.py to
+# avoid coupling the UI to the TTS layer for one integer - keep this
+# value <= that one.
+IMAGE_CACHE_MAX_ENTRIES = 20
+
+
+class ImageResultCache:
+    """Tiny in-memory LRU cache from image-content hash -> (audio_path,
+    text) result, bounded to IMAGE_CACHE_MAX_ENTRIES entries.
+
+    Only successful results are ever stored here (see handle_submit) - a
+    quota/API failure must never be replayed to the next visitor as if it
+    were that photo's own answer.
+
+    Guarded by a single lock: Gradio serves requests from a thread pool,
+    and put()'s assign / move_to_end / conditional popitem sequence is not
+    atomic, so without one the size bound could be transiently exceeded
+    under concurrent access. One plain (non-reentrant) lock around each
+    method's compound operation - nothing fancier.
+    """
+
+    def __init__(self, max_entries=IMAGE_CACHE_MAX_ENTRIES):
+        self._max_entries = max_entries
+        self._entries = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        with self._lock:
+            if key not in self._entries:
+                return None
+            self._entries.move_to_end(key)
+            return self._entries[key]
+
+    def put(self, key, value):
+        with self._lock:
+            self._entries[key] = value
+            self._entries.move_to_end(key)
+            if len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+
+    def discard(self, key):
+        with self._lock:
+            self._entries.pop(key, None)
+
+
+def _image_content_key(image_data):
+    """Hash of the DECODED image bytes (the base64 JPEG _encode_image
+    produces), never a filename/upload path - the same photo uploaded
+    twice arrives at a different temp path each time, but re-encodes to
+    the same bytes."""
+    return hashlib.sha256(image_data.encode("ascii")).hexdigest()
+
+
 @dataclass
 class AppResources:
     """Everything build_resources() constructs once at startup and
@@ -698,6 +773,7 @@ class AppResources:
     tts_providers: list
     searcher: object
     research_client: object
+    image_cache: object = field(default_factory=ImageResultCache)
 
 
 def build_resources():
@@ -787,6 +863,27 @@ def handle_submit(image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUD
     except Exception:
         return None, UNREADABLE_IMAGE_MESSAGE
 
+    # Issue #75: key on a hash of the DECODED image content (never the
+    # upload path/filename - the same photo uploaded twice arrives at a
+    # different temp path each time), so a repeat photo costs no quota. A
+    # hit returns the exact same (audio_path, text) a miss would have
+    # produced, so handle_submit_staged (which calls this) stages a hit
+    # identically to a miss - it has no idea whether this was cached.
+    cache_key = _image_content_key(image_data)
+    cached = resources.image_cache.get(cache_key)
+    if cached is not None:
+        cached_audio_path, _ = cached
+        # A cached audio path could have been deleted since it was stored
+        # (tts.py's _prune_old_files DOES delete old mp3s once more than
+        # MAX_KEPT_FILES exist; a temp cleaner or disk pressure could too).
+        # Returning it anyway would have the UI announce "ready" over
+        # silence - the worst failure mode for a user who cannot see the
+        # screen. Treat a missing file as a miss: drop the stale entry and
+        # fall through to run the pipeline for real.
+        if not cached_audio_path or os.path.exists(cached_audio_path):
+            return cached
+        resources.image_cache.discard(cache_key)
+
     try:
         state = make_initial_state(image_data)
         config = {
@@ -805,7 +902,9 @@ def handle_submit(image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUD
         # whole pipeline fails before a node can degrade (issue #18 / P6.2
         # scope item 4, e.g. a client-construction failure a node did not
         # catch). Uses the SAME category mapping the nodes use, rather than
-        # collapsing into the generic UNEXPECTED_ERROR_MESSAGE below.
+        # collapsing into the generic UNEXPECTED_ERROR_MESSAGE below. Not
+        # cached (issue #75): a quota/API failure must never be replayed
+        # to the next visitor as if it were that photo's own answer.
         return None, message_for_ladder_exhausted(exc)
     except OpenRouterError as exc:
         return None, message_for_terminal_error(exc)
@@ -816,14 +915,28 @@ def handle_submit(image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUD
     audio_path = result.get("audio_file_path") or ""
 
     if audio_path:
-        return audio_path, final_output
-
-    if is_chain_exhausted():
+        outcome = (audio_path, final_output)
+    elif is_chain_exhausted():
         if final_output:
-            return None, f"{final_output} {AUDIO_UNAVAILABLE_NOTE}"
-        return None, AUDIO_UNAVAILABLE_NOTE
+            outcome = (None, f"{final_output} {AUDIO_UNAVAILABLE_NOTE}")
+        else:
+            outcome = (None, AUDIO_UNAVAILABLE_NOTE)
+    else:
+        outcome = (None, final_output or UNEXPECTED_ERROR_MESSAGE)
 
-    return None, final_output or UNEXPECTED_ERROR_MESSAGE
+    # The pipeline ran to completion (no exception above), but only a
+    # real audio outcome is cached. Outcome (b) - description succeeded,
+    # every TTS provider failed for THIS call - is a degraded result, not
+    # a success: caching it would permanently mute a photo across a
+    # transient TTS outage, replaying text-with-no-audio to every later
+    # visitor long after TTS recovered. That violates this cache's own
+    # docstring ("a quota/API failure must never be replayed to the next
+    # visitor as if it were that photo's own answer"). Quota is cheaper
+    # than permanently serving silence to a blind user, so a text-only
+    # outcome is left to retry next time.
+    if audio_path:
+        resources.image_cache.put(cache_key, outcome)
+    return outcome
 
 
 def handle_submit_staged(image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUDGET_SECONDS):
