@@ -242,6 +242,11 @@ something similar later.
 - **Other browsers** - the browser used has not been varied; other
   browser/screen-reader combinations are unknown.
 - **Mobile** has not been checked at all, on any platform.
+- **Render's cold-start loading page.** After 15 minutes with no traffic,
+  the app sleeps; waking it back up takes about a minute, and Render shows
+  its own loading page during that time. That page belongs to Render, not
+  this app, so whether it announces itself to a screen reader is outside
+  this app's control and has not been checked.
 
 ## Known defects
 

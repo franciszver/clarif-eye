@@ -77,6 +77,25 @@ external systems this app depends on (the model API, search, text-to-speech)
 are checked against real calls rather than only mocks, see
 [docs/SCENARIOS.md](docs/SCENARIOS.md).
 
+## Deployment
+
+Clarif-Eye runs on Render's free tier, configured in
+[render.yaml](render.yaml). Two things to know before you rely on the live
+URL:
+
+- **The app sleeps after 15 minutes with no traffic.** Waking it back up
+  takes about a minute, during which Render shows its own loading page.
+  This is on top of the 21 to 31 second pipeline latency noted above; a
+  cold visit can take close to two minutes end to end.
+- **That loading page is Render's, not this app's.** Whether it announces
+  itself to a screen reader has not been checked, because it is outside
+  this app's control. A blind user may spend that first minute on a page
+  nobody here has verified.
+
+The host supplies `OPENROUTER_API_KEY` as an environment variable in its
+own dashboard. `.env` is never deployed; it exists only for running the
+app locally.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
