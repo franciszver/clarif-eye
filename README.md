@@ -64,9 +64,11 @@ suite), see [CONTRIBUTING.md](CONTRIBUTING.md).
    the search turned up.
 6. On that closer-look path, before anything is spoken, every number in the
    drafted script is checked against the photographed text. If a number
-   doesn't trace back to what the camera actually saw, the app reports that
-   the result could not be verified rather than risk reading a wrong amount
-   or date aloud.
+   doesn't trace back to what the camera actually saw, the app stops and
+   asks: it reads out the description it wrote, says which number it could
+   not check, and offers two buttons - hear it anyway, or take a new photo.
+   Nothing is read aloud as fact until you choose, and this is the only
+   thing the app ever stops to ask you about.
 7. The final script is converted to speech.
 
 The pipeline is built with [LangGraph](https://github.com/langchain-ai/langgraph)'s

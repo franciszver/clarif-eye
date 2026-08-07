@@ -429,7 +429,7 @@ def test_full_compiled_graph_runs_end_to_end_on_research_path_with_fakes():
 
     result, trace = drain_stream_collecting_trace(graph, state, config)
 
-    assert trace == ["entry", "vision", "research", "analysis", "tts"]
+    assert trace == ["entry", "vision", "research", "analysis", "verify_numbers", "tts"]
     assert result["scraper_data"] != ""
     assert "Background info" in result["scraper_data"]
     assert result["final_output"] != ""

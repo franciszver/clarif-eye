@@ -1,9 +1,11 @@
 """Compiling LangGraph skeleton for Clarif-Eye.
 
 Wires: entry -> vision -> dynamic_router -> fast_synth OR (research ->
-analysis) -> tts -> END, with entry -> followup -> tts as the second way in
-(issue #82 / P9.3 - a typed question about a photo this thread already
-described).
+analysis -> verify_numbers) -> tts -> END, with entry -> followup -> tts as
+the second way in (issue #82 / P9.3 - a typed question about a photo this
+thread already described). `verify_numbers` (issue #83 / P9.4) is the one
+node that can PAUSE the run to ask the user a question - see its own
+section below for the narrow rule that governs when.
 
 TWO ROUTING MECHANISMS, EACH WHERE IT FITS (issue #82 / P9.3)
 ---------------------------------------------------------------
@@ -49,7 +51,7 @@ side-channel, and needs nothing extra recorded by the nodes themselves.
 import time
 
 from langgraph.graph import END, StateGraph
-from langgraph.types import Command
+from langgraph.types import Command, interrupt
 
 from clarif_eye.analysis import run_analysis
 from clarif_eye.followup import run_followup
@@ -292,6 +294,115 @@ def analysis_node(state, config=None, client=None):
     )
 
 
+# --- Asking before speaking an unverifiable number (issue #83 / P9.4) ------
+#
+# THE PRODUCT RULE, stated here because it is a product decision and not a
+# framework one: this graph pauses ONLY when the number verification the
+# deep-analysis path already performs FAILS. Never on general low
+# confidence, never on the fast path, never on a follow-up answer. Every
+# user of this app is visually impaired and cannot glance at the screen to
+# see what is being asked; an unnecessary question costs them more than it
+# would most audiences, so the gate below is deliberately narrow.
+#
+# The key LangGraph fact this design is built on, EMPIRICALLY VERIFIED on
+# langgraph 1.2.10 before anything was written (probes, not assumption):
+# resuming an interrupted run RE-EXECUTES THE WHOLE NODE the interrupt was
+# raised in, from its first line. `interrupt()` then returns the resume
+# value instead of pausing again. So anything expensive standing between
+# the node's entry and its interrupt() call runs TWICE. That is why the
+# question is asked from this small node and not from `analysis`, which has
+# just spent a brain-ladder call: a resume from inside `analysis` would buy
+# a second model call (money on a rate-limited free tier), a second ~20s
+# wait for someone already waiting, and - worst - a second, possibly
+# DIFFERENT draft, so the user would hear an answer to a question they were
+# never actually asked. `analysis` writes its draft and the failing tokens
+# into state["verification_hold"] instead, and this node does nothing but
+# read that key, ask, and rewrite final_output.
+#
+# The chunk key LangGraph emits for a pause in stream(stream_mode="updates")
+# - {"__interrupt__": (Interrupt(...),)}. Named here, next to the node that
+# causes it, so clarif_eye.ui matches on a shared constant instead of
+# repeating the magic string (next_node_after already returns None for it).
+INTERRUPT_CHUNK_KEY = "__interrupt__"
+
+# The two answers this app sends back via Command(resume=...). Constants,
+# not inline literals, for the same reason vision.py's DEGRADED_* messages
+# are: the UI's buttons and the node's branch must agree, and a typo in one
+# of two string literals would silently mean "retake" forever.
+RESUME_CONTINUE = "continue"
+RESUME_RETAKE = "retake"
+
+# Prepended to the drafted script when the user chooses to hear it anyway.
+# PREPENDED, not appended: the caveat has to arrive BEFORE the number it is
+# about, or the user hears an amount stated as fact and only afterwards
+# learns it could not be checked. Plain spoken language, no hedging jargon.
+UNVERIFIED_NUMBER_CAVEAT = (
+    "A number in this description could not be checked against the photo, "
+    "so please treat it with care."
+)
+
+# Spoken when the user chooses to take a new photo instead. This is a real
+# spoken outcome, not silence - it goes through tts exactly like a
+# description does, because a blind user who pressed a button and heard
+# nothing back has no way to know whether it worked.
+RETAKE_CONFIRMATION = (
+    "All right, nothing was read out. Please take or upload a new photo, "
+    'then activate "Describe this photo".'
+)
+
+
+def verify_numbers_node(state):
+    """Ask the user before speaking a number that could not be checked
+    (issue #83 / P9.4) - or pass straight through when there is nothing to
+    ask about.
+
+    Reads ONE key, state["verification_hold"], which `analysis` wrote (see
+    clarif_eye.analysis.run_analysis and state.py's own comment on that
+    key). Falsy - the overwhelmingly common case - means every number in
+    the drafted script traced back to the photographed text, so this node
+    returns an empty update and the run continues to tts untouched. This is
+    THE GATE the product rule above lives in: it is what stops the app
+    asking a question on a run that has nothing wrong with it.
+    - RESUME_CONTINUE: the held draft IS spoken, with UNVERIFIED_NUMBER_CAVEAT
+      in front of it. The user asked to hear it; hiding it now would be a
+      second, quieter refusal.
+    - ANYTHING ELSE (including RESUME_RETAKE): the retake confirmation is
+      spoken and the draft is discarded. Defaulting the unrecognised case to
+      "do not speak it" is deliberate - only an answer this app actually
+      sent may be read as consent to speak an unverified number.
+    Either way `verification_hold` is cleared, so the thread is left ready
+    for the next photo with nothing pending.
+
+    MAKES NO CALL OF ANY KIND - no model, no network, no filesystem - which
+    is exactly what makes it safe to re-execute on resume. See this
+    section's comment block above for the empirical basis.
+
+    Takes no `config`: it has nothing to read from one, and the pipeline
+    deadline deliberately does not apply here - a run that has stopped to
+    ask a human a question is already outside any latency budget, and
+    "degrade because the budget expired while the user was deciding" would
+    throw away the answer they just gave.
+    """
+    hold = state.get("verification_hold")
+    if not hold:
+        return {}
+
+    answer = interrupt(
+        {
+            "reason": "unverified_numbers",
+            "script": hold.get("script", ""),
+            "numbers": list(hold.get("numbers") or []),
+        }
+    )
+
+    if answer == RESUME_CONTINUE:
+        return {
+            "final_output": f"{UNVERIFIED_NUMBER_CAVEAT} {hold.get('script', '')}".strip(),
+            "verification_hold": None,
+        }
+    return {"final_output": RETAKE_CONFIRMATION, "verification_hold": None}
+
+
 def followup_node(state, config=None, client=None):
     """Follow-up node (issue #82 / P9.3): answers state["question"] from the
     ocr_output/scene_context this THREAD already has checkpointed.
@@ -416,6 +527,10 @@ def build_graph(checkpointer=None):
     builder.add_node("fast_synth", fast_synth_node)
     builder.add_node("research", research_node)
     builder.add_node("analysis", analysis_node)
+    # issue #83 / P9.4: sits between analysis and tts so the question is
+    # asked BEFORE anything is spoken, and so a resume never re-runs the
+    # brain call analysis just made - see verify_numbers_node's docstring.
+    builder.add_node("verify_numbers", verify_numbers_node)
     builder.add_node("followup", followup_node)
     builder.add_node("tts", tts_node)
 
@@ -435,7 +550,12 @@ def build_graph(checkpointer=None):
     )
     builder.add_edge("fast_synth", "tts")
     builder.add_edge("research", "analysis")
-    builder.add_edge("analysis", "tts")
+    # Only the deep-analysis path verifies numbers at all (see
+    # clarif_eye.verification's module docstring), so only this path routes
+    # through the asking node. fast_synth and followup go straight to tts,
+    # unchanged.
+    builder.add_edge("analysis", "verify_numbers")
+    builder.add_edge("verify_numbers", "tts")
     # A follow-up answer is spoken exactly like a description is: same tts
     # node, same provider chain, same staged delivery in the UI.
     builder.add_edge("followup", "tts")
@@ -456,7 +576,8 @@ def build_graph(checkpointer=None):
 _UNCONDITIONAL_SUCCESSOR = {
     "fast_synth": "tts",
     "research": "analysis",
-    "analysis": "tts",
+    "analysis": "verify_numbers",
+    "verify_numbers": "tts",
     "followup": "tts",
 }
 
@@ -478,10 +599,14 @@ def next_node_after(node_name, state):
     RETURNS None FOR ANY NAME THIS GRAPH DOES NOT KNOW, rather than raising
     a KeyError. The caller is clarif_eye.ui's narration, which iterates over
     whatever keys LangGraph's stream produces - and those are not all node
-    names. LangGraph emits RESERVED keys too: "__interrupt__" is the
-    concrete one coming in issue #83 (human-in-the-loop interrupts), and a
-    KeyError raised from shared narration code would take down a run that
-    was otherwise fine. A typo'd or renamed node name lands here as well and
+    names. LangGraph emits RESERVED keys too: INTERRUPT_CHUNK_KEY
+    ("__interrupt__") is the concrete one, emitted whenever verify_numbers
+    pauses to ask the user about an unverifiable number (issue #83 / P9.4),
+    and a KeyError raised from shared narration code would take down a run
+    that was otherwise fine. Callers that need to ACT on a pause match that
+    constant themselves before reaching here (see
+    clarif_eye.ui._narrate_stream); this function only has to not crash on
+    it. A typo'd or renamed node name lands here as well and
     degrades to "announce nothing for this step" - a quiet narration gap,
     which is the right failure for a progress announcement, rather than
     losing the user an answer that had already been computed.

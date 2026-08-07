@@ -624,7 +624,7 @@ def test_full_compiled_graph_runs_end_to_end_with_fake_client_research_path():
     )
 
     assert result["complexity_flag"] is True
-    assert trace == ["entry", "vision", "research", "analysis", "tts"]
+    assert trace == ["entry", "vision", "research", "analysis", "verify_numbers", "tts"]
     assert result["final_output"] != ""
     assert result["audio_file_path"] != ""
 

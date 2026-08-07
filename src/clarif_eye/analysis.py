@@ -49,8 +49,12 @@ from clarif_eye.speech import to_spoken_text as _to_spoken_text
 # under the old private name so every existing importer of
 # `clarif_eye.analysis._numbers_verified` (scripts/benchmark_ladders.py,
 # scripts/benchmark_pipeline.py, tests/test_analysis_fixture_replay.py)
-# keeps working untouched.
-from clarif_eye.verification import numbers_verified as _numbers_verified
+# keeps working untouched. Re-exported, not called here any more (issue #83
+# / P9.4 needs the FAILING TOKENS, not just a bool - see
+# _unverified_numbers below), hence the noqa: dropping the name would break
+# those three importers for no gain.
+from clarif_eye.verification import numbers_verified as _numbers_verified  # noqa: F401
+from clarif_eye.verification import unverified_numbers as _unverified_numbers
 from clarif_eye.vision import is_degraded_scene
 
 # scraper_data can grow unboundedly (issue #10's web lookups); a large scrape
@@ -146,7 +150,12 @@ def _build_messages(ocr_output, scene_context, scraper_data, cap=_SCRAPER_DATA_C
 
 
 def _degraded(message):
-    return {"final_output": _to_spoken_text(message)}
+    # verification_hold is written on EVERY return path, not only the one
+    # that sets it (issue #83 / P9.4): it is a plain, non-reducer state key,
+    # so on a checkpointed thread a hold left over from an earlier photo
+    # would otherwise survive and stop THIS run to ask about a number
+    # nobody just heard. See state.py's ClarifEyeState.verification_hold.
+    return {"final_output": _to_spoken_text(message), "verification_hold": None}
 
 
 def _degrade_from_known(ocr_output, scene_context):
@@ -236,10 +245,28 @@ def run_analysis(ocr_output, scene_context, scraper_data, client=None, scraper_d
     if not spoken:
         return _degraded("The analysis model returned an empty response.")
 
-    if not _numbers_verified(spoken, ocr_output, scene_context, scraper_data):
-        return _degraded(
-            "This description could not be verified against the photographed "
-            "text, so it is not safe to read aloud as fact. Please try again."
-        )
+    failing_numbers = _unverified_numbers(spoken, ocr_output, scene_context, scraper_data)
+    if failing_numbers:
+        # THE SAME final_output AS BEFORE issue #83 / P9.4, deliberately.
+        # This node still refuses to hand an unverifiable script onward as
+        # if it were fact, so a graph that does NOT wire the asking node in
+        # (or a caller invoking run_analysis directly - scripts/, the
+        # fixture-replay tests) degrades exactly as it always did. What is
+        # NEW is that the questioned material is carried FORWARD in
+        # `verification_hold` instead of being dropped, so
+        # clarif_eye.graph.verify_numbers_node can ask the user about it
+        # and, if they say yes, speak the draft after all.
+        #
+        # WHY THE DRAFT IS NOT SPOKEN FROM HERE: the model call has just
+        # happened, and resuming an interrupt re-executes the whole node it
+        # was raised in. Raising it here would re-run the brain call on
+        # every resume - see verify_numbers_node's docstring.
+        return {
+            "final_output": _to_spoken_text(
+                "This description could not be verified against the photographed "
+                "text, so it is not safe to read aloud as fact. Please try again."
+            ),
+            "verification_hold": {"script": spoken, "numbers": failing_numbers},
+        }
 
-    return {"final_output": spoken}
+    return {"final_output": spoken, "verification_hold": None}

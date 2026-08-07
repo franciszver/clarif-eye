@@ -81,6 +81,11 @@ def test_make_initial_state_has_every_key_with_correct_types():
     assert state["final_output"] == ""
     assert state["audio_file_path"] == ""
     assert state["messages"] == []
+    # None, not {} (issue #83 / P9.4): None means "nothing is being held
+    # back pending a question", and a photo run seeding it explicitly is
+    # what CLEARS a hold left over from a run the user abandoned mid-
+    # question - see state.py's ClarifEyeState.verification_hold.
+    assert state["verification_hold"] is None
     # None, not "" (issue #82 / P9.3): None means "this is a photo run, not
     # a question", and a photo run seeding it explicitly is what RESETS a
     # question left over from the previous turn on a checkpointed thread -
@@ -97,6 +102,7 @@ def test_make_initial_state_has_every_key_with_correct_types():
         "audio_file_path",
         "messages",
         "question",
+        "verification_hold",
     }
     assert set(state.keys()) == expected_keys
 
@@ -112,6 +118,7 @@ def test_state_typeddict_has_exactly_the_expected_keys():
         "audio_file_path",
         "messages",
         "question",
+        "verification_hold",
     }
 
 
@@ -177,7 +184,7 @@ def test_full_graph_routes_using_node_owned_complexity_flag_not_caller_value():
     result, trace = run(graph, state, client=client)
 
     assert result["complexity_flag"] is True
-    assert trace == ["entry", "vision", "research", "analysis", "tts"]
+    assert trace == ["entry", "vision", "research", "analysis", "verify_numbers", "tts"]
     assert "fast_synth" not in trace
 
 
@@ -336,5 +343,5 @@ def test_research_path_visits_vision_research_analysis_tts_only():
 
     _, trace = run(graph, state, client=client)
 
-    assert trace == ["entry", "vision", "research", "analysis", "tts"]
+    assert trace == ["entry", "vision", "research", "analysis", "verify_numbers", "tts"]
     assert "fast_synth" not in trace

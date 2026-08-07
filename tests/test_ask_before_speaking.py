@@ -200,7 +200,10 @@ def test_unverified_numbers_names_the_tokens_that_do_not_trace_back():
     tokens - so nothing downstream has to parse them back out of prose."""
     failing = unverified_numbers(INVENTED_DRAFT, BILL_OCR, BILL_SCENE, "")
 
-    assert failing == ["999.99"]
+    # The ORIGINAL spoken form, currency symbol and all - this token is
+    # read aloud back to the user, so it should sound like what they were
+    # about to be told, not like a normalised comparison key.
+    assert failing == ["$999.99"]
     assert unverified_numbers(HONEST_DRAFT, BILL_OCR, BILL_SCENE, "") == []
 
 
@@ -222,7 +225,7 @@ def test_analysis_holds_the_draft_and_the_failing_numbers_for_the_asker():
 
     hold = result["verification_hold"]
     assert hold["script"] == INVENTED_DRAFT
-    assert hold["numbers"] == ["999.99"]
+    assert hold["numbers"] == ["$999.99"]
 
 
 def test_a_verified_analysis_reply_holds_nothing():
@@ -258,7 +261,7 @@ def test_unverifiable_number_pauses_the_run_and_carries_the_questioned_text():
     # travel as their own fields so the UI never parses a sentence.
     assert payload["reason"] == "unverified_numbers"
     assert payload["script"] == INVENTED_DRAFT
-    assert payload["numbers"] == ["999.99"]
+    assert payload["numbers"] == ["$999.99"]
 
 
 def test_resume_continue_speaks_the_drafted_script_with_a_spoken_caveat():
