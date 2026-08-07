@@ -210,7 +210,7 @@ def run_followup(ocr_output, scene_context, question, client=None, deadline_exce
     # site, because it is the one thing the three callers genuinely differ on.
     result, failure_message = call_ladder(
         "brain",
-        _build_messages(ocr_output, scene_context, question),
+        lambda: _build_messages(ocr_output, scene_context, question),
         client,
         _default_client,
         "The answer could not be prepared because of an unexpected "

@@ -150,7 +150,7 @@ def run_fast_synth(ocr_output, scene_context, client=None, deadline_exceeded=Fal
     # site, because it is the one thing the three callers genuinely differ on.
     result, failure_message = call_ladder(
         "eyes",
-        _build_messages(ocr_output, scene_context),
+        lambda: _build_messages(ocr_output, scene_context),
         client,
         _default_client,
         "The spoken description could not be prepared because of an "

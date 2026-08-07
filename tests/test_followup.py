@@ -318,6 +318,14 @@ def test_a_blank_question_is_refused_without_running_the_graph():
     assert len(client.calls) == calls_after_photo
     assert updates[-1][2] == NO_QUESTION_MESSAGE
 
+    # A non-string question must not raise into Gradio either. Not reachable
+    # through the UI today (Textbox preprocesses to str), but this module's
+    # contract is never-raise, not never-raise-when-Gradio-behaves.
+    for not_a_question in (None, 42, ["what is the expiry date?"]):
+        updates = list(handle_ask_staged(not_a_question, resources, thread_id=thread_id))
+        assert updates[-1][2] == NO_QUESTION_MESSAGE
+    assert len(client.calls) == calls_after_photo
+
 
 # --- Image-cache hits must keep the thread in step with what was spoken ---
 #

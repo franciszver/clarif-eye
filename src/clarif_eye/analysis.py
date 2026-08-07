@@ -218,7 +218,7 @@ def run_analysis(ocr_output, scene_context, scraper_data, client=None, scraper_d
     # site, because it is the one thing the three callers genuinely differ on.
     result, failure_message = call_ladder(
         "brain",
-        _build_messages(ocr_output, scene_context, scraper_data, cap),
+        lambda: _build_messages(ocr_output, scene_context, scraper_data, cap),
         client,
         _default_client,
         "The spoken description could not be prepared because of an "

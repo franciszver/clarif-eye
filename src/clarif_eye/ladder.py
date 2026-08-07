@@ -36,8 +36,19 @@ from clarif_eye.failure_messages import (
 )
 
 
-def call_ladder(role, messages, client, client_factory, unexpected_error_message):
-    """Call `role`'s ladder with `messages`, never raising.
+def call_ladder(role, build_messages, client, client_factory, unexpected_error_message):
+    """Call `role`'s ladder, never raising.
+
+    `build_messages` is a ZERO-ARGUMENT callable that returns the request
+    messages, not the messages themselves - and that distinction is the
+    whole point of it (deep-review MINOR, issue #82 / P9.3). Before this
+    helper existed, each caller built its messages INSIDE its own try, so a
+    prompt-building failure degraded like any other. Passing an already-built
+    list would quietly move that evaluation outside the never-raise
+    boundary, and prompt building is not obviously infallible: it
+    interpolates OCR text through fence_untrusted's regex substitutions and
+    formats values a node read out of graph state. A thunk keeps the
+    evaluation where it was.
 
     Returns a (result, failure_message) pair, exactly one of which is None:
       - (CompletionResult, None) when the call succeeded.
@@ -61,7 +72,8 @@ def call_ladder(role, messages, client, client_factory, unexpected_error_message
     The bare `except Exception` is deliberate and is the contract every
     calling module's docstring makes: an injected client can raise anything
     at all, and none of it may escape into the graph. It does NOT catch
-    KeyboardInterrupt/SystemExit, which derive from BaseException.
+    KeyboardInterrupt/SystemExit, which derive from BaseException. It covers
+    build_messages() as well as the call itself - see above.
     """
     owns_client = client is None
     if owns_client:
@@ -71,7 +83,7 @@ def call_ladder(role, messages, client, client_factory, unexpected_error_message
             return None, message_for_terminal_error(exc)
     try:
         try:
-            return client.complete(role, messages), None
+            return client.complete(role, build_messages()), None
         except LadderExhaustedError as exc:
             return None, message_for_ladder_exhausted(exc)
         except OpenRouterError as exc:
