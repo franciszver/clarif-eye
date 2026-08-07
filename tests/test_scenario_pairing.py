@@ -52,6 +52,7 @@ SCENARIOS = [
             "tests/test_graph.py",
             "tests/test_pipeline_deadline.py",
             "tests/test_failure_messages.py",
+            "tests/test_checkpointing.py",
         ],
         "scenario_paths": [
             "scripts/live_smoke.py",
@@ -109,6 +110,7 @@ SCENARIOS = [
             "tests/test_vision.py",
             "tests/test_synth.py",
             "tests/test_graph.py",
+            "tests/test_checkpointing.py",
         ],
         "scenario_paths": [
             "scripts/tts_smoke.py",

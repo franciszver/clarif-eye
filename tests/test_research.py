@@ -435,21 +435,27 @@ def test_full_compiled_graph_runs_end_to_end_on_research_path_with_fakes():
     assert result["final_output"] != ""
 
 
-# --- Contract decision (#10): scraper_data stays a plain string, no sentinel
+# --- Contract decision (#10, revised by #81/P9.2): scraper_data now
+# distinguishes "never ran" (None) from "ran and found nothing" ("") -
+# this module's OWN behavior (what run_research returns) is unchanged;
+# only the value it starts from before it ever runs is now different from
+# the value it produces when it runs and comes up empty. See state.py's
+# ClarifEyeState.scraper_data comment for the full rationale: analysis.py
+# still treats both as "no external context available" and proceeds
+# identically either way, so no consumer's BEHAVIOR depends on this
+# distinction - it exists so callers that inspect state directly (a future
+# feature, or a human debugging a run) aren't left guessing.
 
 
-def test_scraper_data_is_a_plain_empty_string_whether_not_applicable_or_no_result_found():
-    # "not applicable" (fast path never calling research at all) and "research
-    # ran and genuinely found nothing" are both represented as the exact
-    # same value: "". See module docstring for the justification.
+def test_scraper_data_never_ran_is_none_ran_and_found_nothing_is_empty_string():
     not_applicable = make_initial_state("data")["scraper_data"]
 
     searcher = FakeSearcher(results=[])
     ran_and_found_nothing = run_research("some product", "a scene", searcher=searcher)["scraper_data"]
 
-    assert not_applicable == ""
+    assert not_applicable is None
     assert ran_and_found_nothing == ""
-    assert not_applicable == ran_and_found_nothing
+    assert not_applicable != ran_and_found_nothing
     assert isinstance(ran_and_found_nothing, str)
 
 

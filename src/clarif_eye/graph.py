@@ -224,6 +224,20 @@ def tts_node(state, config=None, provider=None, providers=None):
     deliverable, so skipping it on a blown deadline would turn "degraded
     but spoken" into total silence - exactly the failure this pipeline
     exists to avoid.
+
+    ALSO appends one entry to `messages` (issue #81 / P9.2 - the app's
+    first reducer, see state.py): {"role": "assistant", "content":
+    final_output}. tts is chosen as the ONE place this happens - not
+    fast_synth_node/analysis_node, which is where final_output is actually
+    written - because tts is the single point EVERY path (fast_synth->tts
+    and research->analysis->tts) converges on before END. Appending here
+    means exactly one entry per run regardless of which path was taken,
+    without duplicating the same two lines in both upstream nodes and
+    without risking one of them being updated to append while the other is
+    forgotten. Deliberately excludes image_data (never shown back to the
+    user as "the conversation") and audio_file_path (a filesystem path, not
+    a spoken/read deliverable) - `content` is exactly what the run already
+    shows the user: the final_output text.
     """
     configurable = (config or {}).get("configurable", {})
     if providers is None:
@@ -231,7 +245,9 @@ def tts_node(state, config=None, provider=None, providers=None):
     if provider is None:
         provider = configurable.get("tts_provider")
     out_dir = configurable.get("tts_out_dir")
-    return run_tts(state["final_output"], provider=provider, providers=providers, out_dir=out_dir)
+    update = run_tts(state["final_output"], provider=provider, providers=providers, out_dir=out_dir)
+    update["messages"] = [{"role": "assistant", "content": state["final_output"]}]
+    return update
 
 
 def dynamic_router(state):
@@ -257,8 +273,21 @@ def dynamic_router(state):
     return "research" if flag else "fast_synth"
 
 
-def build_graph():
-    """Build and compile the Clarif-Eye graph."""
+def build_graph(checkpointer=None):
+    """Build and compile the Clarif-Eye graph.
+
+    `checkpointer` (issue #81 / P9.2) is OPTIONAL and defaults to None -
+    every existing caller/test that calls build_graph() with no argument
+    keeps compiling an uncheckpointed graph, exactly today's behavior, and
+    can go on invoking it with no `thread_id` at all. When a checkpointer
+    IS supplied (clarif_eye.ui.build_resources passes a fresh
+    langgraph.checkpoint.memory.InMemorySaver - see that function's own
+    comment for its honest limits), LangGraph then REQUIRES
+    config["configurable"]["thread_id"] on every invoke()/stream() call
+    against the compiled graph (verified empirically: omitting it raises
+    ValueError) - clarif_eye.ui is responsible for minting one per browser
+    session and passing it through.
+    """
     builder = StateGraph(ClarifEyeState)
 
     builder.add_node("vision", vision_node)
@@ -278,7 +307,7 @@ def build_graph():
     builder.add_edge("analysis", "tts")
     builder.add_edge("tts", END)
 
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer)
 
 
 # Unconditional successor for every edge above EXCEPT the one out of
