@@ -33,18 +33,53 @@ rate limit, and free-tier limits are the thing being hit, not a transient
 blip a delay would fix. This module only chooses WORDS for a failure that
 already happened.
 
-WHAT'S NOT DISTINGUISHED: the daily (1,000/day) vs per-minute (20/min) rate
-limit. client.py's Attempt only records category="rate_limited" and the
-HTTP 429 status; OpenRouter's error body carries no field this client reads
-that says which limit was hit (see client._describe_failure, which reads
+HOW THE DAILY LIMIT IS DISTINGUISHED (issue #76 / P8.8): OpenRouter's error
+body still carries no field this client reads that says which limit (the
+1,000/day or the 20/min) was hit (see client._describe_failure, which reads
 only error.message as free text, and the terminal-status table, which has
-no 429 entry at all - 429 always fails over, never terminal). Inventing a
-distinction the response does not carry would be a guess dressed up as
-information, so every rate-limited exhaustion gets the same BUSY_MESSAGE
-regardless of which limit was actually hit.
+no 429 entry at all - 429 always fails over, never terminal), and GET
+/api/v1/auth/key returns limit_reset: null and limit_remaining: null, so
+there is no reset timestamp to read either. Parsing the 429 body would
+still be a guess dressed up as information. Instead, client.py keeps a
+process-wide count of model requests sent today (client.requests_sent_
+today) - not from this response, but from this app's own request history -
+and message_for_ladder_exhausted below picks DAILY_EXHAUSTED_MESSAGE over
+BUSY_MESSAGE when a rate-limited exhaustion's attempts coincide with that
+counter being over DAILY_REQUEST_THRESHOLD. This still never reads
+Attempt.detail or exc's text - only .category and the counter.
+
+LIMITS OF THE COUNTER: it resets to zero on every process restart, redeploy,
+or idle-sleep, so it can only ever UNDERCOUNT against the real OpenRouter
+total. An undercount just means BUSY_MESSAGE fires when the truth was the
+daily limit - the same outcome as before this issue, not a worse one. It
+cannot go the other way: DAILY_EXHAUSTED_MESSAGE can only fire alongside an
+actual 429, so it can never tell the user to come back tomorrow while the
+service is in fact available.
+
+This direction is enforced by what client.py counts, not just by the
+process-restart reset above. client._record_model_request() is called only
+after a response is actually received from OpenRouter (see client.py's
+comment at the call site), which deliberately excludes two cases so the
+counter never counts more than OpenRouter itself would:
+  - transport errors and connect/write timeouts: the request never reached
+    OpenRouter, so it could not have consumed any of the daily quota it's
+    meant to track. Counting these would overcount against real usage - the
+    exact failure this issue exists to prevent (a day of flaky wifi must
+    never be read as a day of real usage).
+  - read timeouts: OpenRouter may well have received the request and even
+    processed it before the response was lost in transit, so this case is
+    genuinely ambiguous - it might have consumed quota. It is excluded
+    anyway, on purpose, because undercounting is the safe direction and
+    counting a possibly-phantom request risks the reverse.
 """
 
+from clarif_eye import client as client_module
 from clarif_eye.speech import to_spoken_text
+
+# The free-tier daily cap (issue #76 / P8.8's "Approach decided" comment).
+# Compared against client.requests_sent_today() - our own request count,
+# never the 429 response - to pick DAILY_EXHAUSTED_MESSAGE over BUSY_MESSAGE.
+DAILY_REQUEST_THRESHOLD = 1000
 
 # --- The messages, one per category --------------------------------------
 #
@@ -58,6 +93,14 @@ from clarif_eye.speech import to_spoken_text
 # (D10, no paid fallback), not a fault - must not sound broken.
 BUSY_MESSAGE = to_spoken_text(
     "The service is busy right now. Please try again in a few minutes."
+)
+
+# All ladder rungs rate-limited AND our own request counter says today's
+# free allowance is gone (see DAILY_REQUEST_THRESHOLD above). No clock time
+# or reset moment is stated - auth/key returns limit_reset: null, so there
+# is nothing truthful to cite (issue #76).
+DAILY_EXHAUSTED_MESSAGE = to_spoken_text(
+    "Today's free allowance has been used up. Please come back tomorrow."
 )
 
 # A terminal 401/402/403, a missing/blank API key, or any other
@@ -93,17 +136,31 @@ GENERIC_FAILURE_MESSAGE = to_spoken_text(
 )
 
 
-def message_for_ladder_exhausted(exc):
+def message_for_ladder_exhausted(exc, requests_today=None):
     """Spoken message for a LadderExhaustedError, chosen from its Attempt
-    categories alone (never from any attempt's .detail text).
+    categories (never from any attempt's .detail text) plus, for the
+    rate-limited case, the process-wide daily request counter (never the
+    429 response - see this module's docstring).
 
-    - every attempt category == "rate_limited" -> BUSY_MESSAGE.
+    - every attempt category == "rate_limited":
+        - requests_today > DAILY_REQUEST_THRESHOLD -> DAILY_EXHAUSTED_MESSAGE.
+        - otherwise -> BUSY_MESSAGE.
+      `requests_today` defaults to client.requests_sent_today() and is
+      injectable for tests.
     - every attempt category in {"timeout", "budget_exhausted"} -> TIMED_OUT_MESSAGE.
     - anything else (mixed categories, server errors, model-unavailable,
       or an empty attempts tuple) -> GENERIC_FAILURE_MESSAGE.
     """
     categories = {attempt.category for attempt in exc.attempts}
     if categories == {"rate_limited"}:
+        if requests_today is None:
+            requests_today = client_module.requests_sent_today()
+        # Strictly greater than: the counter increments before an attempt's
+        # outcome is known (see client.py), so requests_today ==
+        # DAILY_REQUEST_THRESHOLD means exactly the allowed number of
+        # requests has been sent - still within the allowance, not over it.
+        if requests_today > DAILY_REQUEST_THRESHOLD:
+            return DAILY_EXHAUSTED_MESSAGE
         return BUSY_MESSAGE
     if categories and categories <= {"timeout", "budget_exhausted"}:
         return TIMED_OUT_MESSAGE

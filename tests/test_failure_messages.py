@@ -17,6 +17,9 @@ Attempt docstring, "issue #18 ... without substring-matching upstream
 prose").
 """
 
+import datetime
+import re
+
 import httpx
 import pytest
 
@@ -26,9 +29,12 @@ from clarif_eye.client import (
     OpenRouterClient,
     OpenRouterError,
 )
+from clarif_eye import client as client_module
 from clarif_eye.failure_messages import (
     BUSY_MESSAGE,
     CONFIG_ERROR_MESSAGE,
+    DAILY_EXHAUSTED_MESSAGE,
+    DAILY_REQUEST_THRESHOLD,
     GENERIC_FAILURE_MESSAGE,
     PAYLOAD_TOO_LARGE_MESSAGE,
     TIMED_OUT_MESSAGE,
@@ -52,6 +58,7 @@ ALL_MESSAGES = {
     "payload_too_large": PAYLOAD_TOO_LARGE_MESSAGE,
     "timed_out": TIMED_OUT_MESSAGE,
     "generic": GENERIC_FAILURE_MESSAGE,
+    "daily_exhausted": DAILY_EXHAUSTED_MESSAGE,
 }
 
 
@@ -197,6 +204,124 @@ def test_terminal_dispatch_uses_status_code_not_message_text():
 
     exc2 = OpenRouterError("everything is fine, try again shortly", status_code=401)
     assert message_for_terminal_error(exc2) == CONFIG_ERROR_MESSAGE
+
+
+# --- Daily vs momentary rate-limit exhaustion (issue #76 / P8.8) -----------
+#
+# Dispatch reads the process-wide request counter (client.requests_sent_
+# today), never error prose - see test_daily_dispatch_ignores_misleading_
+# detail_text_counter_wins below, which feeds detail text that says the
+# opposite of the counter's state and asserts the counter wins.
+
+
+def test_daily_request_threshold_matches_openrouters_documented_free_tier_cap():
+    """DAILY_REQUEST_THRESHOLD is not an arbitrary tuning knob - it mirrors
+    OpenRouter's published free-tier daily allowance (1,000 requests/day;
+    see issue #76's "Approach decided" comment). Every other test in this
+    file expresses its inputs relative to the constant (threshold - 1,
+    threshold), so none of them would fail if the constant were raised or
+    lowered - they prove the comparison works, not that the number is
+    right. This test is deliberately a change-detector, pinning the actual
+    value, so that changing it is a conscious act instead of silent drift.
+    Do NOT delete this as redundant.
+
+    If this fails because DAILY_REQUEST_THRESHOLD was edited: that is not a
+    bug in the test. It means the published free-tier allowance changed.
+    Go confirm the new number in OpenRouter's current documentation before
+    updating this assertion - do not tune the constant to make the test
+    pass.
+    """
+    assert DAILY_REQUEST_THRESHOLD == 1000, (
+        "DAILY_REQUEST_THRESHOLD no longer matches OpenRouter's documented "
+        "free-tier daily allowance of 1,000 requests/day. If that published "
+        "allowance genuinely changed, update the constant and this "
+        "assertion together, citing OpenRouter's current documentation. If "
+        "it did not change, someone tuned the constant instead of fixing "
+        "the underlying problem - revert it."
+    )
+
+
+def test_rate_limited_exhaustion_under_daily_threshold_yields_busy_message():
+    attempts = (Attempt("model-a", "rate_limited", 429, "rate limited"),)
+    exc = LadderExhaustedError("eyes", attempts)
+
+    message = message_for_ladder_exhausted(exc, requests_today=DAILY_REQUEST_THRESHOLD - 1)
+
+    assert message == BUSY_MESSAGE
+
+
+def test_rate_limited_exhaustion_over_daily_threshold_yields_daily_message():
+    attempts = (Attempt("model-a", "rate_limited", 429, "rate limited"),)
+    exc = LadderExhaustedError("eyes", attempts)
+
+    message = message_for_ladder_exhausted(exc, requests_today=DAILY_REQUEST_THRESHOLD + 1)
+
+    assert message == DAILY_EXHAUSTED_MESSAGE
+    assert message != BUSY_MESSAGE
+
+
+def test_rate_limited_exhaustion_at_exact_daily_threshold_yields_busy_message():
+    # The counter increments before an attempt's outcome is known (see
+    # client.py), so requests_today == DAILY_REQUEST_THRESHOLD means exactly
+    # the allowed number of requests has been sent - still within the
+    # allowance, not over it. Only a count strictly greater than the
+    # threshold means the allowance was genuinely exceeded.
+    attempts = (Attempt("model-a", "rate_limited", 429, "rate limited"),)
+    exc = LadderExhaustedError("eyes", attempts)
+
+    message = message_for_ladder_exhausted(exc, requests_today=DAILY_REQUEST_THRESHOLD)
+
+    assert message == BUSY_MESSAGE
+    assert message != DAILY_EXHAUSTED_MESSAGE
+
+
+def test_daily_message_states_no_clock_time_or_reset_moment():
+    assert not re.search(r"\d", DAILY_EXHAUSTED_MESSAGE)
+    lowered = DAILY_EXHAUSTED_MESSAGE.lower()
+    for word in ("o'clock", "am", "pm", "hour", "minute", "reset", "midnight", "utc"):
+        assert word not in lowered
+
+
+def test_daily_dispatch_ignores_misleading_detail_text_counter_wins():
+    # detail claims a momentary per-minute limit; counter says the daily
+    # allowance is gone - the counter must win.
+    over_threshold_attempts = (
+        Attempt("model-a", "rate_limited", 429, "per-minute limit only, resets in seconds"),
+    )
+    exc = LadderExhaustedError("eyes", over_threshold_attempts)
+    assert message_for_ladder_exhausted(exc, requests_today=DAILY_REQUEST_THRESHOLD + 1) == (
+        DAILY_EXHAUSTED_MESSAGE
+    )
+
+    # detail claims the daily quota is exhausted; counter says we're nowhere
+    # near it - the counter must still win.
+    under_threshold_attempts = (
+        Attempt("model-a", "rate_limited", 429, "daily quota fully exhausted"),
+    )
+    exc2 = LadderExhaustedError("eyes", under_threshold_attempts)
+    assert message_for_ladder_exhausted(exc2, requests_today=0) == BUSY_MESSAGE
+
+
+def test_default_requests_today_reads_from_client_module(monkeypatch):
+    monkeypatch.setattr(client_module, "requests_sent_today", lambda: DAILY_REQUEST_THRESHOLD + 1)
+    attempts = (Attempt("model-a", "rate_limited", 429, "rate limited"),)
+    exc = LadderExhaustedError("eyes", attempts)
+
+    assert message_for_ladder_exhausted(exc) == DAILY_EXHAUSTED_MESSAGE
+
+
+def test_dispatch_uses_the_real_live_counter_when_over_threshold_no_override(monkeypatch):
+    # Populates client.py's actual counter state (not a stand-in), then
+    # calls message_for_ladder_exhausted with NO requests_today override,
+    # proving the default path really reads client.requests_sent_today().
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    monkeypatch.setitem(client_module._daily_request_count, "date", today)
+    monkeypatch.setitem(client_module._daily_request_count, "count", DAILY_REQUEST_THRESHOLD + 1)
+
+    attempts = (Attempt("model-a", "rate_limited", 429, "rate limited"),)
+    exc = LadderExhaustedError("eyes", attempts)
+
+    assert message_for_ladder_exhausted(exc) == DAILY_EXHAUSTED_MESSAGE
 
 
 # --- No unhandled exception on an empty attempts tuple ----------------------

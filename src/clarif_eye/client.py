@@ -12,13 +12,18 @@ repr(), or str() of anything this module creates. See tests/test_client.py
 for the leak-prevention tests.
 """
 
+import datetime
+import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
 
 import httpx
 
 from clarif_eye.registry import RegistryError, load_registry
+
+_logger = logging.getLogger(__name__)
 
 API_BASE_URL = "https://openrouter.ai/api/v1"
 
@@ -62,6 +67,87 @@ _TERMINAL_STATUS_REASONS = {
     402: "out of credit on this OpenRouter account",
     413: "request payload too large",
 }
+
+# Process-wide count of model requests sent today, keyed by UTC date so it
+# rolls over at UTC midnight regardless of local time (issue #76 / P8.8).
+# Counts every REQUEST complete() sends, not every user submission, because
+# a single submission can send several requests (one per ladder rung) -
+# counting submissions would undercount against OpenRouter's per-day cap.
+# failure_messages.py reads this (never error text) to tell a momentary
+# rate limit from the daily allowance being gone; see its module docstring
+# for what this counter's limits mean for that message.
+_daily_request_count_lock = threading.Lock()
+_daily_request_count = {"date": None, "count": 0}
+
+
+def _utc_today(now=None):
+    """Resolve today's UTC date. `now` is injectable for tests; defaults to
+    the real UTC clock."""
+    if now is None:
+        now = datetime.datetime.now(datetime.timezone.utc)
+    return now.date()
+
+
+def _record_model_request(now=None):
+    """Record one model request against today's (UTC) count.
+
+    `now` is injectable for tests; defaults to the real UTC clock.
+    """
+    today = _utc_today(now)
+    with _daily_request_count_lock:
+        if _daily_request_count["date"] != today:
+            _daily_request_count["date"] = today
+            _daily_request_count["count"] = 0
+        _daily_request_count["count"] += 1
+
+
+def requests_sent_today(now=None):
+    """Count of model requests sent so far today (UTC).
+
+    `now` is injectable for tests; defaults to the real UTC clock. Returns 0
+    if no request has been recorded yet today (including right after a UTC
+    date change, even if yesterday's count was nonzero).
+    """
+    today = _utc_today(now)
+    with _daily_request_count_lock:
+        if _daily_request_count["date"] != today:
+            return 0
+        return _daily_request_count["count"]
+
+
+_SENSITIVE_HEADER_NAMES = {"authorization", "cookie", "set-cookie", "x-api-key"}
+
+
+def _redact_headers(headers):
+    """Redact sensitive headers from a header mapping before logging it.
+
+    OpenRouter's 429 responses don't echo our Authorization request header
+    back, but this stays defensive: neither the API key nor any session
+    credential must ever reach a log line (see module docstring), so any
+    value under one of _SENSITIVE_HEADER_NAMES is stripped here regardless
+    of where it came from.
+    """
+    return {
+        key: ("[REDACTED]" if key.lower() in _SENSITIVE_HEADER_NAMES else value)
+        for key, value in headers.items()
+    }
+
+
+def _log_raw_429(response):
+    """Log the full raw 429 (status, headers, body) (issue #76 / P8.8).
+
+    OpenRouter's error body has no field this client reads that identifies
+    which limit (daily vs per-minute) was hit (see failure_messages.py's
+    module docstring), so this exists to put the real, evidence-based shape
+    of the response on record for a future change to work from - not to be
+    parsed here.
+    """
+    _logger.warning(
+        "OpenRouter 429 response: status=%s headers=%s body=%s",
+        response.status_code,
+        _redact_headers(response.headers),
+        response.text[:2000],
+    )
 
 
 class OpenRouterError(Exception):
@@ -240,6 +326,13 @@ class OpenRouterClient:
                 )
                 continue
 
+            # Only count now: a response was actually received from
+            # OpenRouter, whatever its status. Anything that raised above
+            # (transport error, connect/write/read timeout) never reached
+            # the service and must not consume any of the daily quota this
+            # counter tracks (see module docstring and failure_messages.py's).
+            _record_model_request()
+
             if response.status_code == 200:
                 result = self._parse_success(response, model)
                 if result is None:
@@ -260,6 +353,7 @@ class OpenRouterClient:
                 )
 
             if response.status_code == 429:
+                _log_raw_429(response)
                 attempts.append(Attempt(model, "rate_limited", 429, reason))
                 continue
             if response.status_code >= 500:
