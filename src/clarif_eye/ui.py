@@ -894,11 +894,39 @@ class _BoundedLRU:
 
 class ImageResultCache(_BoundedLRU):
     """Tiny in-memory LRU cache from image-content hash -> (audio_path,
-    text) result, bounded to IMAGE_CACHE_MAX_ENTRIES entries.
+    text, ocr_output, scene_context), bounded to IMAGE_CACHE_MAX_ENTRIES
+    entries.
 
     Only successful results are ever stored here (see handle_submit) - a
     quota/API failure must never be replayed to the next visitor as if it
     were that photo's own answer.
+
+    WHY ocr_output/scene_context ARE STORED TOO (deep-review BLOCKER, issue
+    #82 / P9.3): a cache hit short-circuits the graph entirely, so nothing
+    writes those keys onto the caller's THREAD - and follow-up questions are
+    answered from the thread. That desynchronised what the user had just
+    been told from what the thread remembered, two ways:
+      a. one thread, photo A then photo B then photo A again: the third
+         submit hit the cache, the checkpoint still held B, and a follow-up
+         answered about B while the user was holding A.
+      b. two visitors, one process-wide cache: visitor two submitted a photo
+         visitor one had already sent, heard the cached description, and -
+         their own thread having never run the graph - was told there was no
+         photo yet when they asked about it.
+    Neither is visible to a blind user, which is what made them blockers
+    rather than rough edges. Carrying the two keys here lets
+    _run_pipeline_events write them onto the thread on a hit (see its
+    cache-hit branch), so the thread always describes the photo the user was
+    last told about.
+
+    NO NEW PRIVACY EXPOSURE: ocr_output/scene_context are text DERIVED from
+    the photo, the same class of thing as the `text` already cached here,
+    held in this process's memory only and never written to disk. The base64
+    photo itself is deliberately NOT stored.
+
+    NO MIGRATION CONCERN: this cache has no persisted format - it lives and
+    dies with the process - so widening the entry only needs every put/get
+    site in this module updated, which this change does.
     """
 
     def __init__(self, max_entries=IMAGE_CACHE_MAX_ENTRIES):
@@ -1281,9 +1309,35 @@ def _outcome_for(final_output, audio_path):
     return (None, final_output or UNEXPECTED_ERROR_MESSAGE)
 
 
+def _update_thread_state(graph, config, thread_id, update):
+    """Write `update` onto `thread_id`'s checkpoint, then bound that
+    thread's checkpoint history.
+
+    NEVER RAISES (deep-review BLOCKER fix, issue #81 / P9.2): this is
+    bookkeeping - state for a LATER run - not part of THIS run's
+    deliverable, which was already computed before the caller got here. A
+    failure here (a stale/evicted thread_id whose checkpoint ThreadRegistry
+    deleted mid-run - see that class's docstring for why that is tolerated -
+    or any other unforeseen edge in update_state/trim) must never cost the
+    user the answer that already exists. thread_configurable() is the FIRST
+    line of defence (it declines to thread a thread_id through to an
+    uncheckpointed graph at all); this is the second, catching whatever that
+    guard doesn't.
+
+    Works on a thread with NO prior checkpoint (verified empirically on
+    langgraph 1.2.10 for issue #82's cache-hit fix): update_state creates
+    the thread's first checkpoint and needs no `as_node` to do it, which is
+    exactly the case a second visitor's cache hit produces.
+    """
+    try:
+        graph.update_state(config, update)
+        _trim_thread_to_latest_checkpoint(getattr(graph, "checkpointer", None), thread_id)
+    except Exception:
+        pass
+
+
 def _record_turn(graph, config, thread_id, messages):
-    """Record `messages` against `thread_id` at the conversation boundary,
-    then bound that thread's checkpoint history.
+    """Record `messages` against `thread_id` at the conversation boundary.
 
     Called only after a run has fully COMPLETED and produced something worth
     remembering - see _run_pipeline_events's "CONVERSATION-BOUNDARY
@@ -1291,22 +1345,12 @@ def _record_turn(graph, config, thread_id, messages):
     clarif_eye.graph.tts_node's docstring for why this lives at the boundary
     rather than inside a node.
 
-    NEVER RAISES (deep-review BLOCKER fix, issue #81 / P9.2): this is
-    bookkeeping - accumulating conversation history for a LATER run - not
-    part of THIS run's deliverable, which was already computed before the
-    caller got here. A failure recording the turn (a stale/evicted thread_id
-    whose checkpoint ThreadRegistry deleted mid-run - see that class's
-    docstring for why that is tolerated - or any other unforeseen edge in
-    update_state/trim) must never cost the user the answer that already
-    exists. thread_configurable() is the FIRST line of defence (it declines
-    to thread a thread_id through to an uncheckpointed graph at all); this
-    is the second, catching whatever that guard doesn't.
+    KNOWN GAP, TRACKED AS ISSUE #93: a DEGRADED run's message ("every model
+    was busy", "the photo could not be read") is recorded here exactly like
+    a real description, so it becomes part of the thread's history a later
+    turn reads back. Deliberately not changed in this PR.
     """
-    try:
-        graph.update_state(config, {"messages": messages})
-        _trim_thread_to_latest_checkpoint(getattr(graph, "checkpointer", None), thread_id)
-    except Exception:
-        pass
+    _update_thread_state(graph, config, thread_id, {"messages": messages})
 
 
 def _narrate_stream(graph, state, config, result):
@@ -1441,7 +1485,7 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
     cache_key = _image_content_key(image_data)
     cached = resources.image_cache.get(cache_key)
     if cached is not None:
-        cached_audio_path, _ = cached
+        cached_audio_path, cached_text, cached_ocr, cached_scene = cached
         # A cached audio path could have been deleted since it was stored
         # (tts.py's _prune_old_files DOES delete old mp3s once more than
         # MAX_KEPT_FILES exist; a temp cleaner or disk pressure could too).
@@ -1450,7 +1494,28 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
         # screen. Treat a missing file as a miss: drop the stale entry and
         # fall through to run the pipeline for real.
         if not cached_audio_path or os.path.exists(cached_audio_path):
-            yield "outcome", cached
+            # THE THREAD MUST DESCRIBE THE PHOTO THE USER WAS JUST TOLD
+            # ABOUT (deep-review BLOCKER, issue #82 / P9.3 - see
+            # ImageResultCache's docstring for the two proven scenarios).
+            # The graph did not run, so nothing else will write these keys,
+            # and a follow-up answers from the thread. `question` is reset
+            # to None for exactly the reason make_initial_state resets it on
+            # a real photo run: a question left over from the previous turn
+            # must not divert the next one.
+            if thread_id is not None:
+                configurable = dict(thread_configurable(resources, thread_id))
+                if configurable:
+                    _update_thread_state(
+                        resources.graph,
+                        {"configurable": configurable},
+                        thread_id,
+                        {
+                            "ocr_output": cached_ocr,
+                            "scene_context": cached_scene,
+                            "question": None,
+                        },
+                    )
+            yield "outcome", (cached_audio_path or None, cached_text)
             return
         resources.image_cache.discard(cache_key)
 
@@ -1526,8 +1591,16 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
     # visitor as if it were that photo's own answer"). Quota is cheaper
     # than permanently serving silence to a blind user, so a text-only
     # outcome is left to retry next time.
+    #
+    # ocr_output/scene_context are stored ALONGSIDE the spoken result so a
+    # later hit can put them back on the hitting caller's thread - see
+    # ImageResultCache's docstring for the two ways a hit used to leave the
+    # thread describing a different photo than the user had just heard about.
     if audio_path:
-        resources.image_cache.put(cache_key, outcome)
+        resources.image_cache.put(
+            cache_key,
+            (audio_path, outcome[1], result.get("ocr_output") or "", result.get("scene_context") or ""),
+        )
     yield "outcome", outcome
 
 
@@ -1583,7 +1656,23 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
     # See NO_QUESTION_MESSAGE: a blank question must never reach the graph,
     # because entry_destination would route it to `vision` and re-run the
     # whole photo pipeline.
-    question = (question or "").strip()
+    #
+    # THE isinstance CHECK IS NOT DECORATION (deep-review MINOR, issue #82 /
+    # P9.3): this line runs BEFORE the try below, so a non-string question
+    # would have raised AttributeError from .strip() straight into Gradio.
+    # Nothing reaches this with a non-string today - Gradio's Textbox
+    # preprocesses to str - but this module's contract is "never raise",
+    # not "never raise while Gradio behaves as expected", and
+    # _run_followup_events is a public-ish seam that scripts and tests call
+    # directly. Anything that is not a usable string is treated as no
+    # question at all, which is the honest reading of it.
+    # clarif_eye.graph.entry_destination's TypeError stays what it already
+    # was: the second layer, for a question that reaches the graph by some
+    # other route.
+    if not isinstance(question, str):
+        yield "outcome", (None, NO_QUESTION_MESSAGE)
+        return
+    question = question.strip()
     if not question:
         yield "outcome", (None, NO_QUESTION_MESSAGE)
         return
