@@ -83,6 +83,7 @@ SCENARIOS = [
         "system": "Fast-synth node (clarif_eye.synth, the eyes role again)",
         "mock_test_modules": [
             "tests/test_synth.py",
+            "tests/test_synth_fixture_replay.py",
         ],
         "scenario_paths": [
             "scripts/record_synth_fixture.py",
