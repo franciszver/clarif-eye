@@ -194,6 +194,51 @@ def test_openrouter_error_degrades_without_raising():
     _assert_reasonable_message(result["scene_context"], mentions="configuration")
 
 
+# --- Degradation: category-specific messages (issue #18 / P6.2) -------------
+#
+# The exhaustion/terminal-error branches above already existed; these prove
+# run_vision picks a DIFFERENT message per Attempt.category / status_code,
+# not just "some reasonable-looking sentence" - a user must be able to tell
+# a busy service from a broken configuration.
+
+
+def test_all_rungs_rate_limited_produces_a_busy_not_broken_message():
+    from clarif_eye.client import Attempt
+
+    attempts = (
+        Attempt("model-a", "rate_limited", 429, "rate limited"),
+        Attempt("model-b", "rate_limited", 429, "rate limited"),
+    )
+    client = FakeVisionClient(exc=LadderExhaustedError("eyes", attempts))
+
+    result = run_vision("base64data", client)
+
+    message = result["scene_context"].lower()
+    assert "busy" in message
+    assert "configuration" not in message
+    assert "broken" not in message
+
+
+def test_payload_too_large_produces_a_message_distinct_from_config_error():
+    client = FakeVisionClient(exc=OpenRouterError("too large", status_code=413))
+
+    result = run_vision("base64data", client)
+
+    message = result["scene_context"].lower()
+    assert "photo" in message
+    assert "configuration" not in message
+
+
+def test_config_error_never_tells_the_user_to_retry():
+    client = FakeVisionClient(exc=OpenRouterError("authentication failed", status_code=401))
+
+    result = run_vision("base64data", client)
+
+    message = result["scene_context"].lower()
+    assert "try again" not in message
+    assert "retry" not in message
+
+
 # --- Degradation: unexpected exception types (FIX 1) -------------------------
 
 

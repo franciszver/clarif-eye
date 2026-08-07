@@ -28,6 +28,10 @@ regularly (see vision.py's module docstring):
 """
 
 from clarif_eye.client import LadderExhaustedError, OpenRouterClient, OpenRouterError
+from clarif_eye.failure_messages import (
+    message_for_ladder_exhausted,
+    message_for_terminal_error,
+)
 from clarif_eye.prompting import fence_untrusted
 from clarif_eye.speech import to_spoken_text as _to_spoken_text
 from clarif_eye.vision import is_degraded_scene
@@ -146,27 +150,15 @@ def run_fast_synth(ocr_output, scene_context, client=None, deadline_exceeded=Fal
     if owns_client:
         try:
             client = _default_client()
-        except OpenRouterError:
-            return _degraded(
-                "The spoken description could not be prepared because of a "
-                "configuration problem with the service. Please tell "
-                "whoever set this up."
-            )
+        except OpenRouterError as exc:
+            return _degraded(message_for_terminal_error(exc))
     try:
         try:
             result = client.complete("eyes", _build_messages(ocr_output, scene_context))
-        except LadderExhaustedError:
-            return _degraded(
-                "The spoken description could not be prepared right now: "
-                "every available model was busy or unavailable. Please try "
-                "again in a moment."
-            )
-        except OpenRouterError:
-            return _degraded(
-                "The spoken description could not be prepared because of a "
-                "configuration problem with the service. Please tell "
-                "whoever set this up."
-            )
+        except LadderExhaustedError as exc:
+            return _degraded(message_for_ladder_exhausted(exc))
+        except OpenRouterError as exc:
+            return _degraded(message_for_terminal_error(exc))
         except Exception:
             # Contract (module docstring): no raw exception may escape into
             # the graph. Catches everything else an injected client could

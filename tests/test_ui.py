@@ -13,7 +13,9 @@ already use (is_degraded_scene / is_chain_exhausted).
 """
 
 from clarif_eye import tts as tts_module
-from clarif_eye.client import OpenRouterError
+from clarif_eye.client import Attempt, LadderExhaustedError, OpenRouterError
+from clarif_eye.failure_messages import BUSY_MESSAGE
+from clarif_eye.failure_messages import CONFIG_ERROR_MESSAGE as MAPPED_CONFIG_ERROR_MESSAGE
 from clarif_eye.ui import (
     AppResources,
     AUDIO_UNAVAILABLE_NOTE,
@@ -215,6 +217,39 @@ def test_unexpected_exception_in_graph_is_handled_not_raised():
 
     assert audio is None
     assert text == UNEXPECTED_ERROR_MESSAGE
+
+
+# --- A LadderExhaustedError/OpenRouterError escaping the graph itself -------
+# (issue #18 / P6.2 scope item 4): every node already degrades these
+# internally, but if the whole pipeline fails before a node can degrade
+# (e.g. a client-construction failure not caught by a node), the UI must
+# apply the same category mapping, not collapse it into the generic
+# UNEXPECTED_ERROR_MESSAGE.
+
+
+def test_ladder_exhausted_escaping_the_graph_produces_the_busy_message():
+    attempts = (
+        Attempt("model-a", "rate_limited", 429, "rate limited"),
+        Attempt("model-b", "rate_limited", 429, "rate limited"),
+    )
+    graph = FakeGraph(exc=LadderExhaustedError("eyes", attempts))
+    resources = _resources(graph)
+
+    audio, text = handle_submit(FakeImage(), resources)
+
+    assert audio is None
+    assert text == BUSY_MESSAGE
+
+
+def test_terminal_config_error_escaping_the_graph_never_says_try_again():
+    graph = FakeGraph(exc=OpenRouterError("authentication failed", status_code=401))
+    resources = _resources(graph)
+
+    audio, text = handle_submit(FakeImage(), resources)
+
+    assert audio is None
+    assert text == MAPPED_CONFIG_ERROR_MESSAGE
+    assert "try again" not in text.lower()
 
 
 # --- Shared client: constructed once, injected on every invocation -------
