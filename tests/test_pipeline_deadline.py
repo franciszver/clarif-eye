@@ -22,8 +22,6 @@ hardcoded 4000.
 
 import time
 
-import pytest
-
 from clarif_eye import analysis, research, synth, vision
 from clarif_eye.client import CompletionResult
 from clarif_eye.graph import (

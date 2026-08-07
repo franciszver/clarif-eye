@@ -1,0 +1,39 @@
+name: CI
+
+# Model inference never runs here. Tests replay recordings committed under
+# tests/fixtures/ through deterministic assertions, so this workflow needs
+# no API key and makes no network call beyond installing dependencies.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # scripts/scan_history.py scans every commit reachable from every
+          # ref. A shallow checkout would only scan the last commit and
+          # pass without having checked anything.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches render.yaml's PYTHON_VERSION pin, so CI and production
+          # run the same interpreter.
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install package and dev dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        run: python -m pytest
+
+      - name: Scan full history for leaked credentials
+        run: python scripts/scan_history.py

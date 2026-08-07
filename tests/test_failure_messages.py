@@ -93,8 +93,6 @@ def test_all_timeouts_yield_timed_out_message():
 
 
 def test_budget_exhausted_alone_also_yields_timed_out_message(monkeypatch):
-    import time
-
     from clarif_eye import client as client_module
 
     monkeypatch.setitem(client_module.ROLE_TIMEOUTS, "eyes", 0.0)

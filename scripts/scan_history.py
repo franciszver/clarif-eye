@@ -15,7 +15,6 @@ the object/commit counts scanned if clean.
 
 import re
 import subprocess
-import sys
 
 SECRET_PATTERNS = [
     ("OpenRouter key", re.compile(r"sk-or-v1-[A-Za-z0-9]+")),

@@ -11,7 +11,7 @@ requires-python = ">=3.11"
 dependencies = ["httpx>=0.27", "langgraph>=1.2", "ddgs>=9.0", "beautifulsoup4>=4.12", "edge-tts>=6.1", "gTTS>=2.5", "gradio>=5.0"]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4"]
+dev = ["pytest>=7.4", "ruff>=0.6"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -25,3 +25,15 @@ clarif_eye = ["config/models.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+# Start narrow: undefined names/imports (F) and unused imports/variables
+# (F401/F841) are real bugs. E/W (pycodestyle) and the rest of the default
+# rule set are left off for now; the codebase was never formatted against
+# them and enabling them would need a mass reformat rather than a
+# defensible gate. See CHECK F in the CI proof for what else was tried and
+# dropped, and why.
+select = ["F"]
