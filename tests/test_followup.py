@@ -68,10 +68,21 @@ class RecordingClient:
     is computed structurally from the request body (an "image_url" content
     part), which is the only honest way to tell a real vision call apart
     from clarif_eye.synth's image-free call on the SAME "eyes" role.
+
+    `ocr_texts`, when given, makes each successive VISION call report a
+    different photo - which is what lets a test tell "the thread remembers
+    the photo the user is actually looking at" apart from "the thread
+    remembers whichever photo happened to run last".
     """
 
-    def __init__(self):
+    def __init__(self, ocr_texts=None):
         self.calls = []
+        self.ocr_texts = list(ocr_texts) if ocr_texts else None
+
+    def _next_ocr(self):
+        if self.ocr_texts is None:
+            return STORED_OCR_TEXT
+        return self.ocr_texts[len(self.vision_calls()) - 1]
 
     @staticmethod
     def _flatten(messages):
@@ -94,7 +105,7 @@ class RecordingClient:
         self.calls.append((role, has_image, prompt))
         if has_image:
             return CompletionResult(
-                content=f"OCR_TEXT: {STORED_OCR_TEXT}\nSCENE: {STORED_SCENE_TEXT}",
+                content=f"OCR_TEXT: {self._next_ocr()}\nSCENE: {STORED_SCENE_TEXT}",
                 model="fake-eyes-model:free",
             )
         if role == "brain":
@@ -306,6 +317,71 @@ def test_a_blank_question_is_refused_without_running_the_graph():
 
     assert len(client.calls) == calls_after_photo
     assert updates[-1][2] == NO_QUESTION_MESSAGE
+
+
+# --- Image-cache hits must keep the thread in step with what was spoken ---
+#
+# The image cache (issue #75) short-circuits the graph entirely on a repeat
+# photo: nothing runs, so nothing writes ocr_output/scene_context onto the
+# thread. Before this was fixed, that left the checkpoint describing a
+# DIFFERENT photo than the one the user had just been told about - and a
+# follow-up answers from the checkpoint. Two ways that goes wrong, both
+# reproduced below as they were proven in review.
+
+
+def test_a_follow_up_after_a_cache_hit_answers_about_the_photo_just_described():
+    """Scenario (a): one thread, photo A, then photo B, then photo A again.
+
+    The third submit is a cache hit, so the graph never runs and the
+    checkpoint still holds photo B's OCR. The user has just heard photo A
+    described. Asking a question then answered about B - the wrong document,
+    with no signal to a blind user that anything was amiss.
+    """
+    client = RecordingClient(ocr_texts=["alpha label text", "bravo label text"])
+    resources = _resources(client)
+    thread_id = "cache-hit-same-thread"
+
+    list(handle_submit_staged(FakeImage(content=b"photo-a"), resources, thread_id=thread_id))
+    list(handle_submit_staged(FakeImage(content=b"photo-b"), resources, thread_id=thread_id))
+    # Photo A again: a cache hit, so no third vision call.
+    list(handle_submit_staged(FakeImage(content=b"photo-a"), resources, thread_id=thread_id))
+    assert len(client.vision_calls()) == 2, "third submit should have been a cache hit"
+
+    list(handle_ask_staged(QUESTION, resources, thread_id=thread_id))
+
+    _role, _has_image, prompt = client.brain_calls()[-1]
+    assert "alpha label text" in prompt, (
+        "the follow-up must answer about the photo the user was just told "
+        "about (A), not whichever photo last ran through the graph (B)"
+    )
+    assert "bravo label text" not in prompt
+
+
+def test_a_follow_up_after_a_cache_hit_on_a_fresh_thread_still_has_a_photo():
+    """Scenario (b): the cache is process-wide, threads are per-session.
+
+    A second visitor submits a photo the first visitor already sent. They
+    get the cached description read aloud - but their OWN thread never ran
+    the graph, so it holds nothing. Asking a question then said "no photo
+    yet" seconds after a description had been spoken.
+    """
+    client = RecordingClient(ocr_texts=["alpha label text"])
+    resources = _resources(client)
+
+    list(handle_submit_staged(FakeImage(content=b"shared-photo"), resources, thread_id="visitor-one"))
+    list(handle_submit_staged(FakeImage(content=b"shared-photo"), resources, thread_id="visitor-two"))
+    assert len(client.vision_calls()) == 1, "visitor two should have been a cache hit"
+
+    updates = list(handle_ask_staged(QUESTION, resources, thread_id="visitor-two"))
+
+    final_text = updates[-1][2]
+    assert NO_PHOTO_YET_MESSAGE not in final_text, (
+        "a visitor who was just read a description must not be told there is "
+        "no photo yet"
+    )
+    assert CANNED_ANSWER in final_text
+    _role, _has_image, prompt = client.brain_calls()[-1]
+    assert "alpha label text" in prompt
 
 
 def test_follow_up_before_any_photo_speaks_an_explanation_and_calls_no_model():
