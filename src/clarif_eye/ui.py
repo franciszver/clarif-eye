@@ -46,7 +46,11 @@ from dataclasses import dataclass
 
 import gradio as gr
 
-from clarif_eye.client import OpenRouterClient, OpenRouterError
+from clarif_eye.client import LadderExhaustedError, OpenRouterClient, OpenRouterError
+from clarif_eye.failure_messages import (
+    message_for_ladder_exhausted,
+    message_for_terminal_error,
+)
 from clarif_eye.graph import DEFAULT_PIPELINE_BUDGET_SECONDS, build_graph
 from clarif_eye.state import make_initial_state
 from clarif_eye.tts import DEFAULT_PROVIDER_CHAIN, is_chain_exhausted
@@ -795,6 +799,16 @@ def handle_submit(image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUD
             }
         }
         result = resources.graph.invoke(state, config=config)
+    except LadderExhaustedError as exc:
+        # Every node already catches and degrades this internally (see
+        # vision.py/synth.py/analysis.py); this branch only matters if the
+        # whole pipeline fails before a node can degrade (issue #18 / P6.2
+        # scope item 4, e.g. a client-construction failure a node did not
+        # catch). Uses the SAME category mapping the nodes use, rather than
+        # collapsing into the generic UNEXPECTED_ERROR_MESSAGE below.
+        return None, message_for_ladder_exhausted(exc)
+    except OpenRouterError as exc:
+        return None, message_for_terminal_error(exc)
     except Exception:
         return None, UNEXPECTED_ERROR_MESSAGE
 

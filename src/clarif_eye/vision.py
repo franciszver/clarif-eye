@@ -15,7 +15,12 @@ of returning the key on every branch (including the degraded ones); it
 just no longer computes the rule itself.
 """
 
+from clarif_eye import failure_messages
 from clarif_eye.client import LadderExhaustedError, OpenRouterClient, OpenRouterError
+from clarif_eye.failure_messages import (
+    message_for_ladder_exhausted,
+    message_for_terminal_error,
+)
 from clarif_eye.router import classify_complexity
 from clarif_eye.speech import strip_code_fence
 
@@ -237,14 +242,19 @@ def _parse_reply(reply):
 # scene description" WITHOUT matching against the English wording, so that
 # rewording one of these messages for accessibility (issues #15/#18) can't
 # silently break that detection - see is_degraded_scene below.
-DEGRADED_CONFIG_ERROR = (
-    "Vision could not run because of a configuration problem with the "
-    "service. Please tell whoever set this up."
-)
-DEGRADED_LADDER_EXHAUSTED = (
-    "Vision could not run right now: every available model was busy or "
-    "unavailable. Please try again in a moment."
-)
+#
+# DEGRADED_CONFIG_ERROR, DEGRADED_LADDER_EXHAUSTED, DEGRADED_BUSY,
+# DEGRADED_PAYLOAD_TOO_LARGE, and DEGRADED_TIMED_OUT below are bound to
+# failure_messages.py's module constants (issue #18 / P6.2) rather than
+# duplicated text, so this module and synth.py/analysis.py/ui.py share
+# exactly one copy of each message - see failure_messages.py's module
+# docstring for why the category->message mapping lives there instead of
+# here or in speech.py.
+DEGRADED_CONFIG_ERROR = failure_messages.CONFIG_ERROR_MESSAGE
+DEGRADED_LADDER_EXHAUSTED = failure_messages.GENERIC_FAILURE_MESSAGE
+DEGRADED_BUSY = failure_messages.BUSY_MESSAGE
+DEGRADED_PAYLOAD_TOO_LARGE = failure_messages.PAYLOAD_TOO_LARGE_MESSAGE
+DEGRADED_TIMED_OUT = failure_messages.TIMED_OUT_MESSAGE
 DEGRADED_UNEXPECTED_ERROR = (
     "Vision could not run because of an unexpected internal error. Please "
     "try again, and tell whoever set this up if it keeps happening."
@@ -271,6 +281,9 @@ def is_degraded_scene(text):
     return stripped in (
         DEGRADED_CONFIG_ERROR,
         DEGRADED_LADDER_EXHAUSTED,
+        DEGRADED_BUSY,
+        DEGRADED_PAYLOAD_TOO_LARGE,
+        DEGRADED_TIMED_OUT,
         DEGRADED_UNEXPECTED_ERROR,
         DEGRADED_EMPTY_REPLY,
         DEGRADED_UNPARSEABLE_REPLY,
@@ -315,15 +328,15 @@ def run_vision(image_data, client=None, deadline_exceeded=False):
     if owns_client:
         try:
             client = _default_client()
-        except OpenRouterError:
-            return _degraded(DEGRADED_CONFIG_ERROR)
+        except OpenRouterError as exc:
+            return _degraded(message_for_terminal_error(exc))
     try:
         try:
             result = client.complete("eyes", _build_messages(image_data))
-        except LadderExhaustedError:
-            return _degraded(DEGRADED_LADDER_EXHAUSTED)
-        except OpenRouterError:
-            return _degraded(DEGRADED_CONFIG_ERROR)
+        except LadderExhaustedError as exc:
+            return _degraded(message_for_ladder_exhausted(exc))
+        except OpenRouterError as exc:
+            return _degraded(message_for_terminal_error(exc))
         except Exception:
             # Contract (module docstring): no raw exception may escape into
             # the graph. This catches everything else the injected client

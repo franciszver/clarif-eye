@@ -14,7 +14,7 @@ import pytest
 from clarif_eye.client import CompletionResult, LadderExhaustedError, OpenRouterError
 from clarif_eye.graph import build_graph, fast_synth_node
 from clarif_eye.state import make_initial_state
-from clarif_eye import synth
+from clarif_eye import synth, vision
 from clarif_eye.synth import _to_spoken_text, run_fast_synth
 
 # --- Shared TTS-safety assertion, applied to every produced output ---------
@@ -172,12 +172,18 @@ def test_empty_ocr_with_real_scene_calls_model_and_does_not_ask_about_absent_tex
 @pytest.mark.parametrize(
     "degradation_message",
     [
-        "Vision could not run right now: every available model was busy or "
-        "unavailable. Please try again in a moment.",
-        "Vision could not run because of a configuration problem with the "
-        "service. Please tell whoever set this up.",
-        "The vision model returned an empty response.",
-        "The vision model's response could not be understood.",
+        # Read live off vision.py's own constants (issue #18 / P6.2 changed
+        # their wording) rather than a pinned copy, matching the module's
+        # own "structural, not textual" detection - see
+        # test_rewording_a_vision_degradation_message_does_not_break_detection
+        # below for the same reasoning applied explicitly.
+        vision.DEGRADED_LADDER_EXHAUSTED,
+        vision.DEGRADED_CONFIG_ERROR,
+        vision.DEGRADED_BUSY,
+        vision.DEGRADED_PAYLOAD_TOO_LARGE,
+        vision.DEGRADED_TIMED_OUT,
+        vision.DEGRADED_EMPTY_REPLY,
+        vision.DEGRADED_UNPARSEABLE_REPLY,
     ],
 )
 def test_empty_ocr_with_vision_degradation_message_is_not_echoed_as_a_description(

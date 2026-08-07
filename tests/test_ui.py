@@ -14,7 +14,8 @@ already use (is_degraded_scene / is_chain_exhausted).
 
 from clarif_eye import tts as tts_module
 from clarif_eye.client import Attempt, LadderExhaustedError, OpenRouterError
-from clarif_eye.failure_messages import BUSY_MESSAGE, CONFIG_ERROR_MESSAGE
+from clarif_eye.failure_messages import BUSY_MESSAGE
+from clarif_eye.failure_messages import CONFIG_ERROR_MESSAGE as MAPPED_CONFIG_ERROR_MESSAGE
 from clarif_eye.ui import (
     AppResources,
     AUDIO_UNAVAILABLE_NOTE,
@@ -247,7 +248,7 @@ def test_terminal_config_error_escaping_the_graph_never_says_try_again():
     audio, text = handle_submit(FakeImage(), resources)
 
     assert audio is None
-    assert text == CONFIG_ERROR_MESSAGE
+    assert text == MAPPED_CONFIG_ERROR_MESSAGE
     assert "try again" not in text.lower()
 
 

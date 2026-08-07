@@ -65,7 +65,20 @@ _TERMINAL_STATUS_REASONS = {
 
 
 class OpenRouterError(Exception):
-    """Base error for OpenRouter client configuration and usage failures."""
+    """Base error for OpenRouter client configuration and usage failures.
+
+    `status_code` (issue #18 / P6.2): the terminal HTTP status this came
+    from, when known - one of _TERMINAL_STATUS_REASONS's keys (401/402/403/
+    413), or the malformed-400-request status. None for a missing/blank API
+    key or an unknown role, where there was no HTTP response at all. A
+    caller (see failure_messages.py) uses this to pick a spoken message per
+    status without parsing this exception's English text, the same reason
+    Attempt.category exists for LadderExhaustedError.
+    """
+
+    def __init__(self, message, status_code=None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @dataclass(frozen=True)
@@ -242,7 +255,8 @@ class OpenRouterClient:
                 raise OpenRouterError(
                     f"OpenRouter request failed for model {model!r} "
                     f"(HTTP {response.status_code}): {_TERMINAL_STATUS_REASONS[response.status_code]} "
-                    f"({reason})"
+                    f"({reason})",
+                    status_code=response.status_code,
                 )
 
             if response.status_code == 429:
@@ -267,7 +281,8 @@ class OpenRouterClient:
                     continue
                 raise OpenRouterError(
                     f"OpenRouter rejected the request as malformed (HTTP 400) "
-                    f"for model {model!r}: {reason}"
+                    f"for model {model!r}: {reason}",
+                    status_code=400,
                 )
             attempts.append(
                 Attempt(model, "unexpected_status", response.status_code, reason)
