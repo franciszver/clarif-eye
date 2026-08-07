@@ -61,25 +61,25 @@ def test_readme_links_live_app_and_states_cold_start():
     readme_path = REPO_ROOT / "README.md"
     text = readme_path.read_text(encoding="utf-8")
     url = "https://clarif-eye.onrender.com"
-    assert url in text, "README does not link the deployed app URL"
 
-    index = text.index(url)
-    start = max(0, index - 300)
-    end = min(len(text), index + 300)
-    nearby = text[start:end]
-    cold_start_pattern = re.compile(
-        r"\b6\d(\.\d+)?\s*seconds?\b.{0,80}"
-        r"(first request|wak(e|ing|es)|sleep(s|ing)?)"
-        r"|"
-        r"(first request|wak(e|ing|es)|sleep(s|ing)?).{0,80}"
-        r"\b6\d(\.\d+)?\s*seconds?\b",
-        re.IGNORECASE | re.DOTALL,
+    # The URL must be an actual markdown link target, not just bare text
+    # somewhere in the doc (an editor could strip the brackets and leave an
+    # inert string that still passes a plain substring check).
+    assert re.search(r"\[[^\]]*\]\(" + re.escape(url) + r"\)", text), (
+        "README does not render the deployed app URL as a markdown link"
     )
-    assert cold_start_pattern.search(nearby), (
-        "README does not mention the cold-start wait (a number around 60 "
-        "seconds together with wording about the first request / waking / "
-        "sleeping) near the deployed URL"
+
+    # Scope the cold-start checks to the intro (everything before the first
+    # "##" heading) rather than a fixed character window around the URL, so
+    # legitimate prose edits elsewhere in the intro don't break the test.
+    intro = text.split("\n## ", 1)[0]
+    assert re.search(r"\b6\d(\.\d+)?\s*seconds?\b", intro, re.IGNORECASE), (
+        "README does not mention an approximate wait time (around 60 "
+        "seconds) in the intro"
     )
+    assert re.search(
+        r"first request|wak(e|ing|es)|sleep(s|ing)?", intro, re.IGNORECASE
+    ), "README does not mention waking/sleeping in the intro"
 
 
 def test_committed_docs_have_no_process_meta_language():

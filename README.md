@@ -2,6 +2,11 @@
 
 [![CI](https://github.com/franciszver/clarif-eye/actions/workflows/ci.yml/badge.svg)](https://github.com/franciszver/clarif-eye/actions/workflows/ci.yml)
 
+Try it live: [https://clarif-eye.onrender.com](https://clarif-eye.onrender.com).
+It runs on a free hosting tier, so if it has been idle the first request
+can take about 60 seconds to wake it up; see [Deployment](#deployment) for
+why.
+
 Clarif-Eye turns a photo into a spoken description, for people who cannot
 see the photo they are describing. Point a camera at a bill, a label, or a
 document, and the app reads the text, describes the scene, and speaks the
