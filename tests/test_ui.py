@@ -12,6 +12,10 @@ string-matching the script text - the same discipline vision.py/tts.py
 already use (is_degraded_scene / is_chain_exhausted).
 """
 
+import os
+
+import pytest
+
 from clarif_eye import tts as tts_module
 from clarif_eye.client import Attempt, LadderExhaustedError, OpenRouterError
 from clarif_eye.failure_messages import BUSY_MESSAGE
@@ -20,25 +24,34 @@ from clarif_eye.ui import (
     AppResources,
     AUDIO_UNAVAILABLE_NOTE,
     CONFIG_ERROR_MESSAGE,
+    IMAGE_CACHE_MAX_ENTRIES,
     NO_IMAGE_MESSAGE,
     UNEXPECTED_ERROR_MESSAGE,
     UNREADABLE_IMAGE_MESSAGE,
     build_resources,
     handle_submit,
+    handle_submit_staged,
 )
 
 
 class FakeImage:
-    """Stand-in for a PIL Image good enough for base64 encoding."""
+    """Stand-in for a PIL Image good enough for base64 encoding.
 
-    def __init__(self, mode="RGB"):
+    `content` defaults to fixed bytes for tests that don't care what's in
+    the "photo"; cache tests (issue #75) pass a distinct `content` per
+    "photo" so they can tell two images apart by content rather than by
+    identity/path - the same distinction the cache itself must make.
+    """
+
+    def __init__(self, mode="RGB", content=b"\xff\xd8\xff\xe0fakejpegbytes"):
         self.mode = mode
+        self.content = content
 
     def convert(self, mode):
         return self
 
     def save(self, buf, format=None):
-        buf.write(b"\xff\xd8\xff\xe0fakejpegbytes")
+        buf.write(self.content)
 
 
 class BrokenImage:
@@ -66,6 +79,22 @@ class FakeGraph:
         if self.exc is not None:
             raise self.exc
         return self.result
+
+
+class SequencedGraph:
+    """Like FakeGraph, but returns a DIFFERENT final_output on each
+    invocation - lets cache tests (issue #75) assert that two different
+    images produce genuinely different results, not just different call
+    counts."""
+
+    def __init__(self, outputs):
+        self.outputs = list(outputs)
+        self.invocations = []
+
+    def invoke(self, state, config=None):
+        idx = len(self.invocations)
+        self.invocations.append({"state": state, "config": config})
+        return {"final_output": self.outputs[idx], "audio_file_path": ""}
 
 
 def _resources(graph, client="fake-client"):
@@ -263,8 +292,11 @@ def test_handle_submit_shares_one_client_across_invocations():
     shared_client = object()
     resources = _resources(graph, client=shared_client)
 
-    for _ in range(3):
-        handle_submit(FakeImage(), resources)
+    # Distinct content per call (issue #75's cache would otherwise turn
+    # repeats of the SAME image into hits) - this test is about the
+    # client being shared, not about caching.
+    for i in range(3):
+        handle_submit(FakeImage(content=f"photo-{i}".encode()), resources)
 
     assert len(graph.invocations) == 3
     clients_used = [inv["config"]["configurable"]["client"] for inv in graph.invocations]
@@ -286,3 +318,224 @@ def test_build_resources_constructs_client_only_once(monkeypatch):
         handle_submit(FakeImage(), resources)
 
     assert len(calls) == 1
+
+
+# --- Image content cache (issue #75): identical photos cost one model call -
+#
+# The same photo submitted twice must cost one model call, not two.
+# Keyed on the DECODED image content (the bytes handle_submit actually
+# sends), never on filename/path - the same photo uploaded twice arrives
+# at a different temp path each time.
+
+
+def test_image_cache_size_never_exceeds_the_tts_retention_count():
+    # This bound only rules out slots that are CERTAIN to be dead: a cache
+    # entry beyond the retained-file count can never be served, because
+    # _prune_old_files (mtime-based) will already have deleted its mp3
+    # before it could ever be a hit. It does NOT guarantee a live entry
+    # keeps its file even within the bound - cache eviction is LRU by
+    # ACCESS time while file pruning is by WRITE time, and a cache hit
+    # never updates mtime, so a repeatedly-hit entry can stay "live" here
+    # while its file still ages out of the MAX_KEPT_FILES most-recently-
+    # written set. The stale-file guard in handle_submit (treating a
+    # missing file as a miss, never a lying hit) is what actually makes
+    # that safe, not this bound.
+    assert IMAGE_CACHE_MAX_ENTRIES <= tts_module.MAX_KEPT_FILES, (
+        f"IMAGE_CACHE_MAX_ENTRIES ({IMAGE_CACHE_MAX_ENTRIES}) exceeds "
+        f"tts.MAX_KEPT_FILES ({tts_module.MAX_KEPT_FILES}): a cache entry "
+        "beyond the retained-file count can never be served, because "
+        "_prune_old_files will already have deleted its mp3. This bound "
+        "does not, by itself, guarantee a live entry keeps its file even "
+        "within it (eviction is by access time, pruning is by write "
+        "time) - the stale-file guard in handle_submit is what makes "
+        "that case safe. Lower IMAGE_CACHE_MAX_ENTRIES to at most "
+        "MAX_KEPT_FILES."
+    )
+
+
+def test_identical_image_content_reuses_cached_result_no_second_call(tmp_path):
+    audio_path = tmp_path / "out.mp3"
+    audio_path.write_bytes(b"fake-mp3-bytes")  # must exist: a cache hit checks this
+    tts_module._last_result_set(
+        tts_module.TtsResult(str(audio_path), (tts_module.ProviderAttempt("Edge", "success", ""),), "Edge")
+    )
+    graph = FakeGraph(result={"final_output": "A cat sits on a mat.", "audio_file_path": str(audio_path)})
+    resources = _resources(graph)
+
+    first = handle_submit(FakeImage(content=b"photo-one-bytes"), resources)
+    second = handle_submit(FakeImage(content=b"photo-one-bytes"), resources)
+
+    assert len(graph.invocations) == 1
+    assert first == second == (str(audio_path), "A cat sits on a mat.")
+
+
+def test_cache_hit_yields_the_same_staged_sequence_as_a_miss(tmp_path):
+    audio_path = tmp_path / "out.mp3"
+    audio_path.write_bytes(b"fake-mp3-bytes")  # must exist: a cache hit checks this
+    tts_module._last_result_set(
+        tts_module.TtsResult(str(audio_path), (tts_module.ProviderAttempt("Edge", "success", ""),), "Edge")
+    )
+    graph = FakeGraph(result={"final_output": "A cat sits on a mat.", "audio_file_path": str(audio_path)})
+    resources = _resources(graph)
+
+    miss_updates = list(handle_submit_staged(FakeImage(content=b"photo-two-bytes"), resources))
+    hit_updates = list(handle_submit_staged(FakeImage(content=b"photo-two-bytes"), resources))
+
+    assert len(graph.invocations) == 1  # confirms the second run was a hit
+    assert len(miss_updates) == len(hit_updates) == 3
+    # Same shape on both: working status first, then status+text with no
+    # audio, then (only after the existing delay) status+text+audio - a
+    # hit must not skip or reorder the audio-delay stage.
+    for miss, hit in zip(miss_updates, hit_updates):
+        assert len(miss) == len(hit) == 3
+    assert miss_updates[0][1] is None
+    assert hit_updates[0][1] is None
+    assert miss_updates[1][1] is None
+    assert hit_updates[1][1] is None
+    assert miss_updates[2][1] == hit_updates[2][1] == str(audio_path)
+    assert miss_updates[2][2] == hit_updates[2][2] == "A cat sits on a mat."
+
+
+def test_different_images_produce_two_calls_and_two_different_results():
+    graph = SequencedGraph(["first description", "second description"])
+    resources = _resources(graph)
+
+    _, text_a = handle_submit(FakeImage(content=b"photo-a-bytes"), resources)
+    _, text_b = handle_submit(FakeImage(content=b"photo-b-bytes"), resources)
+
+    assert len(graph.invocations) == 2
+    assert text_a == "first description"
+    assert text_b == "second description"
+    assert text_a != text_b
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        RuntimeError("boom"),
+        LadderExhaustedError(
+            "eyes",
+            (
+                Attempt("model-a", "rate_limited", 429, "rate limited"),
+                Attempt("model-b", "rate_limited", 429, "rate limited"),
+            ),
+        ),
+        OpenRouterError("authentication failed", status_code=401),
+    ],
+    ids=["generic-exception", "ladder-exhausted", "openrouter-error"],
+)
+def test_failed_result_is_not_cached_a_retry_makes_a_second_call(exc):
+    graph = FakeGraph(exc=exc)
+    resources = _resources(graph)
+
+    handle_submit(FakeImage(content=b"photo-fail-bytes"), resources)
+    handle_submit(FakeImage(content=b"photo-fail-bytes"), resources)
+
+    assert len(graph.invocations) == 2
+
+
+class FileWritingGraph:
+    """FakeGraph that actually writes bytes to `audio_path` on each
+    invoke() call, standing in for the real pipeline actually producing a
+    fresh mp3 - lets a test tell "the cache lied about a path" apart from
+    "the pipeline never ran again" (issue #75 follow-up)."""
+
+    def __init__(self, audio_path, final_output):
+        self.audio_path = audio_path
+        self.final_output = final_output
+        self.invocations = []
+
+    def invoke(self, state, config=None):
+        self.invocations.append({"state": state, "config": config})
+        self.audio_path.write_bytes(b"fake-mp3-bytes")
+        return {"final_output": self.final_output, "audio_file_path": str(self.audio_path)}
+
+
+class SequencedTtsGraph:
+    """Like SequencedGraph, but also plants tts_module's last-result state
+    on each invoke() call - simulating a real run_tts() call happening
+    inside the graph - so is_chain_exhausted() reflects THIS call's TTS
+    outcome, not whatever setup_function/a previous call left behind.
+    `outcomes` is a list of (final_output, audio_path, TtsResult) tuples,
+    one per successive invoke() call."""
+
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.invocations = []
+
+    def invoke(self, state, config=None):
+        idx = len(self.invocations)
+        self.invocations.append({"state": state, "config": config})
+        final_output, audio_path, tts_result = self.outcomes[idx]
+        tts_module._last_result_set(tts_result)
+        return {"final_output": final_output, "audio_file_path": audio_path}
+
+
+def test_chain_exhausted_result_is_not_cached_a_retry_reruns_and_recovers(tmp_path):
+    # Issue found in review: outcome (b) (description succeeded, every TTS
+    # provider failed for THIS call) used to be cached anyway, because
+    # handle_submit cached whenever the pipeline call didn't raise. That
+    # permanently muted a photo: TTS recovering later never mattered
+    # because the cache kept replaying the old text-only result. A
+    # text-only outcome is a degraded result and must be retried next
+    # time, per this module's own cache docstring ("a quota/API failure
+    # must never be replayed to the next visitor as if it were that
+    # photo's own answer").
+    audio_path = tmp_path / "out.mp3"
+    audio_path.write_bytes(b"fake-mp3-bytes")
+    failed_attempts = (
+        tts_module.ProviderAttempt("Edge", "error", "boom"),
+        tts_module.ProviderAttempt("Gtts", "error", "boom"),
+    )
+    graph = SequencedTtsGraph(
+        [
+            ("A cat sits on a mat.", "", tts_module.TtsResult("", failed_attempts, None)),
+            (
+                "A cat sits on a mat.",
+                str(audio_path),
+                tts_module.TtsResult(
+                    str(audio_path), (tts_module.ProviderAttempt("Edge", "success", ""),), "Edge"
+                ),
+            ),
+        ]
+    )
+    resources = _resources(graph)
+
+    first_audio, first_text = handle_submit(FakeImage(content=b"photo-tts-recovers"), resources)
+    second_audio, second_text = handle_submit(FakeImage(content=b"photo-tts-recovers"), resources)
+
+    assert first_audio is None
+    assert AUDIO_UNAVAILABLE_NOTE in first_text
+    assert len(graph.invocations) == 2  # second call re-ran the pipeline, not a cache hit
+    assert second_audio == str(audio_path)
+    assert second_text == "A cat sits on a mat."
+
+
+def test_cache_hit_with_a_deleted_audio_file_reruns_the_pipeline(tmp_path):
+    # The cache and the audio file normally share a process lifetime, but
+    # a temp cleaner, disk pressure, or a future change to file pruning
+    # (see tts.py's _prune_old_files - it DOES delete old mp3s) could
+    # leave a cached path pointing at nothing. Returning that path as a
+    # "hit" would have status_for_result announce "Description ready."
+    # while the audio element plays silence - the worst failure mode for
+    # a user who cannot see the screen. A miss is recoverable; a stale
+    # path is not.
+    audio_path = tmp_path / "out.mp3"
+    tts_module._last_result_set(
+        tts_module.TtsResult(str(audio_path), (tts_module.ProviderAttempt("Edge", "success", ""),), "Edge")
+    )
+    graph = FileWritingGraph(audio_path, "A cat sits on a mat.")
+    resources = _resources(graph)
+
+    first_audio, _ = handle_submit(FakeImage(content=b"photo-vanishing-file"), resources)
+    assert first_audio == str(audio_path)
+    assert len(graph.invocations) == 1
+    assert audio_path.exists()
+
+    audio_path.unlink()  # simulate the file disappearing between requests
+
+    second_audio, _ = handle_submit(FakeImage(content=b"photo-vanishing-file"), resources)
+
+    assert len(graph.invocations) == 2  # ran again - not a lying cache hit
+    assert second_audio == str(audio_path)
+    assert os.path.exists(second_audio)
