@@ -2,7 +2,7 @@
 on the text this project actually SHIPS: the user-facing string constants in
 clarif_eye.ui (status messages, labels, HOW_IT_WORKS_MARKDOWN, the diagram
 label/description), the static labels gr.Blocks renders in build_interface(),
-and docs/ACCESSIBILITY.md.
+docs/ACCESSIBILITY.md, and docs/SCENARIOS.md.
 
 WHAT THIS FILE DOES NOT CHECK, ON PURPOSE:
   - Tone, or whether the prose is good. That is a judgment call, not a
@@ -148,17 +148,23 @@ def _accessibility_doc_text():
     return {"docs/ACCESSIBILITY.md": path.read_text(encoding="utf-8")}
 
 
+def _scenarios_doc_text():
+    path = REPO_ROOT / "docs" / "SCENARIOS.md"
+    return {"docs/SCENARIOS.md": path.read_text(encoding="utf-8")}
+
+
 def shipped_texts():
     """Every piece of text in scope for the plain-language guard: the
     user-facing ui.py string constants, the static labels/markdown
-    build_interface() renders, and docs/ACCESSIBILITY.md. Returns
-    {name: text} so failures can name exactly where the offending text
-    lives.
+    build_interface() renders, docs/ACCESSIBILITY.md, and
+    docs/SCENARIOS.md. Returns {name: text} so failures can name exactly
+    where the offending text lives.
     """
     texts = {}
     texts.update(_ui_string_constants())
     texts.update(_ui_interface_strings())
     texts.update(_accessibility_doc_text())
+    texts.update(_scenarios_doc_text())
     return texts
 
 
