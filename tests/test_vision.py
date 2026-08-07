@@ -15,6 +15,8 @@ from clarif_eye.state import make_initial_state
 from clarif_eye import vision
 from clarif_eye.vision import _parse_reply, is_degraded_scene, run_vision
 
+from tests._stream_helpers import drain_stream_collecting_trace
+
 # 200 words, no data-density signals: trips only the router's long-document
 # word-count fallback (see clarif_eye.router), not the digit/currency/keyword
 # signals - i.e. exercises the "genuinely long document" branch of the
@@ -595,22 +597,6 @@ class _FakeTtsProvider:
             f.write(b"ID3" + b"\x00" * 32)
 
 
-def _invoke_collecting_trace(graph, state, config):
-    """Run the compiled graph via stream(..., stream_mode="updates") and
-    return (final_state, visited_node_names_in_order) - replaces the old
-    config["configurable"]["trace"] seam (issue #80 / P9.1, same helper
-    shape as test_graph.py's `run()`): each stream chunk is keyed by the
-    node that just completed, so collecting those keys in arrival order is
-    a drop-in replacement for what graph._record used to append."""
-    result = dict(state)
-    trace = []
-    for chunk in graph.stream(state, config=config, stream_mode="updates"):
-        for node_name, update in chunk.items():
-            result.update(update)
-            trace.append(node_name)
-    return result, trace
-
-
 def test_full_compiled_graph_runs_end_to_end_with_fake_client_fast_path():
     client = FakeVisionClient(content=well_formed_reply("short text", "a room"))
     graph = build_graph()
@@ -633,7 +619,7 @@ def test_full_compiled_graph_runs_end_to_end_with_fake_client_research_path():
     graph = build_graph()
     state = make_initial_state("base64data")
 
-    result, trace = _invoke_collecting_trace(
+    result, trace = drain_stream_collecting_trace(
         graph, state, config={"configurable": {"client": client, "tts_provider": _FakeTtsProvider()}}
     )
 
@@ -648,7 +634,7 @@ def test_full_compiled_graph_degrades_gracefully_and_still_reaches_tts():
     graph = build_graph()
     state = make_initial_state("base64data")
 
-    result, trace = _invoke_collecting_trace(
+    result, trace = drain_stream_collecting_trace(
         graph, state, config={"configurable": {"client": client, "tts_provider": _FakeTtsProvider()}}
     )
 

@@ -24,6 +24,8 @@ from clarif_eye.client import CompletionResult
 from clarif_eye.research import _derive_query, run_research
 from clarif_eye.state import make_initial_state
 
+from tests._stream_helpers import drain_stream_collecting_trace
+
 
 # --- Fakes -------------------------------------------------------------
 
@@ -425,15 +427,7 @@ def test_full_compiled_graph_runs_end_to_end_on_research_path_with_fakes():
         }
     }
 
-    # Node visitation observed via stream(..., stream_mode="updates")
-    # (issue #80 / P9.1) - one chunk per COMPLETED node, keyed by node
-    # name - rather than the old config["configurable"]["trace"] seam.
-    result = dict(state)
-    trace = []
-    for chunk in graph.stream(state, config=config, stream_mode="updates"):
-        for node_name, update in chunk.items():
-            result.update(update)
-            trace.append(node_name)
+    result, trace = drain_stream_collecting_trace(graph, state, config)
 
     assert trace == ["vision", "research", "analysis", "tts"]
     assert result["scraper_data"] != ""

@@ -33,25 +33,11 @@ from clarif_eye.graph import (
 )
 from clarif_eye.state import make_initial_state
 
+from tests._stream_helpers import drain_stream_collecting_trace
+
 
 def _reply(ocr, scene):
     return f"OCR_TEXT: {ocr}\nSCENE: {scene}"
-
-
-def _invoke_collecting_trace(graph, state, config):
-    """Run the compiled graph via stream(..., stream_mode="updates") and
-    return (final_state, visited_node_names_in_order) - replaces the old
-    config["configurable"]["trace"] seam (issue #80 / P9.1, same helper
-    shape as test_graph.py's `run()`): each stream chunk is keyed by the
-    node that just completed, so collecting those keys in arrival order is
-    a drop-in replacement for what graph._record used to append."""
-    result = dict(state)
-    trace = []
-    for chunk in graph.stream(state, config=config, stream_mode="updates"):
-        for node_name, update in chunk.items():
-            result.update(update)
-            trace.append(node_name)
-    return result, trace
 
 
 # 200 words, no data-density signals - trips only the router's
@@ -197,7 +183,7 @@ def test_graph_with_deadline_already_blown_still_produces_usable_output():
         }
     }
 
-    result, trace = _invoke_collecting_trace(graph, state, config)
+    result, trace = drain_stream_collecting_trace(graph, state, config)
 
     assert client.called_roles == []
     assert searcher.called is False
@@ -232,7 +218,7 @@ def test_deadline_blown_midway_produces_output_from_known_state():
         }
     }
 
-    result, trace = _invoke_collecting_trace(graph, state, config)
+    result, trace = drain_stream_collecting_trace(graph, state, config)
 
     assert "vision" in trace
     assert "research" in trace
@@ -276,7 +262,7 @@ def test_generous_deadline_runs_full_quality_path_unskipped():
         }
     }
 
-    result, trace = _invoke_collecting_trace(graph, state, config)
+    result, trace = drain_stream_collecting_trace(graph, state, config)
 
     assert client.calls == ["eyes", "brain"]
     assert "Full quality analysis" in result["final_output"]
