@@ -15,8 +15,8 @@ for the registry itself.
 
 Every scenario below makes a real network call, a real model inference
 call, or both. None of them run in this pytest suite, and none of them run
-in CI. CI (issue #21) is offline by design, and model inference must never
-run there. A scenario "existing" means the file is present and the pairing
+in CI. CI ([#21](https://github.com/franciszver/clarif-eye/issues/21)) is
+offline by design, and model inference must never run there. A scenario "existing" means the file is present and the pairing
 is checked; it does not mean the scenario was run today, and it does not
 mean the live system currently behaves as the scenario expects.
 
@@ -176,8 +176,8 @@ Real-stack scenario:
 **Before this change, this was the one system with no real-stack scenario
 at all.** `scripts/audit_accessibility.py` checks a running app's DOM and
 ARIA attributes, which is a different concern (rendering, not the handler
-logic), and it requires a server the orchestrator already has running by
-hand; it is not a stand-in for exercising `handle_submit` itself.
+logic), and it requires a server already running by hand; it is not a
+stand-in for exercising `handle_submit` itself.
 `scripts/benchmark_pipeline.py` exercises equivalent machinery (the
 compiled graph, a real client, real TTS providers) but calls the graph
 directly, not `handle_submit`, so it never touches the image-decoding or

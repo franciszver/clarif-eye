@@ -52,10 +52,10 @@ These tests prove the *source* is structured correctly. They do not prove
 anything about what a real browser renders or what a real screen reader
 says - see the next two sections.
 
-### Real-browser DOM verified (Chrome DevTools, by the owner)
+### Real-browser DOM verified (Chrome DevTools)
 
-During the P5.1 follow-up, the owner inspected the running app in a real
-browser and confirmed:
+In a later accessibility pass, the developer inspected the running app in a
+real browser and confirmed:
 
 - `aria-live="polite"`, `role="status"` are applied to the status region,
   and survive Gradio re-rendering it after a submit.
@@ -68,21 +68,24 @@ browser and confirmed:
 
 ### Human screen-reader verified
 
-The owner reloaded the app on `main` and ran the full checklist below with
-Narrator (Windows) and a real camera. His report, verbatim: "refreshed the
-page, camera works, all items work." Each item was confirmed individually:
+The developer reloaded the app on `main` and ran the full checklist below
+with Narrator (Windows) and a real camera. His report, verbatim: "refreshed
+the page, camera works, all items work." Each item was confirmed
+individually:
 
 - **Camera capture**: photographed something with text; the text in the
-  resulting photo reads correctly, not reversed (#59).
+  resulting photo reads correctly, not reversed
+  ([#59](https://github.com/franciszver/clarif-eye/issues/59)).
 - **Tab through the page**: no image anywhere announces as an unlabelled
-  "graphic" (#48).
+  "graphic" ([#48](https://github.com/franciszver/clarif-eye/issues/48)).
 - **Progress announcement**: submitting a photo announces "Photo received.
   Describing it now..."
 - **Completion timing**: waiting for a result, "Description ready."
-  finishes announcing before the audio starts (#47).
+  finishes announcing before the audio starts
+  ([#47](https://github.com/franciszver/clarif-eye/issues/47)).
 - **Replay**: pressing Play to replay the description, the announcement
   finishes before audio starts, and the audio plays from its first word
-  (#52).
+  ([#52](https://github.com/franciszver/clarif-eye/issues/52)).
 - **Pause**: pressing Pause stops the audio instantly.
 - **Heading navigation**: Caps Lock + Space, then pressing H repeatedly,
   moves through six headings in order, ending at "Honest operational
@@ -103,7 +106,9 @@ listed as open, with a fix in place but unverified by a human. Each is
 recorded here with the reasoning behind its fix, kept for anyone debugging
 something similar later.
 
-- **Audio talked over the announcement (#47), now fixed.** The synthesized
+- **Audio talked over the announcement
+  ([#47](https://github.com/franciszver/clarif-eye/issues/47)), now
+  fixed.** The synthesized
   audio used to begin at the same moment the screen reader was still
   announcing the completion status, making both hard to hear. The fix: the
   with-audio completion announcement is now short ("Description ready.")
@@ -121,7 +126,9 @@ something similar later.
   the status wording no longer claims audio "is playing" as a fact, since
   that may not be true. The human pass above confirms the two do not
   collide: "Description ready." finishes before audio starts.
-- **Images announced as "graphic" (#48), now fixed.** A real screen-reader
+- **Images announced as "graphic"
+  ([#48](https://github.com/franciszver/clarif-eye/issues/48)), now
+  fixed.** A real screen-reader
   pass (owner, Narrator on Windows) had found every image on the page
   announcing as an unlabelled "graphic", repeatedly, once per image, while
   navigating ("graphic, graphic, graphic"), covering both Gradio's own
@@ -141,14 +148,16 @@ something similar later.
   Decorative nodes are also taken out of the tab order if they were
   somehow focusable. The human pass above confirms tabbing through the
   page announces no "graphic" anywhere.
-- **Pressing Play collided with the control announcement (#52), now
-  fixed.** A real screen-reader pass (owner, Narrator on Windows) had
+- **Pressing Play collided with the control announcement
+  ([#52](https://github.com/franciszver/clarif-eye/issues/52)), now
+  fixed.** A real screen-reader pass (developer, Narrator on Windows) had
   found that pressing the audio widget's own Play button, to replay the
   description or because the browser had blocked the automatic playback
-  from #47, made the screen reader announce the control's
-  activation/state change at the same instant the audio started, so the
-  opening seconds of the description (often the most important part) were
-  lost under that announcement. This was distinct from #47: #47 was this
+  from [#47](https://github.com/franciszver/clarif-eye/issues/47), made
+  the screen reader announce the control's activation/state change at the
+  same instant the audio started, so the opening seconds of the
+  description (often the most important part) were lost under that
+  announcement. This was distinct from #47: #47 was this
   app's own status text colliding with automatic playback; #52 is the
   screen reader's own announcement, which this app cannot detect or
   suppress, colliding with a user gesture. The fix: the same aria-live
@@ -163,10 +172,11 @@ something similar later.
   announcement finish before audio starts, and the audio plays from its
   first word.
 - **Audio never played at all, now fixed.** This was a regression from
-  #47/#52's first implementation, then a second, deeper regression in the
-  attempt to fix it. After #47 and #52 shipped, the owner reported "the
-  spoken description doesn't start": audio never played, period, not just
-  with imperfect timing. The first diagnosis (an `audioEl.src` truthiness
+  [#47](https://github.com/franciszver/clarif-eye/issues/47)/[#52](https://github.com/franciszver/clarif-eye/issues/52)'s
+  first implementation, then a second, deeper regression in the attempt to
+  fix it. After #47 and #52 shipped, the developer reported "the spoken
+  description doesn't start": audio never played, period, not just with
+  imperfect timing. The first diagnosis (an `audioEl.src` truthiness
   check inside the aria-live shim's `apply()` that a JS property
   assignment never triggers a `MutationObserver` for) led to a fix that
   swapped that check for a real `loadeddata` event listener on the
@@ -174,7 +184,7 @@ something similar later.
   also passed its own full test suite while audio was still completely
   broken in the browser**: it fixed the symptom it could see (a
   `MutationObserver` never firing) but not the actual cause. A
-  real-browser check by the orchestrator on this branch found: run status
+  real-browser check on this branch found: run status
   "Description ready.", a correct download link to a real `.mp3` in
   `#audio-output` (so audio *was* generated), but the `<audio>` element
   had `preload="auto"` (the shim did run) with `src` absent, `readyState`
@@ -202,7 +212,9 @@ something similar later.
   that wrapped method, so nothing about it changed. Pausing remains
   immediate, as before. The human pass above confirms audio plays again,
   and that the completion announcement and audio no longer collide.
-- **Camera photos came back mirrored (#59), now fixed.** The owner, using
+- **Camera photos came back mirrored
+  ([#59](https://github.com/franciszver/clarif-eye/issues/59)), now
+  fixed.** The developer, using
   the camera to photograph a bill, label, or sign, had found the resulting
   image reversed. Gradio's `gr.Image` webcam capture mirrors by default
   (`WebcamOptions.mirror=True`), a setting meant for selfies. Reversed
@@ -259,8 +271,10 @@ instead of calling either one "tested."
 ## Known limitations a user should know
 
 - A request can take roughly **21-31 seconds** end to end (measured
-  separately in issue #17); the progress announcement tells you this is
-  expected, but there is no finer-grained progress indicator.
+  separately, see
+  [#17](https://github.com/franciszver/clarif-eye/issues/17)); the
+  progress announcement tells you this is expected, but there is no
+  finer-grained progress indicator.
 - **Audio may be unavailable.** If speech synthesis fails, the app falls
   back to showing (and announcing) the description as text - the text is
   always the reliable fallback, never a silent failure.
