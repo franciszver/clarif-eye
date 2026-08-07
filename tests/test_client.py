@@ -665,6 +665,40 @@ def test_requests_sent_today_counts_every_ladder_rung_not_just_submissions(monke
     assert client_module.requests_sent_today() == len(EYES_LADDER)
 
 
+def test_transport_failures_never_increment_the_daily_counter(monkeypatch):
+    # Reproduced bug (issue #76 follow-up): a transport error means no
+    # request ever reached OpenRouter, so it must not consume any of the
+    # daily quota it's meant to track. Drives many attempts (standing in for
+    # "1000 ConnectErrors, zero requests reaching OpenRouter") and asserts
+    # the counter never leaves zero.
+    _reset_daily_count(monkeypatch)
+
+    def handler(request):
+        raise httpx.ConnectError("connection refused", request=request)
+
+    client = make_client(handler)
+    for _ in range(500):
+        with pytest.raises(LadderExhaustedError):
+            client.complete("eyes", [{"role": "user", "content": "hi"}])
+
+    assert client_module.requests_sent_today() == 0
+
+
+def test_received_response_of_any_status_increments_the_daily_counter(monkeypatch):
+    # A response actually came back from OpenRouter (a 500 here, but the
+    # status doesn't matter) - that must count, unlike a transport failure.
+    _reset_daily_count(monkeypatch)
+
+    def handler(request):
+        return json_response(500, message="upstream down")
+
+    client = make_client(handler)
+    with pytest.raises(LadderExhaustedError):
+        client.complete("eyes", [{"role": "user", "content": "hi"}])
+
+    assert client_module.requests_sent_today() == len(EYES_LADDER)
+
+
 def test_daily_request_counter_rolls_over_on_utc_date_change(monkeypatch):
     _reset_daily_count(monkeypatch)
 
@@ -691,6 +725,24 @@ def test_redact_headers_strips_authorization_case_insensitively():
     assert redacted["Authorization"] == "[REDACTED]"
     assert redacted["Content-Type"] == "application/json"
     assert SENTINEL_KEY not in repr(redacted)
+
+
+def test_redact_headers_strips_cookies_and_api_key_headers_case_insensitively():
+    headers = {
+        "Set-Cookie": "session=super-secret-session-value; Path=/",
+        "Cookie": "session=super-secret-session-value",
+        "X-Api-Key": "sk-another-secret-key",
+        "Content-Type": "application/json",
+    }
+
+    redacted = client_module._redact_headers(headers)
+
+    assert redacted["Set-Cookie"] == "[REDACTED]"
+    assert redacted["Cookie"] == "[REDACTED]"
+    assert redacted["X-Api-Key"] == "[REDACTED]"
+    assert redacted["Content-Type"] == "application/json"
+    assert "super-secret-session-value" not in repr(redacted)
+    assert "sk-another-secret-key" not in repr(redacted)
 
 
 def test_raw_429_is_logged_with_status_headers_and_body(monkeypatch, caplog):
