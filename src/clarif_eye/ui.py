@@ -878,6 +878,25 @@ class ThreadRegistry(_BoundedLRU):
     langgraph.checkpoint.memory.InMemorySaver in langgraph 1.2.10 (see
     build_resources()'s comment) - so eviction here actually frees the
     checkpointer's memory, not just this registry's own bookkeeping.
+
+    EVICTING A THREAD THAT IS MID-RUN: touch() (and therefore eviction) is
+    called BEFORE a run starts (see thread_configurable), so the thread
+    being evicted is always some OTHER, older thread - never the one this
+    request is about. But that older thread's checkpointed history can
+    still be deleted while its OWN run is still in flight (e.g. a slow
+    research-path request still executing when 20 newer sessions arrive
+    and push it out). This does NOT crash that in-flight run: LangGraph's
+    InMemorySaver.put()/put_writes() re-create a thread's dict entries on
+    demand (defaultdict), so a mid-run write after delete_thread just
+    starts a fresh history rather than raising. The real cost is
+    correctness, not a crash: that run's PRIOR turns (before this
+    request) are gone from get_state() once it finishes, since
+    delete_thread doesn't distinguish "prior history" from "in-flight
+    checkpoint". Requires MAX_LIVE_THREADS=20 (or more) OTHER concurrent
+    distinct sessions to trigger - not the common case for a free-tier
+    demo app, and accepted as such rather than solved with, e.g., a
+    "don't evict a thread with a run in flight" tracking mechanism this
+    app's scale doesn't warrant.
     """
 
     def __init__(self, checkpointer, max_threads=MAX_LIVE_THREADS):
@@ -996,16 +1015,32 @@ def thread_configurable(resources, thread_id):
     without an extra branch, and the uncheckpointed/no-thread_id case
     (every existing test/caller) is unaffected.
 
+    ALSO returns {} whenever `resources.thread_registry` is None (deep-
+    review BLOCKER fix, issue #81 / P9.2) - see AppResources's own
+    docstring for the pairing invariant this enforces: thread_registry is
+    only ever set by build_resources() alongside a REAL checkpointed
+    graph (see that function's CHECKPOINTING comment), so "no registry"
+    is the reliable signal that resources.graph has no checkpointer, or
+    is a test double with no update_state at all. Passing thread_id
+    through to graph.stream() in that situation is exactly what produced
+    the bug this fixes: LangGraph raises ValueError("No checkpointer
+    set") the instant config["configurable"]["thread_id"] is present on
+    an uncheckpointed graph, an exception this function's own caller
+    (_run_pipeline_events) is bound by the module docstring to never let
+    escape. A caller that WANTS thread-scoped behavior must therefore
+    pair a checkpointed graph with a thread_registry - build_resources()
+    already does this correctly; nothing else in this codebase should
+    construct one without the other.
+
     FUTURE CALL SITES MUST GO THROUGH THIS, not resources.thread_registry
     directly: #82 (follow-ups) and #83 (interrupts) will add more places
     that invoke or otherwise touch a thread-scoped graph call, and a
     registry that only some of them remember to touch would silently stop
     bounding the live-thread count for the call sites that forgot.
     """
-    if thread_id is None:
+    if thread_id is None or resources.thread_registry is None:
         return {}
-    if resources.thread_registry is not None:
-        resources.thread_registry.touch(thread_id)
+    resources.thread_registry.touch(thread_id)
     return {"thread_id": thread_id}
 
 
@@ -1037,6 +1072,20 @@ class AppResources:
     # only touches thread_registry / adds thread_id to config when a
     # caller actually passes one in. build_resources() (the live app) sets
     # both.
+    #
+    # PAIRING INVARIANT (deep-review BLOCKER fix, issue #81 / P9.2):
+    # thread_registry must be non-None IF AND ONLY IF `graph` is a real
+    # checkpointed graph (compiled via build_graph(checkpointer=...)) that
+    # actually supports thread-scoped calls (graph.update_state, and
+    # thread_id in config["configurable"] without raising). thread_
+    # configurable() (below) uses "thread_registry is not None" as the
+    # SOLE signal that it's safe to thread thread_id through to the graph
+    # at all - constructing an AppResources with a thread_registry but an
+    # uncheckpointed graph (or vice versa) would silently defeat that
+    # guard and reopen the exact bug it exists to prevent. build_resources()
+    # is the only place in this codebase that should ever set both
+    # together; every test that wants a thread-scoped graph must do the
+    # same (see tests/test_ui.py's checkpointed-thread tests).
     thread_registry: object = None
 
 
@@ -1182,7 +1231,23 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
     measured defect this closes). Neither happens on a cache hit (nothing
     ran) or an early/exception failure (no final_output was produced) -
     same "no bleed of a bad run into cached/replayed state" discipline the
-    image cache above already follows.
+    image cache above already follows. Wrapped in try/except - see the
+    call site's own comment for why a recording failure must never cost
+    the user the answer that was already computed.
+
+    ACCUMULATION IS BEST-EFFORT UNDER CONCURRENT SUBMITS ON ONE
+    thread_id: two overlapping requests on the SAME thread_id (e.g. a
+    double-submit race from one browser tab) each read, then separately
+    write, this thread's state with no lock across the two - LangGraph's
+    update_state and this function's own trim call are each individually
+    consistent, but nothing coordinates the two full boundary-recording
+    sequences against each other. The result is ordinary last-writer-wins,
+    not a guaranteed 2-entries-for-2-submits outcome - deliberately NOT
+    locked, since a global lock across a request as slow as this pipeline
+    (up to DEFAULT_PIPELINE_BUDGET_SECONDS) would serialize every
+    concurrent visitor, not just the rare double-submit case. Acceptable
+    for a demo app; the single-threaded-per-tab tests in this file cannot
+    exercise the race itself.
     """
     if image is None:
         yield "outcome", (None, NO_IMAGE_MESSAGE)
@@ -1269,9 +1334,29 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
     # a real thread_id (an uncheckpointed resources.graph has no
     # update_state-worthy thread to record against) and only when the run
     # actually produced something worth remembering.
+    #
+    # WRAPPED IN try/except (deep-review BLOCKER fix, issue #81 / P9.2):
+    # this block is bookkeeping - accumulating the conversation history for
+    # a LATER run - not part of THIS run's actual deliverable. `final_output`/
+    # `audio_path` above were already computed by the time execution reaches
+    # here; a failure recording the turn (a stale/evicted thread_id whose
+    # checkpoint was deleted mid-run by ThreadRegistry - see that class's
+    # docstring for why that's tolerated - or any other unforeseen edge in
+    # update_state/trim) must never cost the user the answer that already
+    # exists. thread_configurable() above is the FIRST line of defense
+    # (skips thread_id entirely for an uncheckpointed graph/registry-less
+    # AppResources, the exact case that used to raise ValueError/
+    # AttributeError straight through this generator); this try/except is
+    # the second, catching whatever thread_configurable's guard doesn't -
+    # any future graph/thread_registry combination this module hasn't
+    # anticipated degrades to "the turn wasn't recorded" instead of "the
+    # user got no answer at all".
     if thread_id is not None and final_output:
-        graph.update_state(config, {"messages": [{"role": "assistant", "content": final_output}]})
-        _trim_thread_to_latest_checkpoint(getattr(graph, "checkpointer", None), thread_id)
+        try:
+            graph.update_state(config, {"messages": [{"role": "assistant", "content": final_output}]})
+            _trim_thread_to_latest_checkpoint(getattr(graph, "checkpointer", None), thread_id)
+        except Exception:
+            pass
 
     if audio_path:
         outcome = (audio_path, final_output)

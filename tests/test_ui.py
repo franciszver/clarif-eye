@@ -729,3 +729,50 @@ def test_handle_submit_staged_accumulates_messages_on_one_thread_and_isolates_an
     list(handle_submit_staged(FakeImage(content=b"other-session-bytes"), resources, thread_id=other_thread_id))
     other_state = resources.graph.get_state({"configurable": {"thread_id": other_thread_id}})
     assert len(other_state.values["messages"]) == 1
+
+
+# --- Regression: a thread_id must never break the never-raise contract -----
+# (deep-review BLOCKER on issue #81 / P9.2)
+#
+# Reproduced before the fix: passing thread_id="..." to handle_submit_staged
+# against an AppResources whose graph is NOT actually checkpointed (either a
+# plain build_graph() with no checkpointer, or a FakeGraph test double with
+# no update_state method at all) let the conversation-boundary recording
+# block (graph.update_state + _trim_thread_to_latest_checkpoint) raise
+# straight through handle_submit_staged - a ValueError("No checkpointer
+# set") for the uncheckpointed real graph, an AttributeError for FakeGraph -
+# throwing away the outcome that had ALREADY been computed and violating
+# this module's own "never raise" contract. Both cases are exercised here.
+
+
+def test_staged_submit_with_thread_id_never_raises_when_graph_is_not_checkpointed():
+    resources = AppResources(
+        graph=build_graph(),  # no checkpointer - see build_graph's own docstring
+        client=_RoutingVisionClient(SHORT_OCR_TEXT, "a room"),
+        client_error=None,
+        tts_providers=[_FakeTtsProvider()],
+        searcher=_EmptySearcher(),
+        research_client=None,
+    )
+
+    updates = list(handle_submit_staged(FakeImage(), resources, thread_id="thread-with-no-checkpointer"))
+
+    # The staged contract still completes: at least one status yield plus a
+    # final result yield, and the run's actual outcome (audio produced) is
+    # not thrown away by the recording block blowing up after computing it.
+    assert updates
+    final_status, final_audio, final_text = updates[-1]
+    assert final_audio
+    assert final_text
+
+
+def test_staged_submit_with_thread_id_never_raises_against_a_graph_double_with_no_update_state():
+    graph = FakeGraph(result={"final_output": "A cat sits on a mat.", "audio_file_path": "/tmp/out.mp3"})
+    resources = _resources(graph)
+
+    updates = list(handle_submit_staged(FakeImage(), resources, thread_id="thread-against-fake-graph"))
+
+    assert updates
+    final_status, final_audio, final_text = updates[-1]
+    assert final_audio == "/tmp/out.mp3"
+    assert final_text == "A cat sits on a mat."
