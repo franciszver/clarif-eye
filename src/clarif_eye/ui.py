@@ -98,6 +98,16 @@ NO_QUESTION_MESSAGE = (
     "No question was typed. Please type a question about the photo, then "
     "activate the ask button."
 )
+# The two answers to "a number could not be checked" (issue #83 / P9.4).
+# These are BUTTON LABELS, but they are declared here with the other spoken
+# constants and not beside their elem_ids, because they are quoted verbatim
+# inside two spoken messages below (the question itself, and the refusal
+# when a follow-up is typed while it is pending). A label and the sentence
+# telling a blind user which label to activate must never be able to drift
+# apart.
+RESUME_CONTINUE_LABEL = "Continue anyway"
+RESUME_RETAKE_LABEL = "I'll retake the photo"
+
 # Issue #83 / P9.4: a resume button was activated when no run is waiting on
 # an answer. Two different situations produce this and BOTH are honestly
 # covered by one message, so no guessing is needed to tell them apart:
@@ -114,6 +124,28 @@ NOTHING_TO_RESUME_MESSAGE = (
     "There is nothing waiting for an answer right now. If you were asked "
     "about a number that could not be checked, please submit the photo "
     "again."
+)
+# Issue #83 / P9.4: a follow-up question was typed while the app is still
+# waiting to be told whether to speak a number it could not check.
+#
+# THE DECIDED RULE IS TO REFUSE, and to refuse LOUDLY. The alternative -
+# letting the follow-up run - is what the code used to do by accident, and
+# it silently DESTROYED the pending question (LangGraph supersedes a
+# pending task when a new input arrives on the thread), leaving two answer
+# buttons on screen wired to a resume that would then find nothing to
+# resume. A safety question the user never answered must never be thrown
+# away by a side action.
+#
+# It restates the situation and NAMES BOTH BUTTONS, because a user who
+# cannot see the screen has no other way to find out what is blocking them
+# or how to get past it - "you can't do that right now" on its own would
+# be a dead end.
+QUESTION_PENDING_MESSAGE = (
+    "There is still a question waiting for your answer: a number in the "
+    "description could not be checked against the photo. Please activate "
+    f'"{RESUME_CONTINUE_LABEL}" to hear the description anyway, or '
+    f'"{RESUME_RETAKE_LABEL}" to take a new photo. Then you can ask your '
+    "question."
 )
 
 # --- Accessibility (issue #15 / P5.1) ---------------------------------------
@@ -148,8 +180,6 @@ ASK_BUTTON_ELEM_ID = "ask-button"
 # does: so the accessibility tests find them structurally, by id.
 RESUME_CONTINUE_BUTTON_ELEM_ID = "resume-continue-button"
 RESUME_RETAKE_BUTTON_ELEM_ID = "resume-retake-button"
-RESUME_CONTINUE_LABEL = "Continue anyway"
-RESUME_RETAKE_LABEL = "I'll retake the photo"
 
 # Accessible name given to the user's own uploaded/captured photo preview
 # (issue #48 / P5.4 - see ARIA_LIVE_HEAD's image-labelling comment below).

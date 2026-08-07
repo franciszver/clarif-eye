@@ -50,14 +50,18 @@ from clarif_eye.ui import (
     AUDIO_PLAY_DELAY_MS,
     AppResources,
     NOTHING_TO_RESUME_MESSAGE,
+    QUESTION_PENDING_MESSAGE,
     RESUME_CONTINUE_BUTTON_ELEM_ID,
+    RESUME_CONTINUE_LABEL,
     RESUME_RETAKE_BUTTON_ELEM_ID,
+    RESUME_RETAKE_LABEL,
     STATUS_RESUMING,
     STATUS_WORKING,
     ThreadRegistry,
     _PauseSignal,
     _trim_thread_to_latest_checkpoint,
     build_interface,
+    handle_ask_staged,
     handle_resume_staged,
     handle_submit_staged,
 )
@@ -567,3 +571,254 @@ def test_resume_buttons_are_labelled_hidden_and_carry_elem_ids():
 def test_the_audio_delay_contract_is_the_shared_one():
     """Guard against a second copy of the 1.8s gap appearing for resumes."""
     assert AUDIO_PLAY_DELAY_MS == 1800
+
+
+# --- Pause-lifecycle collisions (independent-gate findings) ----------------
+#
+# A pending question is a SAFETY question: the app is holding back a number
+# it could not check. Every other thing the user can do while it is pending
+# has to have a decided answer, because the failure mode of getting one
+# wrong is either speaking an unverified number to someone who declined it,
+# or silently throwing the question away and leaving two buttons on screen
+# wired to nothing. The three collisions are: typing a follow-up,
+# submitting a photo that is already cached, and submitting a fresh photo.
+
+
+class ScriptedClient:
+    """Like RecordingClient, but each successive VISION call reports a
+    DIFFERENT photo and each successive BRAIN call returns a different
+    draft - which is what lets one test hold two photos, one clean and one
+    with a fabricated number, on a single thread.
+    """
+
+    def __init__(self, vision_replies, brain_replies):
+        self.vision_replies = list(vision_replies)
+        self.brain_replies = list(brain_replies)
+        self.calls = []
+
+    def complete(self, role, messages, **params):
+        has_image, prompt = RecordingClient._flatten(messages)
+        self.calls.append((role, has_image, prompt))
+        if has_image:
+            ocr, scene = self.vision_replies[len(self.vision_calls()) - 1]
+            return CompletionResult(
+                content=f"OCR_TEXT: {ocr}\nSCENE: {scene}", model="fake-eyes-model:free"
+            )
+        if role == "brain":
+            return CompletionResult(
+                content=self.brain_replies[len(self.brain_calls()) - 1],
+                model="fake-brain-model:free",
+            )
+        return CompletionResult(content="A plain wall.", model="fake-eyes-model:free")
+
+    def close(self):
+        pass
+
+    def vision_calls(self):
+        return [call for call in self.calls if call[1]]
+
+    def brain_calls(self):
+        return [call for call in self.calls if call[0] == "brain" and not call[1]]
+
+
+# Short, number-free, no document keywords: keeps clarif_eye.router on the
+# FAST path, so this photo never reaches the numbers check and caches
+# cleanly with real audio.
+PLAIN_OCR = "hello"
+PLAIN_SCENE = "a plain wall"
+
+
+def _state_of(resources, thread_id):
+    return resources.graph.get_state({"configurable": {"thread_id": thread_id}})
+
+
+def test_a_follow_up_typed_while_a_question_is_pending_is_refused():
+    """A pending safety question must survive a typed follow-up.
+
+    Before this was fixed the follow-up SUPERSEDED the pending task
+    (probe-proven: get_state().next went back to ()), silently destroying
+    the question while the two answer buttons stayed on screen wired to a
+    resume that would then find nothing to resume. Refusing is the decided
+    rule: the user is told what is pending and what their two choices are,
+    and nothing is thrown away.
+    """
+    resources = _resources(RecordingClient(INVENTED_DRAFT))
+    list(handle_submit_staged(FakeImage(), resources, thread_id="ask-while-paused"))
+    calls_before = len(resources.client.calls)
+
+    updates = _staged(
+        handle_ask_staged("what is the total?", resources, thread_id="ask-while-paused")
+    )
+
+    _status, audio, text = updates[-1]
+    assert audio is None
+    assert text == QUESTION_PENDING_MESSAGE
+    # It must name BOTH ways out, or the user is told they are stuck
+    # without being told how to get unstuck.
+    assert RESUME_CONTINUE_LABEL in text
+    assert RESUME_RETAKE_LABEL in text
+
+    # THE PAUSE SURVIVED: still pending, still resumable.
+    snapshot = _state_of(resources, "ask-while-paused")
+    assert snapshot.next == ("verify_numbers",)
+    assert snapshot.interrupts
+
+    # And it cost nothing: no graph run, so no model call.
+    assert len(resources.client.calls) == calls_before
+
+    # The user can still answer afterwards, which is the point of refusing.
+    resumed = _staged(
+        handle_resume_staged(RESUME_CONTINUE, resources, thread_id="ask-while-paused")
+    )
+    assert UNVERIFIED_NUMBER_CAVEAT in resumed[-1][2]
+
+
+def test_a_cached_photo_submitted_while_paused_resolves_the_pause_first():
+    """Submitting another photo means the user moved on - an IMPLICIT
+    RETAKE - and the cache-hit branch must resolve the pending question
+    before it writes anything.
+
+    Before this was fixed, the hit's graph.update_state() ran straight over
+    a pending interrupt and left a ZOMBIE: get_state().interrupts empty
+    (the pending write cleared by the state write) but .next still naming
+    the paused node, so the thread was neither running nor resumable and
+    the buttons pointed at nothing.
+    """
+    client = ScriptedClient(
+        vision_replies=[(PLAIN_OCR, PLAIN_SCENE), (BILL_OCR, BILL_SCENE)],
+        brain_replies=[INVENTED_DRAFT],
+    )
+    resources = _resources(client)
+    plain_photo = FakeImage(content=b"plain-photo-bytes")
+
+    # 1. A clean photo on another thread, so it lands in the image cache
+    #    with real audio (only audio-bearing results are ever cached).
+    list(handle_submit_staged(plain_photo, resources, thread_id="cache-owner"))
+    # 2. A dense photo with a fabricated number pauses THIS thread.
+    list(
+        handle_submit_staged(
+            FakeImage(content=b"bill-photo-bytes"), resources, thread_id="hit-while-paused"
+        )
+    )
+    assert _state_of(resources, "hit-while-paused").interrupts, "setup: the run should have paused"
+
+    # 3. The user gives up on the question and submits the cached photo.
+    signal = _PauseSignal()
+    updates = _staged(
+        handle_submit_staged(
+            plain_photo, resources, thread_id="hit-while-paused", pause_signal=signal
+        )
+    )
+
+    # Served normally, from the cache - no third vision call.
+    assert len(client.vision_calls()) == 2
+    _status, audio, _text = updates[-1]
+    assert audio, "the cached audio must still be served"
+    assert signal.paused is False, "the buttons must end hidden"
+
+    # NO ZOMBIE: nothing pending, nothing half-resumable.
+    snapshot = _state_of(resources, "hit-while-paused")
+    assert snapshot.next == ()
+    assert not snapshot.interrupts
+
+    # The thread describes the photo the user was just told about, and
+    # carries no leftover draft from the abandoned question.
+    assert snapshot.values["ocr_output"] == PLAIN_OCR
+    assert snapshot.values["scene_context"] == PLAIN_SCENE
+    assert snapshot.values["verification_hold"] is None
+
+    # A late click on a button that is now hidden is answered in words.
+    late = _staged(handle_resume_staged(RESUME_CONTINUE, resources, thread_id="hit-while-paused"))
+    assert late[-1][2] == NOTHING_TO_RESUME_MESSAGE
+
+
+def test_a_fresh_photo_submitted_while_paused_leaves_no_pending_question():
+    """The non-cached sibling of the test above: LangGraph supersedes the
+    pending task on its own here, but the two branches must end in the same
+    place, and that has to be pinned rather than assumed."""
+    client = ScriptedClient(
+        vision_replies=[(BILL_OCR, BILL_SCENE), (PLAIN_OCR, PLAIN_SCENE)],
+        brain_replies=[INVENTED_DRAFT],
+    )
+    resources = _resources(client)
+
+    list(
+        handle_submit_staged(
+            FakeImage(content=b"bill-photo"), resources, thread_id="fresh-while-paused"
+        )
+    )
+    assert _state_of(resources, "fresh-while-paused").interrupts, "setup: should have paused"
+
+    signal = _PauseSignal()
+    updates = _staged(
+        handle_submit_staged(
+            FakeImage(content=b"other-photo"),
+            resources,
+            thread_id="fresh-while-paused",
+            pause_signal=signal,
+        )
+    )
+
+    assert signal.paused is False
+    assert updates[-1][1], "the new photo must be described and spoken"
+    snapshot = _state_of(resources, "fresh-while-paused")
+    assert snapshot.next == ()
+    assert not snapshot.interrupts
+    assert snapshot.values["verification_hold"] is None
+
+
+def _resume_binding(demo, button_elem_id):
+    """The (handler, answer_value) pair Gradio will actually run when
+    `button_elem_id` is activated.
+
+    Walks the built Blocks' own dependency table - demo.fns, whose targets
+    name the component id that triggers each handler - so this reads what
+    the app WILL DO, not what build_interface's source looks like.
+    """
+    button_id = next(
+        block_id
+        for block_id, block in demo.blocks.items()
+        if getattr(block, "elem_id", None) == button_elem_id
+    )
+    for fn in demo.fns.values():
+        if (button_id, "click") in (fn.targets or []) and fn.fn is not None:
+            return fn.fn, fn.inputs[0].value
+    raise AssertionError(f"no click handler bound to {button_elem_id}")
+
+
+def test_each_resume_button_is_wired_to_the_answer_its_label_promises():
+    """MUTATION TARGET: swapping the two answers in build_interface must
+    turn this test RED.
+
+    Nothing else in this suite pinned the wiring, and an inverted one is
+    the worst bug this feature can have: the button a user activates to
+    DECLINE an unverified number would speak it to them instead. Asserted
+    by driving the handler Gradio itself would call, through the binding
+    Gradio itself would use - not by reading the constants back out of the
+    module, which would pass happily under a swap.
+    """
+    resources = _resources(RecordingClient(INVENTED_DRAFT))
+    demo = build_interface(resources)
+    try:
+        for elem_id, thread_id, expecting_continue in (
+            (RESUME_CONTINUE_BUTTON_ELEM_ID, "wired-continue", True),
+            (RESUME_RETAKE_BUTTON_ELEM_ID, "wired-retake", False),
+        ):
+            list(handle_submit_staged(FakeImage(), resources, thread_id=thread_id))
+            assert _state_of(resources, thread_id).interrupts, "setup: should have paused"
+
+            handler, answer = _resume_binding(demo, elem_id)
+            spoken = list(handler(answer, thread_id))[-1][2]
+
+            if expecting_continue:
+                assert UNVERIFIED_NUMBER_CAVEAT in spoken and INVENTED_DRAFT in spoken, (
+                    f"the continue button did not speak the description: {spoken!r}"
+                )
+            else:
+                assert spoken == RETAKE_CONFIRMATION, (
+                    "the retake button spoke something other than the retake "
+                    "confirmation - an inverted wiring would read an unverified "
+                    f"number to a user who declined it: {spoken!r}"
+                )
+    finally:
+        demo.close()
