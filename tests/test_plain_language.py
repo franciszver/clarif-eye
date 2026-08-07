@@ -93,6 +93,71 @@ COMPULSIVE_SUMMARY_RE = re.compile(r"^(Overall|In conclusion|In summary)\b", re.
 # guarantee it.
 AUDIO_IS_PLAYING_RE = re.compile(r"\bis playing\b", re.IGNORECASE)
 
+# Floor below which a skill file reads as an empty placeholder rather than
+# real content.
+MIN_SKILL_FILE_BYTES = 300
+
+# Files that must not carry dangling references or local filesystem paths
+# leaked from the source project these skill files were adapted from.
+SKILL_FILES_TO_CHECK = [
+    ".claude/skills/plain-language/SKILL.md",
+    ".claude/skills/plain-language/references/ai-tells.md",
+]
+
+# A citation of a numbered SKILL.md section (e.g. "§8" or "§8.5"). This
+# project's SKILL.md has no numbered sections, so any such citation dangles.
+# Assumption: any "§N" found in these files cites THIS project's own
+# SKILL.md (which has no numbered sections), not some external standard
+# (e.g. "Chicago Manual of Style §5.20"). No such external citation exists
+# in these files today; if one is ever added legitimately, this regex will
+# need to be scoped further.
+SKILL_SECTION_CITATION_RE = re.compile(r"§\d+(?:\.\d+)?")
+
+# A markdown/inline reference to a path under references/, e.g.
+# "references/wp-aisigns.md" (a real, public example - the Wikipedia
+# shortcut for AI-signs prose), "references/ai-tells-v2.1.md", or
+# "references/archive/ai-tells.md", whether in backticks, bold, or plain
+# text. Stops at whitespace, backtick, closing paren, or closing bracket,
+# since those are what actually delimit the path in markdown inline code
+# and links.
+#
+# Deliberately NOT anchored to a literal ".md" suffix: an earlier version
+# required "\.md" with no boundary after it, so greedy backtracking let
+# "references/ai-tells.mdx" match as the truncated "references/ai-tells.md"
+# and resolve to the real file - a mistyped extension or versioned name was
+# silently validated instead of flagged. Matching the whole delimiter-
+# bounded token instead (whatever its extension) and letting the existence
+# check below judge it means a mistyped/truncated/wrong-extension reference
+# is reported as "does not exist" rather than swallowed by the regex.
+#
+# Because it now runs to the next delimiter rather than stopping at ".md",
+# ordinary sentence punctuation not in the excluded-character class (a
+# trailing comma, period, semicolon, colon, "!" or "?") gets swept into the
+# match too, e.g. "...in references/ai-tells.md, refreshed monthly" would
+# otherwise capture "references/ai-tells.md,". The caller strips trailing
+# ".,;:!?" from the matched token before resolving it.
+REFERENCES_PATH_RE = re.compile(r"references/[^\s`)\]]+")
+
+# A local filesystem path: a Windows drive path (C:\ or C:/), a drive-
+# relative path with no separator (C:Users\x), a UNC path (\\server\share),
+# a /Users/... or /home/... path, or a ~/ home-relative path. This is the
+# generic shape of a private-context leak from whatever machine a skill
+# file was authored on, and it names no instance. Callers should strip URLs
+# from a line before searching, since "https://example.com/home/page.html"
+# is a legitimate citation, not a leaked local path.
+LOCAL_PATH_RE = re.compile(
+    r"\b[A-Za-z]:[\\/]"
+    r"|\b[A-Za-z]:(?=[^\s\\/:])"
+    r"|\\\\[^\s\\]+\\[^\s\\]+"
+    r"|/(?:Users|home)/"
+    r"|~/"
+)
+
+# Matches a URL span so it can be stripped from a line before LOCAL_PATH_RE
+# scans it: a cited "https://example.com/home/page.html" would otherwise
+# false-positive as a leaked "/home/" path.
+URL_RE = re.compile(r"https?://\S+|www\.\S+")
+
 
 def _ui_string_constants():
     """The module-level user-facing string constants in clarif_eye.ui."""
@@ -284,6 +349,67 @@ def test_no_status_string_claims_audio_is_playing():
     assert not failures, "\n".join(failures)
 
 
+def test_skill_files_carry_no_private_references():
+    """The plain-language skill files were adapted from a private local
+    project. This catches the mechanical leftovers of that: a citation of a
+    numbered SKILL.md section this project's SKILL.md does not have, a
+    reference to a references/ path that does not exist in this repo, and a
+    local filesystem path (a Windows drive path, a /Users or /home path, or
+    a ~/ path) that only makes sense on the machine the copy was made from.
+
+    It does NOT catch an unknown private proper noun (a name, a tool, a
+    project) - no regex can, without publishing the very thing it is meant
+    to keep out. A refresh from the source project still needs a human to
+    read the diff for private context.
+    """
+    skill_dir = REPO_ROOT / ".claude" / "skills" / "plain-language"
+    # Glob the skill directory rather than use the SKILL_FILES_TO_CHECK
+    # list, so a file added later anywhere under the skill directory (e.g.
+    # a new reference) is scanned too - a hardcoded list would silently
+    # skip it. Sorted for deterministic failure ordering. The assertion
+    # below ensures this can't pass vacuously if the directory moves.
+    md_files = sorted(skill_dir.rglob("*.md"))
+    assert md_files, f"no markdown files found under {skill_dir}; the glob found nothing to check"
+
+    failures = []
+    for path in md_files:
+        rel_path = path.relative_to(REPO_ROOT).as_posix()
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for lineno, line in enumerate(lines, start=1):
+            section_match = SKILL_SECTION_CITATION_RE.search(line)
+            if section_match:
+                failures.append(
+                    f"{rel_path}:{lineno}: dangling numbered-section citation {section_match.group(0)!r}: {line.strip()!r}"
+                )
+
+            for ref_match in REFERENCES_PATH_RE.finditer(line):
+                # Strip trailing sentence punctuation the broadened regex
+                # swept up along with the path (e.g. "ai-tells.md," or
+                # "ai-tells.md." at the end of a clause/sentence) - stripped
+                # from the end only, so "ai-tells.md" itself is untouched.
+                ref = ref_match.group(0).rstrip(".,;:!?")
+                if ".." in ref:
+                    failures.append(
+                        f"{rel_path}:{lineno}: referenced path {ref!r} contains a path traversal segment: {line.strip()!r}"
+                    )
+                    continue
+                target = skill_dir / ref
+                if not target.exists():
+                    failures.append(f"{rel_path}:{lineno}: referenced path {ref!r} does not exist: {line.strip()!r}")
+
+            # Strip URLs before scanning for local paths: a cited
+            # "https://example.com/home/page.html" would otherwise
+            # false-positive as a leaked "/home/" path (see LOCAL_PATH_RE).
+            line_without_urls = URL_RE.sub("", line)
+            local_path_match = LOCAL_PATH_RE.search(line_without_urls)
+            if local_path_match:
+                failures.append(
+                    f"{rel_path}:{lineno}: local filesystem path found: {line.strip()!r}"
+                )
+
+    assert not failures, "\n".join(failures)
+
+
 def test_plain_language_skill_files_are_tracked_by_git():
     """The module docstring cites .claude/skills/plain-language/SKILL.md and
     references/ai-tells.md as the source of truth for plain-language checks.
@@ -294,14 +420,17 @@ def test_plain_language_skill_files_are_tracked_by_git():
     since the files may exist locally but be untracked. Asserts each file is
     also non-empty (more than 300 bytes) to prevent empty placeholders from
     satisfying the requirement.
+
+    Note: this test assumes a real git checkout. It fails, by design, from a
+    source tarball with no .git.
     """
-    skill_files = [
-        ".claude/skills/plain-language/SKILL.md",
-        ".claude/skills/plain-language/references/ai-tells.md",
-    ]
     failures = []
 
-    for rel_path in skill_files:
+    # Explicit list, not a glob: this test's job is to assert these
+    # specific required files exist and are tracked by git - a glob can
+    # only discover what's present, it can't express "these exact files
+    # must exist".
+    for rel_path in SKILL_FILES_TO_CHECK:
         # Check git-trackedness using git ls-files
         result = subprocess.run(
             ["git", "ls-files", "--error-unmatch", rel_path],
@@ -319,7 +448,9 @@ def test_plain_language_skill_files_are_tracked_by_git():
             continue
 
         size = file_path.stat().st_size
-        if size < 300:
-            failures.append(f"{rel_path}: file is too small ({size} bytes, need at least 300)")
+        if size < MIN_SKILL_FILE_BYTES:
+            failures.append(
+                f"{rel_path}: file is too small ({size} bytes, need at least {MIN_SKILL_FILE_BYTES})"
+            )
 
     assert not failures, "\n".join(failures)
