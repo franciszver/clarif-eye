@@ -14,7 +14,14 @@ list threaded through config["configurable"].
 import pytest
 
 from clarif_eye.client import CompletionResult
-from clarif_eye.graph import build_graph, dynamic_router, vision_node
+from clarif_eye.graph import (
+    _UNCONDITIONAL_SUCCESSOR,
+    TTS_NODE,
+    build_graph,
+    dynamic_router,
+    next_node_after,
+    vision_node,
+)
 from clarif_eye.state import ClarifEyeState, make_initial_state
 
 from tests._stream_helpers import drain_stream_collecting_trace
@@ -345,3 +352,29 @@ def test_research_path_visits_vision_research_analysis_tts_only():
 
     assert trace == ["entry", "vision", "research", "analysis", "tts"]
     assert "fast_synth" not in trace
+
+
+# --- TTS_NODE: the one node name that travels outside this module --------
+
+
+def test_tts_node_constant_names_a_node_the_compiled_graph_actually_has():
+    """TTS_NODE is passed to graph.update_state(as_node=...) from
+    clarif_eye.ui, which validates it against the compiled node set and
+    raises InvalidUpdateError if it misses - and ui's never-raise guard
+    would turn that into a write that silently did nothing (issue #82's
+    wrong-photo blocker, resurrected).
+
+    Written to fail LOUDLY AND BY NAME on a half-finished rename, rather
+    than leaving it to be inferred from three indirect assertions in
+    test_followup.py and test_ask_before_speaking.py. Reads the COMPILED
+    graph's own node registry, not build_graph's source.
+    """
+    assert TTS_NODE in build_graph().nodes
+
+    # And it is genuinely the last node: nothing follows it, and every
+    # other path's declared successor is this same constant, so a rename
+    # cannot leave half the topology pointing at a stale string.
+    assert next_node_after(TTS_NODE, {}) is None
+    assert _UNCONDITIONAL_SUCCESSOR["fast_synth"] == TTS_NODE
+    assert _UNCONDITIONAL_SUCCESSOR["followup"] == TTS_NODE
+    assert _UNCONDITIONAL_SUCCESSOR["verify_numbers"] == TTS_NODE

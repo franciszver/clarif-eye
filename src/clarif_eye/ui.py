@@ -63,6 +63,7 @@ from clarif_eye.graph import (
     INTERRUPT_CHUNK_KEY,
     RESUME_CONTINUE,
     RESUME_RETAKE,
+    TTS_NODE,
     build_graph,
     next_node_after,
 )
@@ -626,7 +627,7 @@ _NODE_PHRASE = {
     "fast_synth": STATUS_NODE_WRITING,
     "analysis": STATUS_NODE_WRITING,
     "followup": STATUS_NODE_ANSWERING,
-    "tts": STATUS_NODE_TTS,
+    TTS_NODE: STATUS_NODE_TTS,
 }
 
 
@@ -1227,7 +1228,7 @@ class ThreadRegistry(_BoundedLRU):
 # paused: RESOLVE-THEN-WRITE. Decide what the user's action means as an
 # answer to the pending question, resolve the pause to that answer, and
 # only then write. Submitting another photo means an implicit RETAKE (the
-# user moved on), and passing as_node="tts" to _update_thread_state
+# user moved on), and passing as_node=TTS_NODE to _update_thread_state
 # resolves and writes in one go with no node executed - see the cache-hit
 # branch in _run_pipeline_events for the full reasoning and the rejected
 # alternative. The other two writes need no resolve: _record_turn only ever
@@ -1244,7 +1245,7 @@ class ThreadRegistry(_BoundedLRU):
 #   - _run_pipeline_events' CACHE-HIT branch, which runs at the START of a
 #     request and trims before yielding. NOT a post-run call, and the one
 #     place a thread can genuinely still be PAUSED when a write lands -
-#     which is why that call passes as_node="tts" to resolve the pause
+#     which is why that call passes as_node=TTS_NODE to resolve the pause
 #     first (see RESOLVE-THEN-WRITE above). Trimming after that resolve is
 #     safe like the others: there is no longer a pending checkpoint to
 #     preserve.
@@ -1530,6 +1531,26 @@ def _update_thread_state(graph, config, thread_id, update, as_node=None):
     exactly the case a second visitor's cache hit produces. Verified again
     for this issue with an explicit as_node="tts" on a thread that has
     never run: it creates the first checkpoint just the same.
+
+    THE ONE THING THE NEVER-RAISE GUARD BELOW CAN HIDE is a WRONG `as_node`.
+    LangGraph validates the name against the compiled node set and raises
+    langgraph.errors.InvalidUpdateError("Node <name> does not exist"), which
+    the blanket except turns into "this write silently did nothing" - and
+    for the cache-hit caller that write is what stops a follow-up answering
+    about a different photo than the user was just told about (issue #82's
+    blocker). Two things keep that honest, and no third mechanism is added
+    here because neither production behaviour nor the never-raise contract
+    should change for a programming error:
+      - the name is not a literal at either end - it is
+        clarif_eye.graph.TTS_NODE, so a node rename is one edit;
+      - a wrong name is LOUD IN THE SUITE, verified by mutation, not
+        assumed: pointing as_node at a node that does not exist turns THREE
+        tests red - test_ask_before_speaking.py's paused-cache-hit test and
+        both of test_followup.py's cache-hit-then-follow-up tests, which are
+        the very tests #82's blocker was closed with. tests/test_graph.py
+        additionally pins TTS_NODE against the compiled graph's node set, so
+        a half-finished rename fails by name rather than through those three
+        indirect assertions.
     """
     try:
         if as_node is None:
@@ -1769,20 +1790,28 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
             # a draft held back for a photo the user has left behind must
             # never divert the next run.
             #
-            # RESOLVED WITH as_node="tts", NOT by streaming
+            # RESOLVED WITH as_node=TTS_NODE, NOT by streaming
             # Command(resume=RESUME_RETAKE). Both end identically
             # (.next == (), no pending interrupt - both probed), but the
             # resume path RUNS the graph's remaining nodes, which means
             # verify_numbers plus a full tts synthesis of a retake
             # confirmation nobody will hear - a real network round trip and
             # a stray mp3, spent to reach a state the user is about to
-            # leave anyway. as_node="tts" reaches the same end state with
+            # leave anyway. as_node=TTS_NODE reaches the same end state with
             # NO node executed at all, and folds into the single write this
             # branch was already making. It is also what this call was
             # already doing implicitly: with no as_node, LangGraph infers
             # the last node to update the state, which on a completed
             # thread is tts. Naming it makes that true on a paused thread
             # too, instead of quietly not being.
+            #
+            # THE NAME COMES FROM clarif_eye.graph.TTS_NODE, never a literal
+            # here: LangGraph validates as_node against the compiled node
+            # set and raises InvalidUpdateError("Node <name> does not
+            # exist") if it misses, which _update_thread_state's never-raise
+            # guard would turn into "this whole write silently did nothing"
+            # - i.e. the #82 wrong-photo blocker, back. See that function's
+            # docstring for the three tests that catch it anyway.
             if thread_id is not None:
                 configurable = dict(thread_configurable(resources, thread_id))
                 if configurable:
@@ -1800,7 +1829,7 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
                         {"configurable": configurable},
                         thread_id,
                         update,
-                        as_node="tts",
+                        as_node=TTS_NODE,
                     )
             yield "outcome", (cached_audio_path or None, cached_text)
             return

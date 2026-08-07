@@ -396,7 +396,7 @@ def analysis_destination(state):
     request, on a 512MB instance, for nothing. Branching here means the
     asking node is entered ONLY on the runs that actually ask.
     """
-    return "verify_numbers" if numbers_need_asking(state) else "tts"
+    return "verify_numbers" if numbers_need_asking(state) else TTS_NODE
 
 
 def verify_numbers_node(state):
@@ -592,7 +592,7 @@ def build_graph(checkpointer=None):
     # brain call analysis just made - see verify_numbers_node's docstring.
     builder.add_node("verify_numbers", verify_numbers_node)
     builder.add_node("followup", followup_node)
-    builder.add_node("tts", tts_node)
+    builder.add_node(TTS_NODE, tts_node)
 
     # entry has NO outgoing edge of any kind: it returns Command(goto=...)
     # and routes itself. See this module's "TWO ROUTING MECHANISMS" block
@@ -608,7 +608,7 @@ def build_graph(checkpointer=None):
         dynamic_router,
         {"fast_synth": "fast_synth", "research": "research"},
     )
-    builder.add_edge("fast_synth", "tts")
+    builder.add_edge("fast_synth", TTS_NODE)
     builder.add_edge("research", "analysis")
     # Only the deep-analysis path verifies numbers at all (see
     # clarif_eye.verification's module docstring), so only this path can
@@ -621,16 +621,29 @@ def build_graph(checkpointer=None):
     builder.add_conditional_edges(
         "analysis",
         analysis_destination,
-        {"verify_numbers": "verify_numbers", "tts": "tts"},
+        {"verify_numbers": "verify_numbers", TTS_NODE: TTS_NODE},
     )
-    builder.add_edge("verify_numbers", "tts")
+    builder.add_edge("verify_numbers", TTS_NODE)
     # A follow-up answer is spoken exactly like a description is: same tts
     # node, same provider chain, same staged delivery in the UI.
-    builder.add_edge("followup", "tts")
-    builder.add_edge("tts", END)
+    builder.add_edge("followup", TTS_NODE)
+    builder.add_edge(TTS_NODE, END)
 
     return builder.compile(checkpointer=checkpointer)
 
+
+# The name the final node is registered under. A CONSTANT because that
+# string is not confined to this module's own wiring: clarif_eye.ui passes
+# it to graph.update_state(as_node=...) when it resolves a paused thread
+# (see _update_thread_state / the cache-hit branch's RESOLVE-THEN-WRITE
+# comment), and LangGraph validates that name against the compiled node set
+# - InvalidUpdateError("Node <name> does not exist"), verified. Renaming
+# the node without updating that far-away call site would turn the whole
+# cache-hit thread write into a no-op. With the constant a rename is ONE
+# edit; tests/test_graph.py additionally pins TTS_NODE against the compiled
+# graph's own node set, so a half-done rename fails immediately and by
+# name rather than through three indirect assertions elsewhere.
+TTS_NODE = "tts"
 
 # Unconditional successor for every edge above EXCEPT the ones out of
 # "entry" (self-routed by Command, resolved by entry_destination instead),
@@ -643,10 +656,10 @@ def build_graph(checkpointer=None):
 # in the same diff, or next_node_after silently starts lying to callers
 # like clarif_eye.ui's per-node progress narration (issue #80 / P9.1).
 _UNCONDITIONAL_SUCCESSOR = {
-    "fast_synth": "tts",
+    "fast_synth": TTS_NODE,
     "research": "analysis",
-    "verify_numbers": "tts",
-    "followup": "tts",
+    "verify_numbers": TTS_NODE,
+    "followup": TTS_NODE,
 }
 
 
@@ -685,6 +698,6 @@ def next_node_after(node_name, state):
         return dynamic_router(state)
     if node_name == "analysis":
         return analysis_destination(state)
-    if node_name == "tts":
+    if node_name == TTS_NODE:
         return None
     return _UNCONDITIONAL_SUCCESSOR.get(node_name)
