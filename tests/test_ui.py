@@ -25,6 +25,7 @@ from clarif_eye.ui import (
     UNREADABLE_IMAGE_MESSAGE,
     build_resources,
     handle_submit,
+    handle_submit_staged,
 )
 
 
@@ -39,6 +40,25 @@ class FakeImage:
 
     def save(self, buf, format=None):
         buf.write(b"\xff\xd8\xff\xe0fakejpegbytes")
+
+
+class ContentImage:
+    """Stand-in PIL Image whose encoded bytes are caller-controlled, so
+    cache tests (issue #75) can tell two "photos" apart by content rather
+    than by identity/path - the same distinction the cache itself must
+    make.
+    """
+
+    mode = "RGB"
+
+    def __init__(self, content):
+        self.content = content
+
+    def convert(self, mode):
+        return self
+
+    def save(self, buf, format=None):
+        buf.write(self.content)
 
 
 class BrokenImage:
@@ -66,6 +86,22 @@ class FakeGraph:
         if self.exc is not None:
             raise self.exc
         return self.result
+
+
+class SequencedGraph:
+    """Like FakeGraph, but returns a DIFFERENT final_output on each
+    invocation - lets cache tests (issue #75) assert that two different
+    images produce genuinely different results, not just different call
+    counts."""
+
+    def __init__(self, outputs):
+        self.outputs = list(outputs)
+        self.invocations = []
+
+    def invoke(self, state, config=None):
+        idx = len(self.invocations)
+        self.invocations.append({"state": state, "config": config})
+        return {"final_output": self.outputs[idx], "audio_file_path": ""}
 
 
 def _resources(graph, client="fake-client"):
@@ -286,3 +322,73 @@ def test_build_resources_constructs_client_only_once(monkeypatch):
         handle_submit(FakeImage(), resources)
 
     assert len(calls) == 1
+
+
+# --- Image content cache (issue #75): identical photos cost one model call -
+#
+# The same photo submitted twice must cost one model call, not two.
+# Keyed on the DECODED image content (the bytes handle_submit actually
+# sends), never on filename/path - the same photo uploaded twice arrives
+# at a different temp path each time.
+
+
+def test_identical_image_content_reuses_cached_result_no_second_call():
+    tts_module._last_result_set(
+        tts_module.TtsResult("/tmp/out.mp3", (tts_module.ProviderAttempt("Edge", "success", ""),), "Edge")
+    )
+    graph = FakeGraph(result={"final_output": "A cat sits on a mat.", "audio_file_path": "/tmp/out.mp3"})
+    resources = _resources(graph)
+
+    first = handle_submit(ContentImage(b"photo-one-bytes"), resources)
+    second = handle_submit(ContentImage(b"photo-one-bytes"), resources)
+
+    assert len(graph.invocations) == 1
+    assert first == second == ("/tmp/out.mp3", "A cat sits on a mat.")
+
+
+def test_cache_hit_yields_the_same_staged_sequence_as_a_miss():
+    tts_module._last_result_set(
+        tts_module.TtsResult("/tmp/out.mp3", (tts_module.ProviderAttempt("Edge", "success", ""),), "Edge")
+    )
+    graph = FakeGraph(result={"final_output": "A cat sits on a mat.", "audio_file_path": "/tmp/out.mp3"})
+    resources = _resources(graph)
+
+    miss_updates = list(handle_submit_staged(ContentImage(b"photo-two-bytes"), resources))
+    hit_updates = list(handle_submit_staged(ContentImage(b"photo-two-bytes"), resources))
+
+    assert len(graph.invocations) == 1  # confirms the second run was a hit
+    assert len(miss_updates) == len(hit_updates) == 3
+    # Same shape on both: working status first, then status+text with no
+    # audio, then (only after the existing delay) status+text+audio - a
+    # hit must not skip or reorder the audio-delay stage.
+    for miss, hit in zip(miss_updates, hit_updates):
+        assert len(miss) == len(hit) == 3
+    assert miss_updates[0][1] is None
+    assert hit_updates[0][1] is None
+    assert miss_updates[1][1] is None
+    assert hit_updates[1][1] is None
+    assert miss_updates[2][1] == hit_updates[2][1] == "/tmp/out.mp3"
+    assert miss_updates[2][2] == hit_updates[2][2] == "A cat sits on a mat."
+
+
+def test_different_images_produce_two_calls_and_two_different_results():
+    graph = SequencedGraph(["first description", "second description"])
+    resources = _resources(graph)
+
+    _, text_a = handle_submit(ContentImage(b"photo-a-bytes"), resources)
+    _, text_b = handle_submit(ContentImage(b"photo-b-bytes"), resources)
+
+    assert len(graph.invocations) == 2
+    assert text_a == "first description"
+    assert text_b == "second description"
+    assert text_a != text_b
+
+
+def test_failed_result_is_not_cached_a_retry_makes_a_second_call():
+    graph = FakeGraph(exc=RuntimeError("boom"))
+    resources = _resources(graph)
+
+    handle_submit(ContentImage(b"photo-fail-bytes"), resources)
+    handle_submit(ContentImage(b"photo-fail-bytes"), resources)
+
+    assert len(graph.invocations) == 2
