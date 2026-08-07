@@ -44,6 +44,7 @@ it were the bug.
 """
 
 import re
+import subprocess
 from pathlib import Path
 
 import gradio as gr
@@ -280,4 +281,45 @@ def test_no_status_string_claims_audio_is_playing():
                 f"{name}: claims audio {match.group(0)!r} as fact, but a browser can block autoplay. "
                 "State only what is true in every branch (e.g. 'Description ready.')."
             )
+    assert not failures, "\n".join(failures)
+
+
+def test_plain_language_skill_files_are_tracked_by_git():
+    """The module docstring cites .claude/skills/plain-language/SKILL.md and
+    references/ai-tells.md as the source of truth for plain-language checks.
+    A fresh clone must have these files tracked and non-empty, or the test
+    suite enforces a standard whose definition is missing.
+
+    This test uses git ls-files to verify trackedness, not path.exists(),
+    since the files may exist locally but be untracked. Asserts each file is
+    also non-empty (more than 300 bytes) to prevent empty placeholders from
+    satisfying the requirement.
+    """
+    skill_files = [
+        ".claude/skills/plain-language/SKILL.md",
+        ".claude/skills/plain-language/references/ai-tells.md",
+    ]
+    failures = []
+
+    for rel_path in skill_files:
+        # Check git-trackedness using git ls-files
+        result = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", rel_path],
+            cwd=REPO_ROOT,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            failures.append(f"{rel_path}: not tracked by git")
+            continue
+
+        # Check file exists and is non-empty
+        file_path = REPO_ROOT / rel_path
+        if not file_path.exists():
+            failures.append(f"{rel_path}: file does not exist")
+            continue
+
+        size = file_path.stat().st_size
+        if size < 300:
+            failures.append(f"{rel_path}: file is too small ({size} bytes, need at least 300)")
+
     assert not failures, "\n".join(failures)
