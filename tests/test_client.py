@@ -4,6 +4,7 @@ No network calls: every test mocks the HTTP transport via
 httpx.MockTransport. The suite must pass fully offline.
 """
 
+import datetime
 import time
 
 import httpx
@@ -632,3 +633,82 @@ def test_registry_is_loaded_exactly_once_across_multiple_requests(monkeypatch):
         client.complete("eyes", [{"role": "user", "content": "hi"}])
 
     assert len(load_calls) == 1  # never re-read from disk per request
+
+
+# --- Process-wide daily request counter (issue #76 / P8.8) ------------------
+#
+# failure_messages.py uses this counter - never error text - to tell a
+# momentary rate limit from the daily allowance being gone. It must count
+# every model REQUEST sent, not every user submission, because complete()
+# can send several requests (one per ladder rung) for one submission.
+
+
+def _reset_daily_count(monkeypatch, date=None, count=0):
+    monkeypatch.setitem(client_module._daily_request_count, "date", date)
+    monkeypatch.setitem(client_module._daily_request_count, "count", count)
+
+
+def test_requests_sent_today_counts_every_ladder_rung_not_just_submissions(monkeypatch):
+    _reset_daily_count(monkeypatch)
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return json_response(429, message="rate limited")
+
+    client = make_client(handler)
+    with pytest.raises(LadderExhaustedError):
+        client.complete("eyes", [{"role": "user", "content": "hi"}])
+
+    # One user submission, but every ladder rung is its own model request.
+    assert len(calls) == len(EYES_LADDER)
+    assert client_module.requests_sent_today() == len(EYES_LADDER)
+
+
+def test_daily_request_counter_rolls_over_on_utc_date_change(monkeypatch):
+    _reset_daily_count(monkeypatch)
+
+    day_one = datetime.datetime(2026, 8, 5, 23, 59, 0, tzinfo=datetime.timezone.utc)
+    day_two = datetime.datetime(2026, 8, 6, 0, 0, 1, tzinfo=datetime.timezone.utc)
+
+    # No sleep: the UTC clock is injected directly.
+    client_module._record_model_request(now=day_one)
+    client_module._record_model_request(now=day_one)
+    assert client_module.requests_sent_today(now=day_one) == 2
+
+    # Reading on the new UTC day must not see yesterday's count.
+    assert client_module.requests_sent_today(now=day_two) == 0
+
+    client_module._record_model_request(now=day_two)
+    assert client_module.requests_sent_today(now=day_two) == 1
+
+
+def test_redact_headers_strips_authorization_case_insensitively():
+    headers = {"Authorization": f"Bearer {SENTINEL_KEY}", "Content-Type": "application/json"}
+
+    redacted = client_module._redact_headers(headers)
+
+    assert redacted["Authorization"] == "[REDACTED]"
+    assert redacted["Content-Type"] == "application/json"
+    assert SENTINEL_KEY not in repr(redacted)
+
+
+def test_raw_429_is_logged_with_status_headers_and_body(monkeypatch, caplog):
+    _reset_daily_count(monkeypatch)
+
+    def handler(request):
+        return httpx.Response(
+            429,
+            headers={"X-RateLimit-Remaining": "0"},
+            json={"error": {"message": "rate limited, evidence marker 7f3a"}},
+        )
+
+    client = make_client(handler)
+    with caplog.at_level("WARNING"):
+        with pytest.raises(LadderExhaustedError):
+            client.complete("eyes", [{"role": "user", "content": "hi"}])
+
+    assert "429" in caplog.text
+    assert "x-ratelimit-remaining" in caplog.text.lower()
+    assert "evidence marker 7f3a" in caplog.text
+    assert SENTINEL_KEY not in caplog.text
