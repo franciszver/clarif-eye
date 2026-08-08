@@ -160,7 +160,19 @@ def _degraded(message):
     # so on a checkpointed thread a hold left over from an earlier photo
     # would otherwise survive and stop THIS run to ask about a number
     # nobody just heard. See state.py's ClarifEyeState.verification_hold.
-    return {"final_output": _to_spoken_text(message), "verification_hold": None}
+    # output_degraded=True (issue #93 / P9.12): written on every degrading
+    # return for the same "one helper, cannot be forgotten" reason
+    # verification_hold is. See clarif_eye.state.ClarifEyeState.output_degraded.
+    # THE HELD-FOR-VERIFICATION BRANCH BELOW USES THIS TOO, and that is
+    # correct: what it puts in final_output is a refusal to read an
+    # unverifiable script aloud, not the script. If the graph goes on to ASK
+    # the user and they say yes, clarif_eye.graph.verify_numbers_node
+    # rewrites both keys - the caveated script IS a real answer.
+    return {
+        "final_output": _to_spoken_text(message),
+        "verification_hold": None,
+        "output_degraded": True,
+    }
 
 
 def _degrade_from_known(ocr_output, scene_context):
@@ -291,4 +303,4 @@ def run_analysis(
         held["verification_hold"] = {"script": spoken, "numbers": failing_numbers}
         return held
 
-    return {"final_output": spoken, "verification_hold": None}
+    return {"final_output": spoken, "verification_hold": None, "output_degraded": False}

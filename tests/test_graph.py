@@ -113,6 +113,8 @@ def test_make_initial_state_has_every_key_with_correct_types():
         "messages",
         "question",
         "verification_hold",
+        # issue #93 / P9.12 - see ClarifEyeState.output_degraded.
+        "output_degraded",
     }
     assert set(state.keys()) == expected_keys
 
@@ -129,6 +131,8 @@ def test_state_typeddict_has_exactly_the_expected_keys():
         "messages",
         "question",
         "verification_hold",
+        # issue #93 / P9.12 - see ClarifEyeState.output_degraded.
+        "output_degraded",
     }
 
 

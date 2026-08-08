@@ -121,7 +121,13 @@ def _build_messages(ocr_output, scene_context, question, verbosity=None):
 
 
 def _degraded(message):
-    return {"final_output": _to_spoken_text(message)}
+    # output_degraded=True (issue #93 / P9.12): NO_PHOTO_YET_MESSAGE and
+    # every other message built here explains why the question was not
+    # answered - it is not an answer to it, and a later turn must not read it
+    # back as one. Set in the ONE helper every degrading return here goes
+    # through. See clarif_eye.state.ClarifEyeState.output_degraded, and
+    # clarif_eye.ui._record_turn for what reads it.
+    return {"final_output": _to_spoken_text(message), "output_degraded": True}
 
 
 def has_described_photo(ocr_output, scene_context):
@@ -238,4 +244,6 @@ def run_followup(ocr_output, scene_context, question, client=None, deadline_exce
     if not spoken:
         return _degraded("The model returned an empty answer.")
 
-    return {"final_output": spoken}
+    # The one success return: a real answer to the user's question (issue
+    # #93 / P9.12).
+    return {"final_output": spoken, "output_degraded": False}

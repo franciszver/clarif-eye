@@ -144,6 +144,16 @@ SCENARIOS = [
             # genuine model text rather than only on text a test wrote to
             # be caught.
             "tests/test_ask_before_speaking.py",
+            # Issue #93 / P9.12: drives handle_submit_staged /
+            # handle_ask_staged with a fake client that FAILS every model
+            # call, to prove a degraded run's spoken failure message never
+            # enters the thread's conversation history. Paired with the same
+            # UI scenario script, with the same honest limit the entry above
+            # states: a live run cannot be made to fail on demand either, so
+            # ui_smoke.py proves the healthy half of this file (real answers
+            # still record) against the real stack, and the degraded half is
+            # reachable only with a fake that refuses.
+            "tests/test_degraded_turns.py",
         ],
         "scenario_paths": [
             "scripts/ui_smoke.py",

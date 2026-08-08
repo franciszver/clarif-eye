@@ -85,7 +85,12 @@ def _build_messages(ocr_output, scene_context, verbosity=None):
 
 
 def _degraded(message):
-    return {"final_output": _to_spoken_text(message)}
+    # output_degraded=True (issue #93 / P9.12): this message explains why
+    # there is no description, so it must never be remembered as one. THE
+    # ONE PLACE it is set for this module - every degrading return here goes
+    # through this helper - so a new degradation branch cannot forget it.
+    # See clarif_eye.state.ClarifEyeState.output_degraded.
+    return {"final_output": _to_spoken_text(message), "output_degraded": True}
 
 
 def _degrade_from_known(ocr_output, scene_context):
@@ -180,4 +185,6 @@ def run_fast_synth(ocr_output, scene_context, client=None, deadline_exceeded=Fal
     if not spoken:
         return _degraded("The synthesis model returned an empty response.")
 
-    return {"final_output": spoken}
+    # The one success return: a real description of the photo, safe to
+    # remember as this thread's answer (issue #93 / P9.12).
+    return {"final_output": spoken, "output_degraded": False}
