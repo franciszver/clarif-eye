@@ -51,6 +51,7 @@ from dataclasses import dataclass, field
 
 import gradio as gr
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.store.memory import InMemoryStore
 from langgraph.types import Command
 
 from clarif_eye.client import LadderExhaustedError, OpenRouterClient, OpenRouterError
@@ -69,8 +70,10 @@ from clarif_eye.graph import (
     build_graph,
     next_node_after,
 )
+from clarif_eye.preferences import detect_preference_command, set_verbosity, VERBOSITY_SHORT
+from clarif_eye.speech import to_spoken_text as _to_spoken_text
 from clarif_eye.state import make_initial_state
-from clarif_eye.tts import DEFAULT_PROVIDER_CHAIN, is_chain_exhausted
+from clarif_eye.tts import DEFAULT_PROVIDER_CHAIN, is_chain_exhausted, run_tts
 
 # Spoken-ready messages, as named constants rather than inline literals -
 # same reasoning as vision.py's DEGRADED_* constants: a caller (and tests)
@@ -100,6 +103,23 @@ AUDIO_UNAVAILABLE_NOTE = (
 NO_QUESTION_MESSAGE = (
     "No question was typed. Please type a question about the photo, then "
     "activate the ask button."
+)
+# Issue #86 / P9.7: spoken back when the follow-up box was recognised as a
+# preference COMMAND, not a question (see clarif_eye.preferences.
+# detect_preference_command). Named constants, same reasoning as every
+# other spoken message here: what is actually said must be readable from
+# the code, not guessed at from behaviour, and a later reword can't
+# silently break a test that was matching prose. Says WHAT changed and that
+# it is FOR THIS SESSION - a user who cannot see any settings screen has no
+# other way to learn what "shorter descriptions please" actually did, or
+# how long it lasts.
+PREFERENCE_CONFIRMATION_SHORT = (
+    "Understood. Descriptions will be shorter for the rest of this "
+    "session."
+)
+PREFERENCE_CONFIRMATION_DETAILED = (
+    "Understood. Descriptions will include more detail for the rest of "
+    "this session."
 )
 # Issue #84 / P9.5: the text-only API route was called with nothing to
 # describe. Worded for an API caller (there is no button and no photo in
@@ -1503,12 +1523,13 @@ def _trim_thread_to_latest_checkpoint(checkpointer, thread_id):
         pass
 
 
-def thread_configurable(resources, thread_id):
+def thread_configurable(resources, thread_id, session_id=None):
     """The ONE chokepoint for every thread-scoped call into
     resources.graph (issue #81 / P9.2). Touches resources.thread_registry
     (if configured) so the live-thread LRU bound (MAX_LIVE_THREADS above)
     stays accurate, and returns the config["configurable"] entries a
-    thread-scoped call needs - currently just {"thread_id": thread_id}.
+    thread-scoped call needs - {"thread_id": thread_id} and, since issue
+    #86 / P9.7, {"session_id": session_id}.
 
     Returns {} when `thread_id` is None, so callers can unconditionally
     `configurable.update(thread_configurable(resources, thread_id))`
@@ -1532,16 +1553,31 @@ def thread_configurable(resources, thread_id):
     already does this correctly; nothing else in this codebase should
     construct one without the other.
 
+    `session_id` (issue #86 / P9.7) is added to the returned dict
+    INDEPENDENTLY of the thread_id/thread_registry guard above - it has no
+    pairing invariant with `graph` to enforce, because a Store is not a
+    checkpointer: an uncheckpointed/no-registry graph can still be compiled
+    WITH a store (see clarif_eye.graph.build_graph's `store` param), and a
+    node reading a preference with no store configured simply sees None
+    (clarif_eye.preferences.verbosity_for_config never raises). Threaded
+    through THIS chokepoint - the SAME ONE thread_id already uses - rather
+    than a second one, for the reason this function's own docstring already
+    states about future call sites: one gate that everything goes through
+    cannot silently stop covering a call site the way two could.
+
     FUTURE CALL SITES MUST GO THROUGH THIS, not resources.thread_registry
     directly: #82 (follow-ups) and #83 (interrupts) will add more places
     that invoke or otherwise touch a thread-scoped graph call, and a
     registry that only some of them remember to touch would silently stop
     bounding the live-thread count for the call sites that forgot.
     """
-    if thread_id is None or resources.thread_registry is None:
-        return {}
-    resources.thread_registry.touch(thread_id)
-    return {"thread_id": thread_id}
+    configurable = {}
+    if thread_id is not None and resources.thread_registry is not None:
+        resources.thread_registry.touch(thread_id)
+        configurable["thread_id"] = thread_id
+    if session_id is not None:
+        configurable["session_id"] = session_id
+    return configurable
 
 
 def _image_content_key(image_data):
@@ -1593,6 +1629,20 @@ class AppResources:
     # together; every test that wants a thread-scoped graph must do the
     # same (see tests/test_ui.py's checkpointed-thread tests).
     thread_registry: object = None
+    # None by default (issue #86 / P9.7), same "every existing test unaffected"
+    # reasoning as thread_registry above: an AppResources built directly with
+    # no `store` keeps handle_ask_staged's preference-command branch a no-op
+    # write (clarif_eye.preferences.set_verbosity degrades to nothing on a
+    # None store) and every node's read degrades to "no preference on file" -
+    # exactly today's behavior. build_resources() (the live app) sets a real
+    # langgraph.store.memory.InMemoryStore, one per process, alongside the
+    # checkpointer - see that function's own comment for the honest,
+    # in-process-only limits it shares with the checkpointer. UNLIKE
+    # thread_registry there is no pairing invariant with `graph` to enforce:
+    # a store is independent of whether `graph` is checkpointed at all (see
+    # clarif_eye.graph.build_graph's `store` param docstring), so this can be
+    # set (or not) without reference to thread_registry/checkpointer.
+    store: object = None
 
 
 def build_resources():
@@ -1635,6 +1685,21 @@ def build_resources():
     this function, is unaffected: build_graph()'s `checkpointer` param
     defaults to None, so an uncheckpointed graph needs no thread_id at all
     - only THIS function's live graph does.
+
+    CROSS-THREAD PREFERENCE STORE (issue #86 / P9.7): also compiles WITH a
+    fresh langgraph.store.memory.InMemoryStore, one per process, the same
+    "construct once at startup" discipline as the checkpointer above.
+    SAME HONEST LIMITS AS THE CHECKPOINTER, stated here for the same
+    reason: everything lives in THIS PROCESS's memory only, nothing is
+    written to disk, and a restart (redeploy, crash, a free-tier cold
+    start) loses every session's preference exactly as it already loses
+    every thread's history. UNLIKE the checkpointer, this store is NEVER
+    bounded by ThreadRegistry/MAX_LIVE_THREADS - it holds at most one tiny
+    dict per session_id ({"verbosity": "short"|"detailed"}, see
+    clarif_eye.preferences), so an unbounded number of sessions would cost
+    kilobytes, not the base64 photo bytes a checkpointer thread can carry.
+    No eviction mechanism exists for it today; that is an accepted,
+    honestly-stated gap for a demo app's scale, not an oversight.
     """
     try:
         client = OpenRouterClient()
@@ -1660,15 +1725,17 @@ def build_resources():
         research_client = None
 
     checkpointer = InMemorySaver()
+    store = InMemoryStore()
 
     return AppResources(
-        graph=build_graph(checkpointer=checkpointer),
+        graph=build_graph(checkpointer=checkpointer, store=store),
         client=client,
         client_error=client_error,
         tts_providers=tts_providers,
         searcher=searcher,
         research_client=research_client,
         thread_registry=ThreadRegistry(checkpointer),
+        store=store,
     )
 
 
@@ -1887,7 +1954,7 @@ def _narrate_stream(graph, state, config, result):
                 yield "status", phrase
 
 
-def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=None):
+def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=None, session_id=None):
     """Generator: the ONE place that knows how to run a photo through the
     pipeline - guards, the image cache, graph execution, and the
     exception/outcome mapping.
@@ -2090,7 +2157,7 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
             "research_client": resources.research_client,
             "deadline": time.monotonic() + pipeline_budget_seconds,
         }
-        configurable.update(thread_configurable(resources, thread_id))
+        configurable.update(thread_configurable(resources, thread_id, session_id=session_id))
         config = {"configurable": configurable}
         graph = resources.graph
         result = dict(state)
@@ -2180,7 +2247,42 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
     yield "outcome", outcome
 
 
-def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id=None):
+def _handle_preference_command(verbosity, resources, session_id):
+    """Store `verbosity` for `session_id` and speak a confirmation - NO
+    graph run, NO model call (issue #86 / P9.7's own rule).
+
+    THE STAGED CONTRACT, EVEN THOUGH THE GRAPH NEVER RUNS: this yields
+    exactly the same ("outcome", (audio_path_or_None, text)) shape every
+    other branch of _run_followup_events/_run_pipeline_events yields, so
+    _stage_events (the caller two levels up) stages it identically to a
+    real answer - the confirmation is genuinely SPOKEN (through run_tts,
+    called directly here since there is no graph run to produce it), not
+    merely written to the text box. clarif_eye.tts.run_tts already never
+    raises (see its own docstring) and always returns {"audio_file_path":
+    "" } on any failure, so this function inherits that same guarantee with
+    no try/except of its own needed.
+
+    set_verbosity (clarif_eye.preferences) is itself never-raising and a
+    silent no-op when `resources.store` is None or `session_id` is falsy -
+    see that function's docstring - so a store-less AppResources (every
+    existing test that builds one directly) or a caller with no session_id
+    still gets the SAME spoken confirmation. That is a deliberate honesty
+    trade-off: the confirmation describes intent ("I will keep descriptions
+    shorter"), and intent is genuinely what was just recognised and acted
+    on, even on the rare path where there is nowhere durable to record it.
+    """
+    set_verbosity(resources.store, session_id, verbosity)
+    confirmation = (
+        PREFERENCE_CONFIRMATION_SHORT
+        if verbosity == VERBOSITY_SHORT
+        else PREFERENCE_CONFIRMATION_DETAILED
+    )
+    spoken = _to_spoken_text(confirmation)
+    audio_path = run_tts(spoken, providers=resources.tts_providers).get("audio_file_path") or ""
+    yield "outcome", (audio_path or None, spoken)
+
+
+def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id=None, session_id=None):
     """Generator: the follow-up sibling of _run_pipeline_events (issue #82 /
     P9.3). Answers a typed question about the photo this thread already
     described, and yields the SAME ("status", phrase) / ("outcome", (audio,
@@ -2242,6 +2344,19 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
     a stale verification_hold could not divert an answer even if one
     existed - and after this guard, a follow-up cannot run on a thread that
     has one at all.
+
+    A PREFERENCE-SETTING COMMAND (issue #86 / P9.7) IS CHECKED AFTER THE
+    BLANK/NON-STRING GUARDS BUT BEFORE THE GRAPH IS EVER TOUCHED - see
+    _handle_preference_command below. "shorter descriptions please"
+    and its tiny closed-vocabulary siblings (clarif_eye.preferences.
+    detect_preference_command) never reach `followup`/the brain model at
+    all: they cost no model call, write only to the Store (never to
+    resources.graph's checkpointer), and the run returns immediately with a
+    spoken confirmation. Checked AFTER `resources.client is None` above on
+    purpose, not before - a client-not-configured process is broken beyond
+    what a stored preference could meaningfully affect, so that guard's
+    existing CONFIG_ERROR_MESSAGE answer is left as the honest one even for
+    a typed preference command.
     """
     if resources.client is None:
         yield "outcome", (None, resources.client_error or CONFIG_ERROR_MESSAGE)
@@ -2271,13 +2386,18 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
         yield "outcome", (None, NO_QUESTION_MESSAGE)
         return
 
+    verbosity_command = detect_preference_command(question)
+    if verbosity_command is not None:
+        yield from _handle_preference_command(verbosity_command, resources, session_id)
+        return
+
     try:
         configurable = {
             "client": resources.client,
             "tts_providers": resources.tts_providers,
             "deadline": time.monotonic() + pipeline_budget_seconds,
         }
-        configurable.update(thread_configurable(resources, thread_id))
+        configurable.update(thread_configurable(resources, thread_id, session_id=session_id))
         config = {"configurable": configurable}
         graph = resources.graph
         # A pending safety question outranks a follow-up - see this
@@ -2325,7 +2445,8 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
 
 
 def handle_ask_staged(
-    question, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUDGET_SECONDS, thread_id=None
+    question, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUDGET_SECONDS, thread_id=None,
+    session_id=None,
 ):
     """The follow-up sibling of handle_submit_staged (issue #82 / P9.3):
     answers a typed question and yields the SAME staged (status_text,
@@ -2338,10 +2459,19 @@ def handle_ask_staged(
     status/text-then-audio split, the delay - must feel identical to a
     photo run. A user who has just heard a description read aloud should not
     have to learn a second interaction rhythm to ask about it.
+
+    `session_id` (issue #86 / P9.7) is OPTIONAL and defaults to None, same
+    shape as `thread_id` - see clarif_eye.ui.thread_configurable and
+    clarif_eye.preferences for what passing one actually does: it is both
+    the namespace a recognised preference COMMAND is written under, and the
+    namespace later runs (on this thread or another) read a stored
+    preference back from.
     """
     yield from _stage_events(
         STATUS_ASKING,
-        _run_followup_events(question, resources, pipeline_budget_seconds, thread_id=thread_id),
+        _run_followup_events(
+            question, resources, pipeline_budget_seconds, thread_id=thread_id, session_id=session_id
+        ),
     )
 
 
@@ -2604,7 +2734,7 @@ def handle_resume_staged(
 
 def handle_submit_staged(
     image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUDGET_SECONDS, thread_id=None,
-    pause_signal=None,
+    pause_signal=None, session_id=None,
 ):
     """Generator version of handle_submit that also drives the live-region
     status text (issue #15 / P5.1 scope item 3).
@@ -2648,10 +2778,20 @@ def handle_submit_staged(
     `pause_signal` (issue #83 / P9.4) is OPTIONAL and defaults to None - see
     _PauseSignal for why the "did this run pause?" bit travels beside the
     yields rather than inside them.
+
+    `session_id` (issue #86 / P9.7) is OPTIONAL and defaults to None, same
+    shape as `thread_id` - build_interface passes each browser session's own
+    minted session_id (a SECOND gr.State, alongside thread_state) through
+    here, so fast_synth_node/analysis_node can read a verbosity preference
+    set on THIS OR ANY OTHER thread of the same session - see
+    clarif_eye.preferences's module docstring for the honest scope of that
+    ("crosses threads" in the sense the store's namespacing genuinely
+    supports, not in the sense that a live browser session normally has more
+    than one thread to demonstrate it with).
     """
     yield from _stage_events(
         STATUS_WORKING,
-        _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=thread_id),
+        _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=thread_id, session_id=session_id),
         pause_signal=pause_signal,
     )
 
@@ -2918,10 +3058,10 @@ def build_interface(resources):
     # comment claimed the follow-up left the pause alone; it did not - it
     # superseded the pending task and left these two buttons wired to
     # nothing. That is the bug the refusal fixes.
-    def _submit(image, thread_id):
+    def _submit(image, thread_id, session_id):
         pause_signal = _PauseSignal()
         for status, audio, text in handle_submit_staged(
-            image, resources, thread_id=thread_id, pause_signal=pause_signal
+            image, resources, thread_id=thread_id, pause_signal=pause_signal, session_id=session_id
         ):
             visible = gr.update(visible=pause_signal.paused)
             yield status, audio, text, visible, visible
@@ -2931,8 +3071,8 @@ def build_interface(resources):
         for status, audio, text in handle_resume_staged(answer, resources, thread_id=thread_id):
             yield status, audio, text, hidden, hidden
 
-    def _ask(question, thread_id):
-        yield from handle_ask_staged(question, resources, thread_id=thread_id)
+    def _ask(question, thread_id, session_id):
+        yield from handle_ask_staged(question, resources, thread_id=thread_id, session_id=session_id)
 
     # Issue #84 / P9.5. Fully type-hinted because gr.api derives the
     # endpoint's typing from the signature rather than from components -
@@ -2945,6 +3085,19 @@ def build_interface(resources):
 
     with gr.Blocks(title="Clarif-Eye") as demo:
         thread_state = gr.State(value=lambda: str(uuid.uuid4()))
+        # Issue #86 / P9.7: a SECOND per-session id, minted the same way
+        # thread_state is (one gr.State callable, called once per browser
+        # session - see thread_state's own comment below) but namespacing
+        # the cross-thread PREFERENCE store instead of the checkpointer.
+        # Kept deliberately separate from thread_state rather than reusing
+        # it: today the two are equal for the lifetime of one session (one
+        # session, one thread - see clarif_eye.preferences's module
+        # docstring for the honest scope this implies), but they answer
+        # different questions - "which checkpoint" vs. "which preference" -
+        # and collapsing them would make a future change to either one
+        # (e.g. re-minting thread_id without starting a new session) alter
+        # the other by accident.
+        session_id_state = gr.State(value=lambda: str(uuid.uuid4()))
         gr.Markdown(
             "# Clarif-Eye\n"
             "Clarif-Eye describes a photo aloud for visually impaired users."
@@ -3093,7 +3246,7 @@ def build_interface(resources):
 
         submit_event = submit_button.click(
             fn=_submit,
-            inputs=[image_input, thread_state],
+            inputs=[image_input, thread_state, session_id_state],
             outputs=result_and_controls,
         )
         # Runs client-side only after the handler above has produced its
@@ -3127,12 +3280,12 @@ def build_interface(resources):
         for ask_event in (
             ask_button.click(
                 fn=_ask,
-                inputs=[question_input, thread_state],
+                inputs=[question_input, thread_state, session_id_state],
                 outputs=result_outputs,
             ),
             question_input.submit(
                 fn=_ask,
-                inputs=[question_input, thread_state],
+                inputs=[question_input, thread_state, session_id_state],
                 outputs=result_outputs,
             ),
         ):

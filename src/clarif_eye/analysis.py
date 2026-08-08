@@ -42,7 +42,7 @@ before being returned - never trust the model to actually follow the
 
 from clarif_eye.client import OpenRouterClient
 from clarif_eye.ladder import call_ladder
-from clarif_eye.prompting import fence_untrusted
+from clarif_eye.prompting import fence_untrusted, verbosity_instruction
 from clarif_eye.speech import to_spoken_text as _to_spoken_text
 # Moved to its own module by issue #82's simplify gate - it was never
 # analysis-specific (see clarif_eye.verification's docstring). Imported
@@ -135,7 +135,7 @@ def _cap_scraper_data(scraper_data, cap=_SCRAPER_DATA_CAP):
     return f"{truncated} [context truncated]"
 
 
-def _build_messages(ocr_output, scene_context, scraper_data, cap=_SCRAPER_DATA_CAP):
+def _build_messages(ocr_output, scene_context, scraper_data, cap=_SCRAPER_DATA_CAP, verbosity=None):
     if ocr_output:
         body = (
             f"Text found in the photo:\n{fence_untrusted(ocr_output)}"
@@ -146,7 +146,12 @@ def _build_messages(ocr_output, scene_context, scraper_data, cap=_SCRAPER_DATA_C
     if scraper_data:
         capped = _cap_scraper_data(scraper_data, cap)
         body += f"\n\nAdditional context from a web lookup:\n{fence_untrusted(capped)}"
-    return [{"role": "user", "content": [{"type": "text", "text": f"{ANALYSIS_PROMPT}\n\n{body}"}]}]
+    # Cross-thread verbosity preference (issue #86 / P9.7) - see
+    # clarif_eye.prompting.verbosity_instruction and
+    # clarif_eye.graph.analysis_node, which reads `verbosity` from the
+    # Store. "" (no preference) leaves the prompt exactly as before.
+    prompt = f"{ANALYSIS_PROMPT}{verbosity_instruction(verbosity)}"
+    return [{"role": "user", "content": [{"type": "text", "text": f"{prompt}\n\n{body}"}]}]
 
 
 def _degraded(message):
@@ -175,7 +180,15 @@ def _degrade_from_known(ocr_output, scene_context):
     return _degraded(scene_context)
 
 
-def run_analysis(ocr_output, scene_context, scraper_data, client=None, scraper_data_cap=None, deadline_exceeded=False):
+def run_analysis(
+    ocr_output,
+    scene_context,
+    scraper_data,
+    client=None,
+    scraper_data_cap=None,
+    deadline_exceeded=False,
+    verbosity=None,
+):
     """Call the brain ladder to turn (ocr_output, scene_context, scraper_data) into final_output.
 
     `client` is injectable (tests pass a fake); when omitted, a real
@@ -196,6 +209,13 @@ def run_analysis(ocr_output, scene_context, scraper_data, client=None, scraper_d
     possibly research, already ran), so the brain call is skipped and
     final_output is built straight from them instead - see
     _degrade_from_known.
+
+    `verbosity` (issue #86 / P9.7): "short", "detailed", or None (no stored
+    preference) - see clarif_eye.graph.analysis_node, which reads it from
+    the Store (propagated into this deep-path child node automatically -
+    see make_deep_path_node's docstring on config/store propagation), and
+    clarif_eye.prompting.verbosity_instruction for the wording folded into
+    the prompt.
     """
     ocr_output = ocr_output or ""
     scene_context = scene_context or ""
@@ -227,7 +247,7 @@ def run_analysis(ocr_output, scene_context, scraper_data, client=None, scraper_d
     # site, because it is the one thing the three callers genuinely differ on.
     result, failure_message = call_ladder(
         "brain",
-        lambda: _build_messages(ocr_output, scene_context, scraper_data, cap),
+        lambda: _build_messages(ocr_output, scene_context, scraper_data, cap, verbosity),
         client,
         _default_client,
         "The spoken description could not be prepared because of an "

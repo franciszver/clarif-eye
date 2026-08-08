@@ -48,7 +48,7 @@ SPOKEN, so it always goes through speech.to_spoken_text.
 
 from clarif_eye.client import OpenRouterClient
 from clarif_eye.ladder import call_ladder
-from clarif_eye.prompting import fence_untrusted
+from clarif_eye.prompting import fence_untrusted, verbosity_instruction
 from clarif_eye.speech import to_spoken_text as _to_spoken_text
 from clarif_eye.vision import is_degraded_scene
 
@@ -103,7 +103,7 @@ def _default_client():
     return OpenRouterClient()
 
 
-def _build_messages(ocr_output, scene_context, question):
+def _build_messages(ocr_output, scene_context, question, verbosity=None):
     if ocr_output:
         body = (
             f"Text found in the photo:\n{fence_untrusted(ocr_output)}"
@@ -112,7 +112,12 @@ def _build_messages(ocr_output, scene_context, question):
     else:
         body = f"No text was found in the photo.\n\nScene description: {scene_context}"
     body += f"\n\nThe user's question:\n{fence_untrusted(question)}"
-    return [{"role": "user", "content": [{"type": "text", "text": f"{FOLLOWUP_PROMPT}\n\n{body}"}]}]
+    # Cross-thread verbosity preference (issue #86 / P9.7) - see
+    # clarif_eye.prompting.verbosity_instruction and
+    # clarif_eye.graph.followup_node, which reads `verbosity` from the
+    # Store. "" (no preference) leaves the prompt exactly as before.
+    prompt = f"{FOLLOWUP_PROMPT}{verbosity_instruction(verbosity)}"
+    return [{"role": "user", "content": [{"type": "text", "text": f"{prompt}\n\n{body}"}]}]
 
 
 def _degraded(message):
@@ -162,7 +167,7 @@ def _degrade_from_known(ocr_output, scene_context):
     )
 
 
-def run_followup(ocr_output, scene_context, question, client=None, deadline_exceeded=False):
+def run_followup(ocr_output, scene_context, question, client=None, deadline_exceeded=False, verbosity=None):
     """Answer `question` from the thread's stored ocr_output/scene_context
     with ONE `brain` call, and return a {"final_output": ...} state update.
 
@@ -177,10 +182,15 @@ def run_followup(ocr_output, scene_context, question, client=None, deadline_exce
     spent (checked by clarif_eye.graph at node entry), so the brain call is
     skipped - see _degrade_from_known.
 
-    THE NO-PHOTO-YET CASE costs no model call at all and is checked FIRST,
-    before the deadline and before any client construction: there is
-    genuinely nothing to answer from, so calling a model could only produce
-    an invented answer.
+    `verbosity` (issue #86 / P9.7): "short", "detailed", or None (no stored
+    preference) - see clarif_eye.graph.followup_node, which reads it from
+    the Store, and clarif_eye.prompting.verbosity_instruction for the
+    wording folded into the prompt. NOTE: a genuine preference-SETTING
+    command ("shorter descriptions please") never reaches this function at
+    all - clarif_eye.ui recognises and answers it before the graph is
+    touched (see clarif_eye.preferences.detect_preference_command and
+    clarif_eye.ui's PREFERENCE_CONFIRMATION_* handling), so `question` here
+    is always a genuine question about the photo.
     """
     ocr_output = ocr_output or ""
     scene_context = scene_context or ""
@@ -210,7 +220,7 @@ def run_followup(ocr_output, scene_context, question, client=None, deadline_exce
     # site, because it is the one thing the three callers genuinely differ on.
     result, failure_message = call_ladder(
         "brain",
-        lambda: _build_messages(ocr_output, scene_context, question),
+        lambda: _build_messages(ocr_output, scene_context, question, verbosity),
         client,
         _default_client,
         "The answer could not be prepared because of an unexpected "

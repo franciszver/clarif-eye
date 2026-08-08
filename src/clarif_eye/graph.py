@@ -80,6 +80,7 @@ from langgraph.types import Command, interrupt
 from clarif_eye.analysis import run_analysis
 from clarif_eye.deep_path import build_deep_path_graph
 from clarif_eye.followup import run_followup
+from clarif_eye.preferences import verbosity_for_config
 from clarif_eye.research import run_research
 from clarif_eye.state import ClarifEyeState
 from clarif_eye.synth import run_fast_synth
@@ -232,7 +233,7 @@ def vision_node(state, config=None, client=None):
     return run_vision(state["image_data"], client, deadline_exceeded=_deadline_exceeded(config))
 
 
-def fast_synth_node(state, config=None, client=None):
+def fast_synth_node(state, config=None, client=None, store=None):
     """Fast-path synthesis node (issue #7/P1.4): turns vision output into spoken text.
 
     The substantive logic (prompt building, sanitisation, degradation)
@@ -246,11 +247,27 @@ def fast_synth_node(state, config=None, client=None):
     run_fast_synth, which skips the eyes-ladder call and builds
     final_output straight from ocr_output/scene_context if it has already
     passed.
+
+    `store` (issue #86 / P9.7): injectable directly (unit tests), or
+    populated automatically by LangGraph when the compiled graph was built
+    with build_graph(store=...) - EMPIRICALLY VERIFIED on langgraph 1.2.10,
+    unlike `client`/`config`, a node parameter literally named `store`
+    needs no config["configurable"] fallback at all; LangGraph injects it
+    itself. Read into the cross-thread verbosity preference via
+    clarif_eye.preferences.verbosity_for_config, which never raises and
+    degrades to None (no preference on file) for a None store, a missing
+    session_id, or anything else it does not recognise - see that
+    function's own docstring.
     """
     if client is None:
         client = (config or {}).get("configurable", {}).get("client")
+    verbosity = verbosity_for_config(store, config)
     return run_fast_synth(
-        state["ocr_output"], state["scene_context"], client, deadline_exceeded=_deadline_exceeded(config)
+        state["ocr_output"],
+        state["scene_context"],
+        client,
+        deadline_exceeded=_deadline_exceeded(config),
+        verbosity=verbosity,
     )
 
 
@@ -294,7 +311,7 @@ def research_node(state, config=None, searcher=None, client=None):
     )
 
 
-def analysis_node(state, config=None, client=None):
+def analysis_node(state, config=None, client=None, store=None):
     """Deep-analysis node (issue #8/P1.5): turns dense-document input into spoken text.
 
     A NODE OF THE CHILD GRAPH since issue #84 / P9.5 - see research_node's
@@ -314,10 +331,22 @@ def analysis_node(state, config=None, client=None):
     run_analysis, which skips the brain-ladder call and builds
     final_output straight from ocr_output/scene_context if it has already
     passed.
+
+    `store` (issue #86 / P9.7): same injection mechanics as
+    fast_synth_node's own `store` param (see its docstring) - EMPIRICALLY
+    VERIFIED to reach THIS node too, even though it runs inside the
+    deep-path CHILD graph (clarif_eye.deep_path), which is itself compiled
+    with no store of its own: LangGraph's store propagates into a subgraph
+    invoked manually from a node (make_deep_path_node's deep_path_node,
+    child.invoke(...)) the same way config already does - see that
+    function's own "NO config PASSED TO THE CHILD" docstring block for the
+    config half of this fact; the store half was probed identically for
+    this issue. Read via clarif_eye.preferences.verbosity_for_config.
     """
     configurable = (config or {}).get("configurable", {})
     if client is None:
         client = configurable.get("client")
+    verbosity = verbosity_for_config(store, config)
     return run_analysis(
         state["document_text"],
         state["scene_description"],
@@ -325,6 +354,7 @@ def analysis_node(state, config=None, client=None):
         client,
         scraper_data_cap=configurable.get("scraper_data_cap"),
         deadline_exceeded=_deadline_exceeded(config),
+        verbosity=verbosity,
     )
 
 
@@ -619,7 +649,7 @@ def make_deep_path_node(child):
     return deep_path_node
 
 
-def followup_node(state, config=None, client=None):
+def followup_node(state, config=None, client=None, store=None):
     """Follow-up node (issue #82 / P9.3): answers state["question"] from the
     ocr_output/scene_context this THREAD already has checkpointed.
 
@@ -640,15 +670,25 @@ def followup_node(state, config=None, client=None):
     nodes (see this module's top-level "Total-pipeline deadline" block) and
     passes the result through, so a run that has already blown its budget
     reads back what is known instead of spending a brain call.
+
+    `store` (issue #86 / P9.7): same injection mechanics as
+    fast_synth_node's own `store` param (see its docstring). Only a genuine
+    QUESTION ever reaches this node - a preference-SETTING command is
+    recognised and answered by clarif_eye.ui before the graph is invoked at
+    all (see clarif_eye.preferences.detect_preference_command) - so
+    verbosity here only ever changes HOW an answer is phrased, never
+    whether this node runs.
     """
     if client is None:
         client = (config or {}).get("configurable", {}).get("client")
+    verbosity = verbosity_for_config(store, config)
     return run_followup(
         state.get("ocr_output"),
         state.get("scene_context"),
         state.get("question"),
         client,
         deadline_exceeded=_deadline_exceeded(config),
+        verbosity=verbosity,
     )
 
 
@@ -726,7 +766,7 @@ def dynamic_router(state):
     return DEEP_PATH_NODE if flag else "fast_synth"
 
 
-def build_graph(checkpointer=None):
+def build_graph(checkpointer=None, store=None):
     """Build and compile the Clarif-Eye graph.
 
     `checkpointer` (issue #81 / P9.2) is OPTIONAL and defaults to None -
@@ -740,6 +780,22 @@ def build_graph(checkpointer=None):
     against the compiled graph (verified empirically: omitting it raises
     ValueError) - clarif_eye.ui is responsible for minting one per browser
     session and passing it through.
+
+    `store` (issue #86 / P9.7) is OPTIONAL and defaults to None, the SAME
+    "optional at compile" shape as `checkpointer` above - every existing
+    caller/test keeps compiling a store-less graph unaffected. When a store
+    IS supplied (clarif_eye.ui.build_resources passes a fresh
+    langgraph.store.memory.InMemoryStore - see that function's own comment
+    for its honest limits, the same in-process-only ones the checkpointer
+    already has), fast_synth_node/analysis_node/followup_node - the nodes
+    that build a spoken prompt - receive it automatically as their own
+    `store` parameter (EMPIRICALLY VERIFIED on langgraph 1.2.10, see those
+    nodes' docstrings) and read a cross-thread verbosity preference from it
+    via clarif_eye.preferences. UNLIKE `checkpointer`, LangGraph does NOT
+    require a `thread_id` (or anything else) just because a store is
+    configured - a store-less run and a run with no session_id both simply
+    see no preference (verbosity_for_config degrades to None), never an
+    error.
     """
     builder = StateGraph(ClarifEyeState)
 
@@ -781,7 +837,7 @@ def build_graph(checkpointer=None):
     builder.add_edge("followup", TTS_NODE)
     builder.add_edge(TTS_NODE, END)
 
-    return builder.compile(checkpointer=checkpointer)
+    return builder.compile(checkpointer=checkpointer, store=store)
 
 
 # The name the final node is registered under. A CONSTANT because that

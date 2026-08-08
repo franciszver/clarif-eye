@@ -86,3 +86,49 @@ def fence_untrusted(text):
     text = text or ""
     safe_text = _neutralise(text)
     return f"{FENCE_OPEN}\n{safe_text}\n{FENCE_CLOSE}"
+
+
+# --- Cross-thread verbosity preference (issue #86 / P9.7) -------------------
+#
+# THE SHARED PROMPTING SEAM the issue asks for: synth.py, analysis.py and
+# followup.py each build their own prompt string but all three want the
+# SAME extra sentence when clarif_eye.preferences.get_verbosity reports a
+# stored preference, so the WORDING lives here once rather than three times
+# (a future edit to how it reads would otherwise have to find and update
+# three copies, or drift). Each module's _build_messages appends this to its
+# own prompt text; none of them know or care where the preference came from
+# - clarif_eye.graph's nodes are the only callers that read the store.
+SHORT_VERBOSITY_INSTRUCTION = (
+    " The user has asked for shorter descriptions in this session: keep "
+    "this one brief - one or two sentences, the essential facts only."
+)
+# DETAILED IS INCLUDED, NOT JUST SHORT (a judgment call worth stating): the
+# issue names "short" as the one worked example but leaves "detailed"
+# optional. It costs one more string and one more branch here, and gives
+# the preference mechanism an honest opposite rather than a single
+# hard-coded direction - a user who asks for MORE detail is exactly as
+# realistic as one who asks for less, and detect_preference_command's
+# closed vocabulary already accepts "longer"/"more detail" wording, so
+# leaving this half unimplemented would silently swallow half of what
+# followup.py already recognises. It explicitly does NOT relax the
+# anti-hallucination instructions already in SYNTH_PROMPT/ANALYSIS_PROMPT/
+# FOLLOWUP_PROMPT ("do not invent or guess") - more detail must still come
+# only from the given text.
+DETAILED_VERBOSITY_INSTRUCTION = (
+    " The user has asked for more detail in this session: include "
+    "additional context from the given text where it is genuinely useful, "
+    "without inventing or guessing at anything the text does not contain."
+)
+
+
+def verbosity_instruction(verbosity):
+    """The extra prompt sentence for a stored verbosity preference, or ""
+    for anything else (None - no preference on file - or an unrecognised
+    value, which should not exist per clarif_eye.preferences.get_verbosity's
+    own shape check but is handled here the same defensive way regardless).
+    """
+    if verbosity == "short":
+        return SHORT_VERBOSITY_INSTRUCTION
+    if verbosity == "detailed":
+        return DETAILED_VERBOSITY_INSTRUCTION
+    return ""
