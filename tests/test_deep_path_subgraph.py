@@ -785,6 +785,70 @@ def test_the_text_only_consumer_is_an_api_route_and_not_in_the_ui_flow():
         demo.close()
 
 
+# --- The deployment kill switch (issue #108) -------------------------------
+
+
+def test_describe_document_text_returns_the_disabled_message_and_does_no_work(monkeypatch):
+    """Set to "disabled", the route must return the fixed message WITHOUT
+    invoking the deep-path child graph, touching the document cache, or
+    spending the shared quota - so build_deep_path_graph is patched to raise
+    if it is even called, and the cache is checked to have gained no entry."""
+    import clarif_eye.ui as ui
+
+    monkeypatch.setenv("CLARIFEYE_TEXT_ROUTE", "disabled")
+
+    def _raise_if_called():
+        raise AssertionError("the deep-path child graph must not be built when the route is disabled")
+
+    monkeypatch.setattr(ui, "build_deep_path_graph", _raise_if_called)
+
+    resources = _resources(RecordingClient(HONEST_DRAFT))
+
+    spoken = ui.describe_document_text(BILL_OCR, resources)
+
+    assert spoken == ui.TEXT_ROUTE_DISABLED_MESSAGE
+    assert resources.client.calls == [], "the disabled route spent a model call"
+    assert len(resources.document_cache._entries) == 0, "the disabled route wrote to the document cache"
+
+
+def test_describe_document_text_disabled_route_does_not_pollute_the_cache_on_repeat(monkeypatch):
+    """A repeated call while disabled must keep returning the fixed message
+    - not a cached answer, because there never was one to cache."""
+    import clarif_eye.ui as ui
+
+    monkeypatch.setenv("CLARIFEYE_TEXT_ROUTE", "disabled")
+    monkeypatch.setattr(
+        ui,
+        "build_deep_path_graph",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("the deep-path child graph must not be built when the route is disabled")
+        ),
+    )
+
+    resources = _resources(RecordingClient(HONEST_DRAFT))
+
+    first = ui.describe_document_text(BILL_OCR, resources)
+    second = ui.describe_document_text(BILL_OCR, resources)
+
+    assert first == ui.TEXT_ROUTE_DISABLED_MESSAGE
+    assert second == ui.TEXT_ROUTE_DISABLED_MESSAGE
+    assert len(resources.document_cache._entries) == 0
+
+
+def test_describe_document_text_unset_env_keeps_the_normal_path_working(monkeypatch):
+    """With the variable unset, the guard must not fire at all - the
+    existing successful-call behavior is untouched."""
+    from clarif_eye.ui import describe_document_text
+
+    monkeypatch.delenv("CLARIFEYE_TEXT_ROUTE", raising=False)
+
+    resources = _resources(RecordingClient(HONEST_DRAFT))
+
+    spoken = describe_document_text(BILL_OCR, resources)
+
+    assert "$104.95" in spoken
+
+
 # --- THE RED LINE: the user-audible sequence must not change --------------
 #
 # These two are written against what the app does TODAY, before any
