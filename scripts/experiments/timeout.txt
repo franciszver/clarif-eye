@@ -13,11 +13,29 @@ langgraph's timeout= relies on asyncio cancellation and simply
 REFUSES TO COMPILE a graph with timeout= on a sync node.
 
 --- Probe 2: add_node(timeout=...) on an ASYNC node (confirms it works) ---
-outcome: NodeTimeoutError: Node 'slow' exceeded its run timeout of 0.100s (elapsed: 0.110s).
-elapsed: 0.110s (timeout was set to 0.1s, sleep was 1.0s)
+outcome: NodeTimeoutError: Node 'slow' exceeded its run timeout of 0.100s (elapsed: 0.109s).
+elapsed: 0.109s (timeout was set to 0.1s, sleep was 1.0s)
 OBSERVATION: with an async node, timeout= does fire at the stated
 deadline and raises langgraph.errors.NodeTimeoutError. The policy
 itself works - the app's synchronous node style is what blocks it.
+
+--- Probe 3: what does adopting timeout= actually cost - the whole
+    graph rewritten async, or just the entry call + timed node(s)? ---
+outcome: NodeTimeoutError: Node 'n2_async_timed' exceeded its run timeout of 0.100s (elapsed: 0.109s).
+OBSERVATION, CORRECTING AN EARLIER OVERSTATEMENT: a three-node
+graph with two plain SYNC nodes and ONE async node carrying
+timeout=, driven through graph.ainvoke(), compiles and the sync
+nodes run untouched - only the timed async node's own timeout
+fires. Adopting timeout= for, say, just the eyes/brain calls does
+NOT require rewriting every run_* function as async - it requires
+making the ENTRY-POINT call ainvoke()/astream() instead of
+invoke()/stream(), and making the specific node(s) carrying
+timeout= async. The real cost for THIS app is still nonzero: the
+whole call chain from ui.handle_submit down through graph.stream()
+is synchronous today (Gradio callbacks, httpx.Client, no event
+loop anywhere in src/clarif_eye/), so even a single timed node
+needs that entry call converted and an event loop available to
+run it in - a real change, just a smaller one than 'every node'.
 
 ========================================================================
 COMPARISON
@@ -47,15 +65,20 @@ our mechanism: TWO layers, deliberately different scopes (see graph.py's
                into a silent one for a blind user.
 
 VERDICT: KEEP OURS
-DECISIVE REASON: Probe 1 shows timeout= cannot even be applied to this
-app's synchronous nodes without rewriting every run_* call chain as
-async - not a config change but an architecture change. Even ignoring
-that, the scope is wrong: timeout= caps one node's one attempt, while the
-actual problem this app solved (issue #17/P6.1) was an unbounded TAIL
-across the whole run (vision + brain + research + tts), which per-node
-caps do not bound - the sum of several under-budget nodes can still blow
-the pipeline deadline. And a node timing out raises by default, which is
-the wrong failure mode here: every model-calling node must degrade to a
-spoken-ready partial result, never raise past the UI boundary, and tts
-must never be gated at all - a rule a per-node timeout has no way to
-express short of exempting tts from the very policy being adopted.
+DECISIVE REASON: Probe 1 shows timeout= cannot be applied to a sync
+node at all - it fails at compile() time. Probe 3 shows the real fix
+for that is smaller than 'rewrite everything': only the ENTRY call and
+the specific timed node(s) need to become async, not every node in the
+graph. But this app's entry call (ui.handle_submit -> graph.stream())
+is synchronous end to end today, with no event loop anywhere in
+src/clarif_eye/, so that conversion is still a real, nonzero change,
+not a config flag. And even paid for, the scope stays wrong: timeout=
+caps one node's one attempt, while the actual problem this app solved
+(issue #17/P6.1) was an unbounded TAIL across the whole run (vision +
+brain + research + tts), which per-node caps do not bound - the sum of
+several under-budget nodes can still blow the pipeline deadline. A
+node timing out also raises by default, the wrong failure mode here:
+every model-calling node must degrade to a spoken-ready partial
+result, never raise past the UI boundary, and tts must never be gated
+at all - a rule a per-node timeout has no way to express short of
+exempting tts from the very policy being adopted.

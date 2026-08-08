@@ -77,6 +77,52 @@ async def probe_async_node_timeout_fires():
         return f"{type(exc).__name__}: {exc}", time.monotonic() - start
 
 
+class MixedState(TypedDict, total=False):
+    a: int
+    b: int
+    result: str
+
+
+async def probe_mixed_graph_only_needs_the_timed_node_async():
+    """Correcting an earlier overstatement in this script: does adopting
+    timeout= require rewriting EVERY node as async, or only the entry-point
+    call plus the specific node(s) actually carrying a timeout?
+
+    Builds a THREE-node graph: two plain sync nodes (n1, n3) and one async
+    node (n2) with timeout= set, driven through graph.ainvoke(). If the sync
+    nodes run untouched and only n2's timeout fires when it overruns, the
+    real migration cost is "the entry call becomes ainvoke()/astream(), and
+    only the node(s) you want timed become async" - not an async rewrite of
+    the whole graph.
+    """
+
+    def sync_node_1(state):
+        return {"a": 1}
+
+    async def timed_async_node(state):
+        await asyncio.sleep(1.0)
+        return {"b": 2}
+
+    def sync_node_2(state):
+        return {"result": "done"}
+
+    builder = StateGraph(MixedState)
+    builder.add_node("n1_sync", sync_node_1)
+    builder.add_node("n2_async_timed", timed_async_node, timeout=0.1)
+    builder.add_node("n3_sync", sync_node_2)
+    builder.set_entry_point("n1_sync")
+    builder.add_edge("n1_sync", "n2_async_timed")
+    builder.add_edge("n2_async_timed", "n3_sync")
+    builder.set_finish_point("n3_sync")
+    graph = builder.compile()
+
+    try:
+        await graph.ainvoke({})
+        return "completed (unexpected - n2 should have timed out)"
+    except Exception as exc:  # noqa: BLE001
+        return f"{type(exc).__name__}: {exc}"
+
+
 def main():
     print("python scripts/experiment_timeout.py")
     print("=" * 72)
@@ -105,6 +151,26 @@ def main():
     print("OBSERVATION: with an async node, timeout= does fire at the stated")
     print("deadline and raises langgraph.errors.NodeTimeoutError. The policy")
     print("itself works - the app's synchronous node style is what blocks it.")
+
+    print()
+    print("--- Probe 3: what does adopting timeout= actually cost - the whole")
+    print("    graph rewritten async, or just the entry call + timed node(s)? ---")
+    outcome = asyncio.run(probe_mixed_graph_only_needs_the_timed_node_async())
+    print(f"outcome: {outcome}")
+    print("OBSERVATION, CORRECTING AN EARLIER OVERSTATEMENT: a three-node")
+    print("graph with two plain SYNC nodes and ONE async node carrying")
+    print("timeout=, driven through graph.ainvoke(), compiles and the sync")
+    print("nodes run untouched - only the timed async node's own timeout")
+    print("fires. Adopting timeout= for, say, just the eyes/brain calls does")
+    print("NOT require rewriting every run_* function as async - it requires")
+    print("making the ENTRY-POINT call ainvoke()/astream() instead of")
+    print("invoke()/stream(), and making the specific node(s) carrying")
+    print("timeout= async. The real cost for THIS app is still nonzero: the")
+    print("whole call chain from ui.handle_submit down through graph.stream()")
+    print("is synchronous today (Gradio callbacks, httpx.Client, no event")
+    print("loop anywhere in src/clarif_eye/), so even a single timed node")
+    print("needs that entry call converted and an event loop available to")
+    print("run it in - a real change, just a smaller one than 'every node'.")
 
     print()
     print("=" * 72)
@@ -139,18 +205,23 @@ def main():
     print()
     print("VERDICT: KEEP OURS")
     print(
-        "DECISIVE REASON: Probe 1 shows timeout= cannot even be applied to this\n"
-        "app's synchronous nodes without rewriting every run_* call chain as\n"
-        "async - not a config change but an architecture change. Even ignoring\n"
-        "that, the scope is wrong: timeout= caps one node's one attempt, while the\n"
-        "actual problem this app solved (issue #17/P6.1) was an unbounded TAIL\n"
-        "across the whole run (vision + brain + research + tts), which per-node\n"
-        "caps do not bound - the sum of several under-budget nodes can still blow\n"
-        "the pipeline deadline. And a node timing out raises by default, which is\n"
-        "the wrong failure mode here: every model-calling node must degrade to a\n"
-        "spoken-ready partial result, never raise past the UI boundary, and tts\n"
-        "must never be gated at all - a rule a per-node timeout has no way to\n"
-        "express short of exempting tts from the very policy being adopted."
+        "DECISIVE REASON: Probe 1 shows timeout= cannot be applied to a sync\n"
+        "node at all - it fails at compile() time. Probe 3 shows the real fix\n"
+        "for that is smaller than 'rewrite everything': only the ENTRY call and\n"
+        "the specific timed node(s) need to become async, not every node in the\n"
+        "graph. But this app's entry call (ui.handle_submit -> graph.stream())\n"
+        "is synchronous end to end today, with no event loop anywhere in\n"
+        "src/clarif_eye/, so that conversion is still a real, nonzero change,\n"
+        "not a config flag. And even paid for, the scope stays wrong: timeout=\n"
+        "caps one node's one attempt, while the actual problem this app solved\n"
+        "(issue #17/P6.1) was an unbounded TAIL across the whole run (vision +\n"
+        "brain + research + tts), which per-node caps do not bound - the sum of\n"
+        "several under-budget nodes can still blow the pipeline deadline. A\n"
+        "node timing out also raises by default, the wrong failure mode here:\n"
+        "every model-calling node must degrade to a spoken-ready partial\n"
+        "result, never raise past the UI boundary, and tts must never be gated\n"
+        "at all - a rule a per-node timeout has no way to express short of\n"
+        "exempting tts from the very policy being adopted."
     )
     return 0
 

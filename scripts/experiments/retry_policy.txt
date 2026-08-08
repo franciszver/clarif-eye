@@ -39,6 +39,24 @@ the node nothing to key that switch off. This is the ladder
 re-implemented inside the node body, which is exactly the code
 client.py already has, just moved and with a worse error shape.
 
+--- Scenario 4: THE REAL INTEGRATION POINT - retry_policy around
+    a node that already exhausted its own ladder ---
+node invocations: 3 (max_attempts=3)
+raised: LadderExhaustedError: OpenRouter ladder exhausted for role 'eyes' (2 model(s) tried): fake/model-a [rate_limited HTTP 429]: rate limited; fake/model-b [server_error HTTP 500]: server error
+OBSERVATION, PROVEN not assumed: langgraph's default_retry_on has
+no special case for LadderExhaustedError - it is not
+ConnectionError, not an httpx/requests HTTPError, and not in the
+excluded list (ValueError/TypeError/RuntimeError/...), so it falls
+through to the catch-all 'return True'. Wrapping a vision_node-
+shaped node in retry_policy(max_attempts=3) RE-RUNS THE ENTIRE
+ALREADY-EXHAUSTED LADDER 3 TIMES. A real vision_node's ladder call
+already spends its full role budget (ROLE_TIMEOUTS['eyes'] = 30s)
+trying every rung before raising - retry_policy would silently
+multiply that up to 3x (~90s) for a call that was already known to
+fail every rung on the first attempt, with zero benefit: no rung
+gets a fresh chance to succeed that it did not already get inside
+the ladder itself.
+
 ========================================================================
 COMPARISON
 ========================================================================
@@ -73,4 +91,10 @@ means re-implementing the ladder's model list and attempt tracking
 inside the node anyway, while losing client.py's terminal-status
 short-circuit (never retry an auth/credit/payload failure) and its
 structured per-rung Attempt report that failure_messages.py depends
-on. retry_policy would be additive complexity, not a replacement.
+on. Scenario 4 STRENGTHENS this: wrapping retry_policy around the
+REAL integration point (a node whose ladder has already exhausted
+itself) is not neutral, it is actively harmful - it multiplies an
+already-spent role time budget by max_attempts with no chance of a
+different outcome, silently, for a blind user already waiting on
+spoken feedback. retry_policy would be additive complexity AND a new
+latency hazard, not a replacement.

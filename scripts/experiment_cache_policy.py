@@ -5,15 +5,23 @@ Runs entirely OFFLINE - no live API calls, no disk writes (langgraph's
 InMemoryCache, like ImageResultCache, lives in process memory only).
 
 WHAT THIS MEASURES:
-  1. Does cache_policy skip re-running a node on a repeat call with the
+  1. THE REALISTIC FAILURE SHAPE FOR THIS CODEBASE, LED WITH: every run_*
+     function here (vision.run_vision, synth.run_fast_synth, ...) does not
+     raise on a model failure - it returns a DEGRADED state update, the
+     same way a normal success is returned (see each module's own
+     docstring: "must NEVER let a raw exception escape into the graph").
+     From cache_policy's point of view that is an ordinary successful node
+     return, indistinguishable from a good answer. Does cache_policy admit
+     it, and does the entry survive the underlying failure clearing?
+  2. Does cache_policy skip re-running a node on a repeat call with the
      same input, the way ImageResultCache short-circuits a repeat photo?
-  2. What is the cache KEY built from - is it content-keyed the way
+  3. What is the cache KEY built from - is it content-keyed the way
      ImageResultCache hashes image bytes, or something else?
-  3. THE DECISIVE QUESTION: does cache_policy admit a FAILED node run into
-     the cache? ImageResultCache's module docstring is explicit: "Only
-     successful results are ever stored here... a quota/API failure must
-     never be replayed to the next visitor as if it were that photo's own
-     answer." This probes whether cache_policy honours that on its own.
+  4. A second, less likely failure shape: does cache_policy also admit a
+     node run that RAISES an exception rather than returning normally?
+     ImageResultCache's module docstring is explicit: "Only successful
+     results are ever stored here... a quota/API failure must never be
+     replayed to the next visitor as if it were that photo's own answer."
 
 Usage:
     python scripts/experiment_cache_policy.py
@@ -48,6 +56,39 @@ def build_graph(cache_policy, cache):
     builder.set_finish_point("n")
     graph = builder.compile(cache=cache)
     return graph, calls
+
+
+def scenario_degraded_result_is_cached_as_a_permanent_stale_answer():
+    """THE REALISTIC SHAPE, not a hypothetical: a node built like every
+    run_* function in this codebase, which degrades to a spoken-ready
+    fallback UPDATE rather than raising. Submit the same input while a
+    transient failure is active, then again after the failure clears -
+    does the SAME input ever get a fresh answer once cache_policy has
+    admitted the degraded one?
+    """
+    transient_failure_active = {"flag": True}
+    calls = []
+
+    def node_like_run_vision(state):
+        calls.append(state["x"])
+        if transient_failure_active["flag"]:
+            # No exception - this is run_vision's real shape: an early
+            # RETURN of a degraded, spoken-ready update.
+            return {"result": "degraded: the model was unavailable, try again"}
+        return {"result": f"computed-{state['x']}"}
+
+    cache = InMemoryCache()
+    builder = StateGraph(State)
+    builder.add_node("n", node_like_run_vision, cache_policy=CachePolicy(ttl=None))
+    builder.set_entry_point("n")
+    builder.set_finish_point("n")
+    graph = builder.compile(cache=cache)
+
+    while_failing = graph.invoke({"x": 1})
+    transient_failure_active["flag"] = False
+    after_failure_cleared = graph.invoke({"x": 1})
+
+    return calls, while_failing, after_failure_cleared
 
 
 def scenario_repeat_input_is_served_from_cache():
@@ -105,7 +146,32 @@ def main():
     print("=" * 72)
 
     print()
-    print("--- Scenario 1: repeat input is served from cache, not re-run ---")
+    print("--- Scenario 1: DECISIVE, THE REALISTIC SHAPE - a degraded result")
+    print("    (no exception, exactly how run_* functions here fail) gets")
+    print("    cached as a permanent stale answer ---")
+    calls, while_failing, after_failure_cleared = (
+        scenario_degraded_result_is_cached_as_a_permanent_stale_answer()
+    )
+    print(f"node invocations: {len(calls)} (calls={calls})")
+    print(f"result while the transient failure was active: {while_failing}")
+    print(f"result AFTER the transient failure cleared, same input: {after_failure_cleared}")
+    print("OBSERVATION: node_invocations == 1 - the node ran exactly once,")
+    print("while the failure was active, and returned a degraded update the")
+    print("same way vision.run_vision returns _degraded(...) - no exception,")
+    print("a normal return. cache_policy has no way to see that this return")
+    print("was a fallback rather than a real answer, so it caches it. Once")
+    print("the transient condition clears, the SAME photo/input still gets")
+    print("the OLD degraded answer forever - the node is never invoked again")
+    print("for that input. This is the realistic consequence for this")
+    print("codebase: not silence, a STALE SPOKEN ANSWER frozen per input,")
+    print("read back to a blind user as if it were current. This is exactly")
+    print("the product invariant ImageResultCache's module docstring states")
+    print("directly: 'Only successful results are ever stored here... a")
+    print("quota/API failure must never be replayed to the next visitor as")
+    print("if it were that photo's own answer.'")
+
+    print()
+    print("--- Scenario 2: repeat input is served from cache, not re-run ---")
     calls, results = scenario_repeat_input_is_served_from_cache()
     print(f"node invocations for [x=1, x=1, x=2]: {len(calls)} (calls={calls})")
     print(f"results: {results}")
@@ -117,7 +183,8 @@ def main():
     print("here.")
 
     print()
-    print("--- Scenario 2: DECISIVE - is a FAILED run cached and replayed? ---")
+    print("--- Scenario 3: secondary failure shape - a RAISED exception is")
+    print("    also cached, and its replay is silent rather than stale ---")
     outcome = scenario_failure_is_cached_and_silently_replayed()
     for key, value in outcome.items():
         print(f"{key}: {value}")
@@ -130,10 +197,11 @@ def main():
     print("error, not a value, nothing indicating anything went wrong. The")
     print("streaming surface confirms this is not just an invoke() quirk:")
     print("stream_mode='updates' on the replay produced ZERO chunks - total")
-    print("silence downstream, exactly what a blind user must never get.")
-    print("This means cache_policy's DEFAULT behaviour is the opposite of")
-    print("ImageResultCache's explicit rule: it caches failures and replays")
-    print("them as if the node had quietly done nothing.")
+    print("silence downstream. This SILENCE shape is real but LESS likely to")
+    print("occur in this codebase than Scenario 1's STALE ANSWER shape,")
+    print("because every run_* function here is written to return a")
+    print("degraded update rather than raise - raising past the node")
+    print("boundary is the exception, not the norm, in this app's own code.")
 
     print()
     print("=" * 72)
@@ -142,36 +210,44 @@ def main():
     print(
         "cache_policy:  content-keyed via pickling the node's input (matches\n"
         "               ImageResultCache's content-hash approach) but admits\n"
-        "               BOTH successful and FAILED runs into the cache with no\n"
-        "               opt-out - Scenario 2 shows a failure is cached and its\n"
-        "               replay is silent (no exception, no result, no stream\n"
-        "               chunk). There is no ttl-based invalidation tied to\n"
-        "               anything except wall-clock time (CachePolicy.ttl), and\n"
-        "               no equivalent of a stale-file guard (this app's audio\n"
-        "               cache entries can outlive their mp3 on disk; a bare\n"
-        "               InMemoryCache has no notion of an external resource\n"
-        "               going stale at all).\n"
+        "               ANY normal return value into the cache with no opt-out,\n"
+        "               including a degraded fallback update that carries no\n"
+        "               signal distinguishing it from a real answer - Scenario 1\n"
+        "               shows that entry then survives forever, read back as a\n"
+        "               STALE spoken answer even once the underlying failure is\n"
+        "               gone. A node that raises instead (Scenario 3, the less\n"
+        "               likely shape in this codebase) is also cached, and its\n"
+        "               replay is SILENT (no exception, no result, no stream\n"
+        "               chunk) rather than stale. There is no ttl-based\n"
+        "               invalidation tied to anything except wall-clock time\n"
+        "               (CachePolicy.ttl), and no equivalent of a stale-file\n"
+        "               guard (this app's audio cache entries can outlive their\n"
+        "               mp3 on disk; a bare InMemoryCache has no notion of an\n"
+        "               external resource going stale at all).\n"
         "\n"
         "our caches:    ImageResultCache/DocumentTextCache (ui.py) only ever\n"
         "               .put() on a verified SUCCESS path (see handle_submit) -\n"
-        "               a quota/API failure is never written to either cache, so\n"
-        "               it can never be replayed to a later request. Bounded LRU\n"
-        "               eviction (IMAGE_CACHE_MAX_ENTRIES/DOCUMENT_CACHE_MAX_\n"
-        "               ENTRIES), never persisted to disk, and ImageResultCache\n"
-        "               carries a stale-file guard so a cache hit whose mp3 was\n"
-        "               pruned from disk is treated as a miss, not a lying hit."
+        "               a quota/API failure, and a degraded fallback answer, are\n"
+        "               never written to either cache, so neither can ever be\n"
+        "               replayed to a later request. Bounded LRU eviction\n"
+        "               (IMAGE_CACHE_MAX_ENTRIES/DOCUMENT_CACHE_MAX_ENTRIES),\n"
+        "               never persisted to disk, and ImageResultCache carries a\n"
+        "               stale-file guard so a cache hit whose mp3 was pruned\n"
+        "               from disk is treated as a miss, not a lying hit."
     )
 
     print()
     print("VERDICT: KEEP OURS")
     print(
-        "DECISIVE REASON: Scenario 2 is a product-safety regression, not a\n"
-        "style difference. cache_policy's default behaviour caches a failed\n"
-        "model call and replays it on the next identical submission as total\n"
-        "silence - no exception, no degraded message, no audio, nothing a\n"
-        "blind user could act on. ImageResultCache's entire reason for\n"
-        "existing (issue #75) is the opposite guarantee: never cache a\n"
-        "failure. Adopting cache_policy as-is would need a custom cache_policy\n"
+        "DECISIVE REASON: Scenario 1 is a product-safety regression, not a\n"
+        "style difference, and it is the REALISTIC one for this codebase:\n"
+        "cache_policy cannot tell a degraded fallback from a real answer, so it\n"
+        "caches the fallback and freezes it as that input's permanent answer -\n"
+        "a blind user who submits the same photo again after a transient\n"
+        "failure clears keeps hearing the old degraded message, spoken as if it\n"
+        "were current. ImageResultCache's entire reason for existing (issue\n"
+        "#75) is the opposite guarantee: only a verified success is ever\n"
+        "stored. Adopting cache_policy as-is would need a custom cache_policy\n"
         "or a wrapper that inspects outcomes before admitting them - at which\n"
         "point it is no longer buying anything over the explicit, already-\n"
         "correct hand-rolled cache."

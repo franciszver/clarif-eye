@@ -20,6 +20,11 @@ WHAT THIS MEASURES:
      a list of models and indexing into it (i.e. reimplementing the ladder
      inside the node body, which defeats the point of a declarative
      framework policy)?
+  4. THE REAL INTEGRATION POINT: what happens if retry_policy wraps a node
+     that already runs a full client.complete() call internally - i.e. a
+     node shaped like vision_node, where the "failure" retry_policy would
+     see is LadderExhaustedError, raised only AFTER the ladder inside that
+     one call has already exhausted every rung within its own role budget?
 
 Usage:
     python scripts/experiment_retry_policy.py
@@ -33,6 +38,8 @@ from typing import TypedDict
 
 from langgraph.graph import StateGraph
 from langgraph.types import RetryPolicy
+
+from clarif_eye.client import Attempt, LadderExhaustedError
 
 
 class FlakyState(TypedDict, total=False):
@@ -139,6 +146,46 @@ def run_model_switch_attempt():
     return models_tried, result
 
 
+def run_retry_policy_around_an_already_exhausted_ladder():
+    """THE REAL INTEGRATION POINT (not a hypothetical): wrap retry_policy
+    around a node shaped like vision_node, which calls client.complete()
+    internally and lets LadderExhaustedError propagate. Inside ONE node
+    invocation, the ladder has ALREADY tried every rung within its own
+    role budget before raising - that is what LadderExhaustedError means.
+    Does retry_policy's default retry_on treat that as retryable?
+    """
+    node_calls = []
+
+    def vision_shaped_node(state):
+        node_calls.append(1)
+        # This is exactly what a real vision_node raises once client.complete
+        # exhausts the eyes ladder (two rungs here, standing in for a real
+        # ladder) - the SAME exception whether this is the 1st or 3rd
+        # invocation, because each invocation re-runs the full ladder.
+        raise LadderExhaustedError(
+            "eyes",
+            (
+                Attempt("fake/model-a", "rate_limited", 429, "rate limited"),
+                Attempt("fake/model-b", "server_error", 500, "server error"),
+            ),
+        )
+
+    policy = RetryPolicy(initial_interval=0.001, backoff_factor=1.0, max_attempts=3, jitter=False)
+    builder = StateGraph(FlakyState)
+    builder.add_node("vision_shaped", vision_shaped_node, retry_policy=policy)
+    builder.set_entry_point("vision_shaped")
+    builder.set_finish_point("vision_shaped")
+    graph = builder.compile()
+
+    try:
+        graph.invoke({})
+        final_error = None
+    except Exception as exc:  # noqa: BLE001
+        final_error = exc
+
+    return node_calls, final_error
+
+
 def main():
     print("python scripts/experiment_retry_policy.py")
     print("=" * 72)
@@ -188,6 +235,26 @@ def main():
     print("client.py already has, just moved and with a worse error shape.")
 
     print()
+    print("--- Scenario 4: THE REAL INTEGRATION POINT - retry_policy around")
+    print("    a node that already exhausted its own ladder ---")
+    node_calls, final_error = run_retry_policy_around_an_already_exhausted_ladder()
+    print(f"node invocations: {len(node_calls)} (max_attempts=3)")
+    print(f"raised: {type(final_error).__name__}: {final_error}")
+    print("OBSERVATION, PROVEN not assumed: langgraph's default_retry_on has")
+    print("no special case for LadderExhaustedError - it is not")
+    print("ConnectionError, not an httpx/requests HTTPError, and not in the")
+    print("excluded list (ValueError/TypeError/RuntimeError/...), so it falls")
+    print("through to the catch-all 'return True'. Wrapping a vision_node-")
+    print("shaped node in retry_policy(max_attempts=3) RE-RUNS THE ENTIRE")
+    print("ALREADY-EXHAUSTED LADDER 3 TIMES. A real vision_node's ladder call")
+    print("already spends its full role budget (ROLE_TIMEOUTS['eyes'] = 30s)")
+    print("trying every rung before raising - retry_policy would silently")
+    print("multiply that up to 3x (~90s) for a call that was already known to")
+    print("fail every rung on the first attempt, with zero benefit: no rung")
+    print("gets a fresh chance to succeed that it did not already get inside")
+    print("the ladder itself.")
+
+    print()
     print("=" * 72)
     print("COMPARISON")
     print("=" * 72)
@@ -226,7 +293,13 @@ def main():
         "inside the node anyway, while losing client.py's terminal-status\n"
         "short-circuit (never retry an auth/credit/payload failure) and its\n"
         "structured per-rung Attempt report that failure_messages.py depends\n"
-        "on. retry_policy would be additive complexity, not a replacement."
+        "on. Scenario 4 STRENGTHENS this: wrapping retry_policy around the\n"
+        "REAL integration point (a node whose ladder has already exhausted\n"
+        "itself) is not neutral, it is actively harmful - it multiplies an\n"
+        "already-spent role time budget by max_attempts with no chance of a\n"
+        "different outcome, silently, for a blind user already waiting on\n"
+        "spoken feedback. retry_policy would be additive complexity AND a new\n"
+        "latency hazard, not a replacement."
     )
     return 0
 
