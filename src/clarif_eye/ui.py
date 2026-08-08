@@ -2352,9 +2352,9 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
     has one at all.
 
     A PREFERENCE-SETTING COMMAND (issue #86 / P9.7) IS CHECKED AFTER THE
-    BLANK/NON-STRING GUARDS BUT BEFORE THE GRAPH IS EVER TOUCHED - see
-    _handle_preference_command below. "shorter descriptions please"
-    and its tiny closed-vocabulary siblings (clarif_eye.preferences.
+    BLANK/NON-STRING GUARDS AND AFTER THE PENDING-INTERRUPT CHECK BELOW -
+    see _handle_preference_command. "shorter descriptions please" and its
+    tiny closed-vocabulary siblings (clarif_eye.preferences.
     detect_preference_command) never reach `followup`/the brain model at
     all: they cost no model call, write only to the Store (never to
     resources.graph's checkpointer), and the run returns immediately with a
@@ -2363,6 +2363,24 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
     what a stored preference could meaningfully affect, so that guard's
     existing CONFIG_ERROR_MESSAGE answer is left as the honest one even for
     a typed preference command.
+
+    A PENDING QUESTION OUTRANKS A PREFERENCE COMMAND TOO (deep-review MAJOR
+    fix, issue #86 / P9.7) - THIS WAS A REAL BUG, not a precaution, the same
+    class as the follow-up-vs-pause bug this function's own docstring
+    already describes above. An earlier version of this function checked
+    detect_preference_command BEFORE _has_pending_interrupt, so
+    "shorter descriptions please" typed while the app was waiting on the
+    unverified-number safety question was silently accepted and confirmed -
+    the pause itself stayed intact (nothing here touches the graph on that
+    path), but the user heard only the verbosity confirmation, never
+    QUESTION_PENDING_MESSAGE, with no idea a safety question was still
+    waiting for them. THE DECIDED RULE, matching the ordinary-follow-up
+    collision exactly: while a question is pending, the ONLY accepted
+    actions are the two choice buttons or a new photo. A preference command
+    is now detected AFTER the pending-interrupt check in the try block
+    below, so it gets the SAME QUESTION_PENDING_MESSAGE refusal an ordinary
+    follow-up gets, and nothing is ever written to the Store while a pause
+    is waiting.
     """
     if resources.client is None:
         yield "outcome", (None, resources.client_error or CONFIG_ERROR_MESSAGE)
@@ -2392,11 +2410,6 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
         yield "outcome", (None, NO_QUESTION_MESSAGE)
         return
 
-    verbosity_command = detect_preference_command(question)
-    if verbosity_command is not None:
-        yield from _handle_preference_command(verbosity_command, resources, session_id)
-        return
-
     try:
         configurable = {
             "client": resources.client,
@@ -2411,9 +2424,22 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
         # Checked here, inside the try and after thread_configurable, so it
         # reads the SAME config the run would have used and so a broken
         # get_state can never raise into Gradio.
+        #
+        # CHECKED BEFORE detect_preference_command BELOW, ON PURPOSE (deep-
+        # review MAJOR fix, issue #86 / P9.7 - see this function's own
+        # docstring "A PENDING QUESTION OUTRANKS A PREFERENCE COMMAND TOO"):
+        # a preference-setting command typed while a run is paused must get
+        # the SAME refusal an ordinary follow-up gets, not be silently
+        # accepted while the safety question goes unanswered and unheard.
         if _has_pending_interrupt(graph, config):
             yield "outcome", (None, QUESTION_PENDING_MESSAGE)
             return
+
+        verbosity_command = detect_preference_command(question)
+        if verbosity_command is not None:
+            yield from _handle_preference_command(verbosity_command, resources, session_id)
+            return
+
         # The DELTA, and nothing else - see this function's docstring.
         state = {"question": question}
         result = dict(state)
