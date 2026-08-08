@@ -1,0 +1,100 @@
+python scripts/experiment_retry_policy.py
+========================================================================
+EXPERIMENT: retry_policy vs the model-ladder failover in client.py
+========================================================================
+
+--- Scenario 1: node fails twice, succeeds on 3rd attempt ---
+attempts made: 3
+final state:   {'result': 'ok', 'attempts_seen_by_node': 3}
+OBSERVATION: retry_policy re-invoked the SAME node body 3 times
+with no framework-supplied signal distinguishing attempt 2 from
+attempt 1 beyond what the node counted itself.
+
+SURPRISE, found empirically while writing this scenario:
+langgraph._internal._retry.default_retry_on treats RuntimeError,
+ValueError, TypeError, OSError, and several other common
+exception types as NOT retryable by default (it assumes they are
+programming errors, not transient failures) - only
+ConnectionError, an httpx/requests HTTPError with a 5xx status,
+or an unrecognised exception type retries by default. A first
+draft of this scenario raised RuntimeError and retry_policy did
+not retry at all. client.py has no such distinction: it branches
+on HTTP status code, never on Python exception type.
+
+--- Scenario 2: node always fails, max_attempts=3 ---
+attempts made: 3
+raised: ConnectionError: simulated transient failure #3
+OBSERVATION: exhausting retry_policy raises the node's own last
+exception type (ConnectionError here), not a structured,
+role-aware error like client.py's LadderExhaustedError (which
+carries an Attempt per rung with a machine-readable category).
+
+--- Scenario 3: express a model SWITCH using only retry_policy ---
+models tried (tracked by the node itself): ['fake/model-a', 'fake/model-b', 'fake/model-c']
+final state: {'result': 'fake/model-c'}
+OBSERVATION: switching models per attempt required the node to
+hold its own ladder and its own attempt counter - retry_policy's
+callback contract (a plain callable retried on exception) gives
+the node nothing to key that switch off. This is the ladder
+re-implemented inside the node body, which is exactly the code
+client.py already has, just moved and with a worse error shape.
+
+--- Scenario 4: THE REAL INTEGRATION POINT - retry_policy around
+    a node that already exhausted its own ladder ---
+node invocations: 3 (max_attempts=3)
+raised: LadderExhaustedError: OpenRouter ladder exhausted for role 'eyes' (2 model(s) tried): fake/model-a [rate_limited HTTP 429]: rate limited; fake/model-b [server_error HTTP 500]: server error
+OBSERVATION, PROVEN not assumed: langgraph's default_retry_on has
+no special case for LadderExhaustedError - it is not
+ConnectionError, not an httpx/requests HTTPError, and not in the
+excluded list (ValueError/TypeError/RuntimeError/...), so it falls
+through to the catch-all 'return True'. Wrapping a vision_node-
+shaped node in retry_policy(max_attempts=3) RE-RUNS THE ENTIRE
+ALREADY-EXHAUSTED LADDER 3 TIMES. A real vision_node's ladder call
+already spends its full role budget (ROLE_TIMEOUTS['eyes'] = 30s)
+trying every rung before raising - retry_policy would silently
+multiply that up to 3x (~90s) for a call that was already known to
+fail every rung on the first attempt, with zero benefit: no rung
+gets a fresh chance to succeed that it did not already get inside
+the ladder itself.
+
+========================================================================
+COMPARISON
+========================================================================
+retry_policy:  retries the SAME callable on the SAME input, with a
+               fixed backoff/jitter schedule and a fixed max_attempts.
+               No per-attempt parameterisation is passed to the node;
+               a node wanting different behaviour per attempt (e.g. a
+               different model) must track that itself.
+               No status-code awareness: retry_on filters by exception
+               type/predicate only, so distinguishing 'retry this
+               (429/5xx)' from 'do not retry this (401/402/403/413,
+               a caller bug)' needs the node to raise different
+               exception types and pass a matching retry_on - client.py
+               does this today via HTTP status branching, not exceptions.
+               Exhaustion surfaces as the node's own last exception, not
+               a structured, per-rung report.
+
+model ladder:  a ROLE (eyes/brain) walks an ORDERED LIST OF DIFFERENT
+               MODELS inside ONE role budget (ROLE_TIMEOUTS), skipping
+               terminal failures (401/402/403/413) immediately instead
+               of retrying them, and returning a structured
+               LadderExhaustedError with one Attempt (model, category,
+               status_code, detail) per rung tried - built for
+               failure_messages.py to turn into a spoken message
+               without parsing prose.
+
+VERDICT: KEEP OURS
+DECISIVE REASON: retry_policy retries one callable against one
+input; the ladder's entire purpose is trying DIFFERENT models. Scenario 3
+shows that expressing the ladder's real behaviour with retry_policy
+means re-implementing the ladder's model list and attempt tracking
+inside the node anyway, while losing client.py's terminal-status
+short-circuit (never retry an auth/credit/payload failure) and its
+structured per-rung Attempt report that failure_messages.py depends
+on. Scenario 4 STRENGTHENS this: wrapping retry_policy around the
+REAL integration point (a node whose ladder has already exhausted
+itself) is not neutral, it is actively harmful - it multiplies an
+already-spent role time budget by max_attempts with no chance of a
+different outcome, silently, for a blind user already waiting on
+spoken feedback. retry_policy would be additive complexity AND a new
+latency hazard, not a replacement.
