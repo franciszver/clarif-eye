@@ -255,27 +255,50 @@ def test_the_deadline_reaches_the_child_s_nodes():
     """config["configurable"] flows into a subgraph invoked from a parent
     node - verified empirically before this was relied on. Without it the
     deep path would silently lose the whole-pipeline deadline the moment it
-    was extracted, and a blown budget would stop degrading."""
-    from tests.test_pipeline_deadline import ExplosiveSearcher, FakeEyesClient, _reply
+    was extracted, and a blown budget would stop degrading.
+
+    THE DEADLINE IS BLOWN *AFTER* VISION, NOT BEFORE IT, and that ordering is
+    the whole test. An already-expired deadline makes `vision` degrade, a
+    degraded scene routes to the FAST path, and the run never enters the
+    child at all - so the two assertions below would pass because nothing
+    ran, which is passing for the wrong reason. (That is exactly what the
+    first version of this test did: hardcoding deadline_exceeded=False in
+    both child nodes left it green.) SlowSearcher is the same
+    sleep-in-a-fake trick tests/test_pipeline_deadline.py's
+    test_deadline_blown_midway_produces_output_from_known_state uses: vision
+    beats the clock, the child's `research` node burns past it, and
+    `analysis` finds the budget gone.
+    """
+    from tests.test_pipeline_deadline import FakeEyesClient, SlowSearcher, _reply
 
     graph = build_graph()
-    searcher = ExplosiveSearcher()
     long_ocr = " ".join(["x"] * 200)
     client = FakeEyesClient(_reply(long_ocr, "a dense long document"))
+    searcher = SlowSearcher(delay=0.05)
     config = {
         "configurable": {
             "client": client,
             "searcher": searcher,
             "tts_provider": _FakeTtsProvider(),
-            "deadline": time.monotonic() - 1.0,
+            # Long enough for vision's near-instant fake call, short enough
+            # that SlowSearcher's sleep pushes the clock past it before the
+            # child's `analysis` node checks.
+            "deadline": time.monotonic() + 0.02,
         }
     }
 
-    result, _trace = drain_stream_collecting_trace(graph, make_initial_state("imgdata"), config)
+    result, trace = drain_stream_collecting_trace(graph, make_initial_state("imgdata"), config)
 
-    assert searcher.called is False, "the child's research node did not see the deadline"
-    assert client.calls == [], "the child's analysis node did not see the deadline"
+    # The run genuinely went THROUGH the child - without this the rest is
+    # vacuous.
+    assert trace == ["entry", "vision", "research", "analysis", "deep_path", "tts"]
+    # vision made its call and nothing else did: the child's `analysis` node
+    # read the deadline off the config it inherited and skipped the brain.
+    assert client.calls == ["eyes"], (
+        f"the child's analysis node did not see the deadline: {client.calls}"
+    )
     assert result["final_output"] != ""
+    assert "not be prepared" not in result["final_output"]
 
 
 # --- The interrupt, fired from inside the child ---------------------------
@@ -328,6 +351,108 @@ def test_resume_on_the_parent_config_reaches_back_into_the_child():
     # the brain call ahead of it is not paid a second time - the wrapper node
     # re-executes, the finished child nodes do not.
     assert len(client.brain_calls()) == 1
+
+
+def test_the_wrapper_maps_the_child_s_own_keys_back_onto_the_parent():
+    """The two write-backs that are NOT the deliverable, pinned as behaviour.
+
+    `final_output` is asserted everywhere already; `scraper_data` and
+    `verification_hold` were mapped back purely so the parent's checkpoint
+    keeps saying what it said before the extraction - which is this issue's
+    red line, and which means deleting either mapping is a silent change:
+    the whole suite stayed green with one removed. Asserted on the PARENT's
+    get_state, which is the thing that must not have changed.
+    """
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    # A searcher that returns a real page, so scraper_data has content the
+    # parent can be checked against rather than the empty string every other
+    # test in this file settles for.
+    class _FindingSearcher:
+        def text(self, query, **kwargs):
+            return [{"href": "https://example.com/water-utility"}]
+
+    class _FetchingClient:
+        def stream(self, method, url, **kwargs):
+            raise RuntimeError("no network in tests")
+
+    graph = build_graph(checkpointer=InMemorySaver())
+    config = _parent_config(RecordingClient(HONEST_DRAFT), thread_id="mapped-back")
+    config["configurable"]["searcher"] = _FindingSearcher()
+    config["configurable"]["research_client"] = _FetchingClient()
+
+    list(graph.stream(make_initial_state("base64photo"), config=config, stream_mode="updates"))
+
+    values = graph.get_state(config).values
+    # research ran and reported its outcome, and the PARENT can see it. "" is
+    # research's own "ran, found nothing" value (the fetch above refuses to
+    # touch the network) - what matters is that it is not None, which is
+    # make_initial_state's "research never ran" sentinel and what the parent
+    # would be stuck at if the mapping were dropped.
+    assert values["scraper_data"] == "", (
+        "the wrapper stopped mapping scraper_data back onto the parent"
+    )
+    assert values["verification_hold"] is None
+
+
+def test_the_parent_holds_nothing_pending_after_either_way_out_of_the_question():
+    """`verification_hold` on the PARENT after each of the two answers - the
+    end-state property a user actually depends on: whichever way they answer,
+    the thread is left ready and nothing is still being held back.
+
+    HONEST LIMIT OF THIS TEST, established by mutation rather than assumed:
+    it does NOT isolate the wrapper's verification_hold write-back. Deleting
+    that mapping leaves this test - and the whole suite - green, because the
+    parent's value is None here either way: make_initial_state seeds None on
+    every photo run, the child clears the hold before the wrapper returns,
+    and on a PAUSE the wrapper never returns at all. That write-back is
+    unobservable through any real flow; see clarif_eye.graph.make_deep_path_node's
+    comment, which now says so instead of implying the mapping is load-bearing.
+    What this test does pin is real all the same: that neither answer leaves
+    a hold behind, which is what would break if the child stopped clearing it.
+    """
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    for answer, thread_id in ((RESUME_CONTINUE, "hold-continue"), ("retake", "hold-retake")):
+        graph = build_graph(checkpointer=InMemorySaver())
+        config = _parent_config(RecordingClient(INVENTED_DRAFT), thread_id=thread_id)
+        list(graph.stream(make_initial_state("base64photo"), config=config, stream_mode="updates"))
+        assert graph.get_state(config).interrupts, "setup: the run should have paused"
+
+        list(graph.stream(Command(resume=answer), config=config, stream_mode="updates"))
+
+        values = graph.get_state(config).values
+        assert values["verification_hold"] is None, (
+            f"after {answer!r} the parent still holds a drafted script back"
+        )
+        # And the hold really was set on the way in - otherwise the check
+        # above proves nothing about the mapping.
+        assert values["final_output"]
+
+
+def test_a_child_raised_pause_is_narrated_as_exactly_one_interrupt_event():
+    """LangGraph emits a child's pause TWICE - namespaced, then re-emitted at
+    the parent level with the same payload. _narrate_stream drops the
+    namespaced copy so its callers see one event.
+
+    ASSERTED AT THE GENERATOR, not through the staged UI output, and that is
+    the point: _stage_events keeps only the last question and yields it once
+    after the loop, so the spoken result looks correct whether this generator
+    emits one event or five. The duplicate would be invisible there and
+    unpinned everywhere - which is how it stays wrong.
+    """
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from clarif_eye.ui import _narrate_stream
+
+    graph = build_graph(checkpointer=InMemorySaver())
+    config = _parent_config(RecordingClient(INVENTED_DRAFT), thread_id="one-event")
+
+    events = list(_narrate_stream(graph, make_initial_state("base64photo"), config, {}))
+
+    interrupts = [payload for kind, payload in events if kind == "interrupt"]
+    assert len(interrupts) == 1, f"the child's pause was narrated {len(interrupts)} times"
+    assert INVENTED_DRAFT in interrupts[0]
 
 
 # --- Bounded memory across the new namespace boundary ---------------------
@@ -513,13 +638,17 @@ def test_the_text_only_route_caps_what_it_sends_to_the_model():
     from clarif_eye.ui import DOCUMENT_TEXT_CAP, describe_document_text
 
     resources = _text_route_resources(RecordingClient(HONEST_DRAFT))
-    oversized = "x" * (DOCUMENT_TEXT_CAP * 3)
+    # "Z" because the count below is taken over the WHOLE prompt, and the
+    # fixed instruction text around the document contributes 16 lowercase
+    # x's of its own ("text", "exactly") but no Z at all - so every Z
+    # counted is document text that actually reached the model.
+    oversized = "Z" * (DOCUMENT_TEXT_CAP * 3)
 
     describe_document_text(oversized, resources)
 
     brain_prompts = [prompt for role, has_image, prompt in resources.client.calls if role == "brain"]
     assert brain_prompts, "the model was never reached"
-    assert brain_prompts[0].count("x") <= DOCUMENT_TEXT_CAP, (
+    assert brain_prompts[0].count("Z") <= DOCUMENT_TEXT_CAP, (
         "more than the cap's worth of document text reached the model"
     )
 

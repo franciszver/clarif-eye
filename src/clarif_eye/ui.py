@@ -1133,6 +1133,86 @@ class ImageResultCache(_BoundedLRU):
         self._discard(key)
 
 
+# How much document text the text-only API route will ever send to the model.
+#
+# WHY A CAP AT ALL: everywhere else in this app, the text handed to the deep
+# path is whatever a vision pass read off ONE photograph - bounded by
+# physics. That route takes text straight from a caller, so nothing bounds
+# it. Probed before this constant existed: a 2,361,688-character body went to
+# the brain model in full. That is a quota hazard on a rate-limited free tier
+# (see describe_document_text on the shared allowance), and a correctness one
+# too - a model that truncates rather than errors would silently answer about
+# the first fraction of the document while sounding exactly as confident, the
+# "partial reproduction dressed as success" failure analysis.py's own cap
+# comment describes.
+#
+# THE NUMBER: 20,000 characters, roughly 3,000 words. Chosen to sit
+# comfortably ABOVE what this route's own purpose can produce and well below
+# where prompt size becomes the problem: a densely printed A4 page holds
+# ~3,000-5,000 characters, so this is several pages' worth of an unusually
+# text-heavy document. Like every other cap in this codebase
+# (analysis._SCRAPER_DATA_CAP, IMAGE_CACHE_MAX_ENTRIES, MAX_LIVE_THREADS), it
+# is a documented, deliberate guess rather than a measured optimum.
+DOCUMENT_TEXT_CAP = 20_000
+
+# How many distinct documents the text route remembers at once. Matched to
+# IMAGE_CACHE_MAX_ENTRIES for the same reason that one is 20 - a double-digit
+# number of live entries suits a small free-tier demo - and because two
+# caches of wildly different sizes would be harder to reason about together
+# than two of the same order.
+DOCUMENT_CACHE_MAX_ENTRIES = 20
+
+
+def _cap_document_text(document_text, cap=DOCUMENT_TEXT_CAP):
+    """Truncate `document_text` to `cap` characters at a word boundary,
+    leaving a visible marker.
+
+    THE SAME SHAPE AS analysis._cap_scraper_data, deliberately, and for the
+    same reason that one gives: a silent cut mid-word - or, worse,
+    mid-number - reads as real evidence, so the truncation is made visible in
+    the prompt body instead. Not imported from that module: it is a private
+    helper there, it is worded for scraped web context ("[context
+    truncated]"), and this text is the document itself rather than supporting
+    material - the two say different things to the model and should be able
+    to keep doing so.
+    """
+    if len(document_text) <= cap:
+        return document_text
+    truncated = document_text[:cap].rsplit(" ", 1)[0]
+    return f"{truncated} [document truncated]"
+
+
+class DocumentTextCache(_BoundedLRU):
+    """Tiny in-memory LRU cache from document-text hash -> the spoken-ready
+    description, bounded to DOCUMENT_CACHE_MAX_ENTRIES entries.
+
+    THE SAME RULES AS ImageResultCache, because it exists for the same reason
+    and spends the same allowance: only real, successful outcomes are ever
+    stored (see describe_document_text), a failure is never replayed to the
+    next caller as if it were that document's answer, and nothing is ever
+    written to disk. It is SIMPLER than that one because this route produces
+    less: there is no audio path to go stale, and no thread whose stored
+    ocr/scene could drift out of step with what the caller was told, so the
+    entry is just the text.
+    """
+
+    def __init__(self, max_entries=DOCUMENT_CACHE_MAX_ENTRIES):
+        super().__init__(max_entries)
+
+    def get(self, key):
+        return self._get(key)
+
+    def put(self, key, value):
+        self._touch(key, value)
+
+
+def _document_text_key(document_text):
+    """Hash of the CAPPED text, so two bodies that differ only past the cap -
+    i.e. two requests this route would answer identically - share one entry
+    instead of each paying for the same model call."""
+    return hashlib.sha256(document_text.encode("utf-8")).hexdigest()
+
+
 # --- Thread registry (issue #81 / P9.2) -------------------------------------
 #
 # A LangGraph checkpointer keeps every checkpointed thread's state in memory
@@ -1456,6 +1536,12 @@ class AppResources:
     searcher: object
     research_client: object
     image_cache: object = field(default_factory=ImageResultCache)
+    # The text-only API route's own cache (issue #84 / P9.5). A SEPARATE
+    # cache, not a second use of image_cache: that one is keyed on image
+    # content and its entries carry an audio path plus the ocr/scene a thread
+    # needs, none of which exist here. Defaulted like image_cache so every
+    # test that builds an AppResources directly keeps working untouched.
+    document_cache: object = field(default_factory=DocumentTextCache)
     # None by default (issue #81 / P9.2): every existing test that builds
     # an AppResources directly (test_ui.py's FakeGraph-based tests) never
     # sets these, so they keep running an uncheckpointed graph with no
@@ -1735,10 +1821,23 @@ def _narrate_stream(graph, state, config, result):
                 # A pause raised INSIDE the child arrives TWICE - once
                 # namespaced to the child, then again at the parent level
                 # with the identical payload (verified empirically on
-                # langgraph 1.2.10). Acting only on the parent-level copy
-                # means the question is spoken once, and it makes this branch
-                # behave identically whether the pause came from a child node
-                # or a parent one.
+                # langgraph 1.2.10). Skipping the namespaced copy makes this
+                # generator emit exactly ONE ("interrupt", ...) event, and
+                # makes this branch behave identically whether the pause came
+                # from a child node or a parent one.
+                #
+                # WHAT THIS IS AND IS NOT RESPONSIBLE FOR, stated because an
+                # earlier version of this comment took credit it had not
+                # earned: it is NOT what stops the user hearing the question
+                # twice. _stage_events collects the question into a local and
+                # yields it once AFTER the loop, so the spoken output would
+                # be single even without this guard. What this guard actually
+                # protects is every OTHER consumer of this generator - it is
+                # shared by the photo, follow-up and resume paths, and
+                # _run_pipeline_events counts an interrupt event to decide a
+                # run paused. A duplicate is not visibly wrong today, which is
+                # exactly why it needs a test rather than an assumption: see
+                # tests/test_deep_path_subgraph.py's one-event test.
                 if namespace:
                     continue
                 interrupts = update or ()
@@ -2562,6 +2661,45 @@ DESCRIBE_TEXT_API_NAME = "describe_document_text"
 TEXT_ONLY_SCENE = "a document supplied as text, with no photo"
 
 
+class _SuccessWatchingClient:
+    """Delegates to the real client and records whether any completion ever
+    came back successfully.
+
+    WHY THIS EXISTS: the cache must never store a failure (see
+    ImageResultCache's rule), and this route cannot otherwise tell one.
+    clarif_eye.analysis catches LadderExhaustedError/OpenRouterError
+    INTERNALLY and degrades to a plain-English message, so from out here a
+    "every model was busy" answer and a real description are both just a
+    non-empty string - and string-matching the difference is exactly what
+    this codebase refuses to do (D15: structural, never prose). Watching the
+    seam the failure actually passes through is the structural answer.
+
+    IT ALSO COVERS THE DEADLINE CASE for free, which is the honest bonus: a
+    run whose budget was already spent skips the model call entirely, so
+    nothing ever succeeds here, so its degraded-from-known answer is not
+    cached either. That is right - it is a description of what this app could
+    manage in the time it had, not the document's answer.
+    """
+
+    def __init__(self, client):
+        self._client = client
+        self.succeeded = False
+
+    def complete(self, role, messages, **params):
+        result = self._client.complete(role, messages, **params)
+        self.succeeded = True
+        return result
+
+    def close(self):
+        # Never closes the wrapped client: it is the process-wide shared one
+        # (build_resources), owned by the caller, and closing it here would
+        # take the UI's connection pool down with this request. run_analysis
+        # only closes a client it constructed itself, so this is never called
+        # today - it exists so a future caller that does call it cannot do
+        # that damage by accident.
+        pass
+
+
 def describe_document_text(
     document_text, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUDGET_SECONDS
 ):
@@ -2592,6 +2730,15 @@ def describe_document_text(
     process-lifetime singleton would buy a lifecycle question (who builds it,
     when, and with what) for nothing measurable.
 
+    IT SPENDS THE SAME DAILY ALLOWANCE THE UI DOES. There is one shared
+    OpenRouter account behind this app and one free-tier quota (see
+    clarif_eye.client), so every call here is a model call the photo pipeline
+    cannot make later that day - and every uncached call is an outbound web
+    search and page fetch too. That is why this route is CAPPED
+    (DOCUMENT_TEXT_CAP) and CACHED (DocumentTextCache) rather than left open:
+    with neither, a caller in a retry loop could spend the day's allowance
+    and the UI would simply stop answering for everyone.
+
     NO IMAGE CACHE (it is keyed on image content and there is no image), and
     NO THREAD (nothing to remember between calls - a follow-up question is a
     UI feature and belongs to a session, which an API caller does not have).
@@ -2601,10 +2748,23 @@ def describe_document_text(
     if resources.client is None:
         return resources.client_error or CONFIG_ERROR_MESSAGE
 
+    # CAPPED BEFORE ANYTHING ELSE, including before the cache key is taken,
+    # so two bodies differing only past the cap share one entry - see
+    # _document_text_key.
+    capped = _cap_document_text(document_text.strip())
+    cache_key = _document_text_key(capped)
+    cached = resources.document_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    # Wrapped so "did a model call actually succeed?" is answerable
+    # structurally after the run - see _SuccessWatchingClient for why that
+    # cannot be read off the result.
+    watched_client = _SuccessWatchingClient(resources.client)
     try:
         config = {
             "configurable": {
-                "client": resources.client,
+                "client": watched_client,
                 "searcher": resources.searcher,
                 "research_client": resources.research_client,
                 "deadline": time.monotonic() + pipeline_budget_seconds,
@@ -2612,7 +2772,7 @@ def describe_document_text(
         }
         result = build_deep_path_graph().invoke(
             {
-                "document_text": document_text.strip(),
+                "document_text": capped,
                 "scene_description": TEXT_ONLY_SCENE,
             },
             config=config,
@@ -2624,7 +2784,22 @@ def describe_document_text(
     except Exception:
         return UNEXPECTED_ERROR_MESSAGE
 
-    return (result.get("final_output") or "").strip() or UNEXPECTED_ERROR_MESSAGE
+    spoken = (result["final_output"] or "").strip()
+    if not spoken:
+        return UNEXPECTED_ERROR_MESSAGE
+
+    # CACHED ONLY WHEN THE RUN GENUINELY PRODUCED THIS DOCUMENT'S ANSWER, the
+    # same discipline the image cache follows:
+    #   - a model call actually succeeded, so a busy-ladder message or a
+    #     deadline-degraded read-back of the input is left to be retried
+    #     rather than served to the next caller as this document's answer;
+    #   - nothing was held back for being unverifiable. That outcome is this
+    #     route's honest degradation (there is nobody here to ask - see
+    #     above), not the description of the document, so a later caller gets
+    #     a fresh attempt instead of a replayed refusal.
+    if watched_client.succeeded and result["verification_hold"] is None:
+        resources.document_cache.put(cache_key, spoken)
+    return spoken
 
 
 def build_interface(resources):

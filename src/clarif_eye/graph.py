@@ -556,13 +556,38 @@ def make_deep_path_node(child):
                 "scene_description": state["scene_context"],
             }
         )
-        # MAPPED BACK OUT, all three of them. `final_output` is the deliverable;
-        # `scraper_data` and `verification_hold` are mapped too so the parent's
-        # checkpoint says exactly what it said before this extraction - those
-        # keys are read by clarif_eye.ui (the implicit-retake write clears the
-        # hold) and asserted by the existing test fleet. They are the child's
-        # OUTPUTS being translated, not shared channels: the child still owns
-        # producing them, and the parent never writes into them.
+        # MAPPED BACK OUT, all three of them, so the parent's checkpoint says
+        # what it said before this extraction. They are the child's OUTPUTS
+        # being translated, not shared channels: the child owns producing
+        # them, and the parent never writes into them.
+        #
+        # HOW MUCH EACH ONE ACTUALLY DOES, measured by deleting it rather
+        # than asserted from intent - because two of these three are not
+        # equally load-bearing and pretending otherwise would mislead the
+        # next editor:
+        #   - final_output: the deliverable. Everything depends on it.
+        #   - scraper_data: genuinely observable. Without it the parent stays
+        #     at make_initial_state's None ("research never ran") after a run
+        #     in which research demonstrably did. Pinned by
+        #     tests/test_deep_path_subgraph.py's write-back test, which reds
+        #     when this line is removed.
+        #   - verification_hold: NOT observable through any real flow, and
+        #     removing it leaves the whole suite green. Every photo run seeds
+        #     the parent's copy None (make_initial_state), the child clears
+        #     the hold before this wrapper returns, and on a PAUSE this
+        #     wrapper never returns at all - so the parent's value is None
+        #     with or without this line. It is kept for symmetry (all three
+        #     of the child's outputs cross the boundary the same way, so a
+        #     future change to when the hold is cleared cannot silently strand
+        #     the parent) and NOT because anything today would notice. THE
+        #     ONE PLACE THE PARENT'S STATE GENUINELY CHANGED with this
+        #     extraction is a PAUSED thread: `analysis` used to write the
+        #     hold straight into the parent, so get_state() showed it while
+        #     the question was pending; now it lives in the child's
+        #     checkpoint and the parent shows None. Nothing in this app reads
+        #     it there (clarif_eye.ui only ever writes it back to None), so
+        #     no behaviour changed - but it is a real difference and is
+        #     recorded here rather than left to be rediscovered.
         #
         # BRACKET ACCESS, NOT .get(), ON PURPOSE - LOUD BEATS SILENT. All three
         # keys are written by the child on every path it can finish through
