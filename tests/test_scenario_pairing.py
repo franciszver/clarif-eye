@@ -53,6 +53,11 @@ SCENARIOS = [
             "tests/test_pipeline_deadline.py",
             "tests/test_failure_messages.py",
             "tests/test_checkpointing.py",
+            # Issue #109 / P10.1: drives build_graph with a recording fake
+            # client to reach a paused interrupt state on a SqliteSaver, so
+            # it can be resumed against a brand-new SqliteSaver on the same
+            # file.
+            "tests/test_durable_checkpointing.py",
         ],
         "scenario_paths": [
             "scripts/live_smoke.py",

@@ -80,8 +80,12 @@ gives callers (and tests) real per-node progress instead of a debugging
 side-channel, and needs nothing extra recorded by the nodes themselves.
 """
 
+import os
+import sqlite3
 import time
 
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
 from langgraph.types import Command, interrupt
 
@@ -957,6 +961,44 @@ def dynamic_router(state):
             f"{type(flag).__name__} ({flag!r})"
         )
     return DEEP_PATH_NODE if flag else "fast_synth"
+
+
+# Env var name for issue #109 / P10.1's pluggable durable checkpointing.
+# Named here, next to the factory that reads it, so clarif_eye.ui.build_resources
+# (the sole caller) never has to repeat the literal.
+CHECKPOINT_DB_ENV_VAR = "CLARIFEYE_CHECKPOINT_DB"
+
+
+def make_checkpointer():
+    """Build the ONE checkpointer a process's graph and thread registry both
+    share (issue #109 / P10.1), selected by the CHECKPOINT_DB_ENV_VAR
+    environment variable.
+
+    UNSET (today's default, byte-identical): a fresh
+    langgraph.checkpoint.memory.InMemorySaver - exactly what
+    clarif_eye.ui.build_resources constructed directly before this issue.
+    See that function's own comment for its honest, in-process-only limits.
+
+    SET to a path: a langgraph.checkpoint.sqlite.SqliteSaver over that file,
+    built from a connection opened with check_same_thread=False. THAT FLAG
+    IS LOAD-BEARING, not a default left alone - Gradio serves requests from
+    worker threads, and sqlite3's own default (check_same_thread=True) raises
+    the moment a connection opened on one thread is used from another, which
+    is exactly what every request after the first would do against one
+    module-level connection. See README.md's Deployment section for why this
+    still is not durable on Render's free tier even though it survives a
+    same-process restart.
+
+    Read PER CALL, not cached: this runs once, at app build time (see
+    clarif_eye.ui.build_resources), so "per call" and "per process" are the
+    same thing here - there is no request-scoped re-evaluation to worry
+    about.
+    """
+    db_path = os.environ.get(CHECKPOINT_DB_ENV_VAR)
+    if not db_path:
+        return InMemorySaver()
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    return SqliteSaver(conn)
 
 
 def build_graph(checkpointer=None, store=None):

@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "A cloud vision assistant that turns photos into spoken descriptions for visually impaired users."
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
-dependencies = ["httpx>=0.27", "langgraph>=1.2", "ddgs>=9.0", "beautifulsoup4>=4.12", "edge-tts>=6.1", "gTTS>=2.5", "gradio>=5.0"]
+dependencies = ["httpx>=0.27", "langgraph>=1.2", "langgraph-checkpoint-sqlite>=3.1,<4.0", "ddgs>=9.0", "beautifulsoup4>=4.12", "edge-tts>=6.1", "gTTS>=2.5", "gradio>=5.0"]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4", "ruff>=0.6"]
