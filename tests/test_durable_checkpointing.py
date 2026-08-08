@@ -4,11 +4,12 @@ RED FIRST: at the time this file was first committed, clarif_eye.graph had
 no `make_checkpointer`, so every test here failed on the import line.
 
 Drives the compiled graph through a paused (interrupt) state the same way
-tests/test_ask_before_speaking.py does - RecordingClient/FakeSearcher/
-_FakeTtsProvider fakes, a dense-document draft that fails number
-verification - and reuses tests/test_checkpointing.py's `_invoke` shape for
-a plain completed turn. See both files' own docstrings for why those fakes
-exist and what they avoid touching (no model or network call).
+tests/test_ask_before_speaking.py does - reusing that file's own
+RecordingClient/FakeSearcher/_FakeTtsProvider fakes and its dense-document
+draft that fails number verification, rather than a second copy of them -
+and reuses tests/test_checkpointing.py's `_invoke` shape for a plain
+completed turn. See both files' own docstrings for why those fakes exist
+and what they avoid touching (no model or network call).
 """
 
 import sqlite3
@@ -22,68 +23,19 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
-BILL_OCR = (
-    "CITY OF RIVERTON WATER UTILITY STATEMENT Account Number: 4471-2205-88 "
-    "AMOUNT DUE $104.95 PAYMENT DUE BY: 22 JULY 2026"
+from tests.test_ask_before_speaking import (
+    INVENTED_DRAFT,
+    FakeSearcher,
+    RecordingClient,
+    _FakeTtsProvider,
 )
-BILL_SCENE = "a water utility statement"
-# $999.99 appears nowhere in BILL_OCR - the fabricated amount that must
-# trigger the pause, exactly as in test_ask_before_speaking.py.
-INVENTED_DRAFT = "This is a water utility bill. The amount due is $999.99."
-
-
-class RecordingClient:
-    """Same shape as test_ask_before_speaking.py's RecordingClient: an eyes
-    call (image present) always returns the bill OCR/scene, a brain call
-    returns the invented draft that fails number verification."""
-
-    @staticmethod
-    def _has_image(messages):
-        for message in messages:
-            content = message.get("content")
-            if isinstance(content, str):
-                continue
-            for part in content:
-                if part.get("type") == "image_url":
-                    return True
-        return False
-
-    def complete(self, role, messages, **params):
-        if self._has_image(messages):
-            return CompletionResult(
-                content=f"OCR_TEXT: {BILL_OCR}\nSCENE: {BILL_SCENE}",
-                model="fake-eyes-model:free",
-            )
-        if role == "brain":
-            return CompletionResult(content=INVENTED_DRAFT, model="fake-brain-model:free")
-        return CompletionResult(content="A bill on a table.", model="fake-eyes-model:free")
-
-    def close(self):
-        pass
-
-
-class FakeSearcher:
-    """Returns no results, so research_node degrades without ever touching
-    the network - the research step is only on the road to `analysis`."""
-
-    def text(self, query, **kwargs):
-        return []
-
-
-class _FakeTtsProvider:
-    """Writes a minimal valid-looking mp3 so run_tts's own "looks like
-    audio" check passes without touching the network."""
-
-    def synthesize(self, text, out_path):
-        with open(out_path, "wb") as f:
-            f.write(b"ID3" + b"\x00" * 32)
 
 
 def _run_config(thread_id):
     return {
         "configurable": {
             "thread_id": thread_id,
-            "client": RecordingClient(),
+            "client": RecordingClient(INVENTED_DRAFT),
             "searcher": FakeSearcher(),
             "tts_provider": _FakeTtsProvider(),
         }
@@ -102,7 +54,7 @@ def test_pause_survives_a_brand_new_sqlitesaver_on_the_same_file(tmp_path):
     conn = sqlite3.connect(db_path, check_same_thread=False)
     first_saver = SqliteSaver(conn)
     first_graph = build_graph(checkpointer=first_saver)
-    config = {"configurable": {"thread_id": thread_id, **_run_config(thread_id)["configurable"]}}
+    config = _run_config(thread_id)
 
     chunks = list(
         first_graph.stream(make_initial_state("base64photo"), config=config, stream_mode="updates")
@@ -167,16 +119,15 @@ def test_delete_thread_removes_state_from_sqlite_saver(tmp_path):
     config = {"configurable": {"thread_id": thread_id}}
 
     state = make_initial_state("image-payload")
+    # A short OCR keeps this on the fast path so the run completes with no
+    # pause, and the point of this test is deletion, not verification.
     run_config = {
         "configurable": {
             "thread_id": thread_id,
-            "client": RecordingClient(),
+            "client": _ShortReplyClient(),
             "tts_provider": _FakeTtsProvider(),
         }
     }
-    # A short OCR keeps this on the fast path so the run completes with no
-    # pause, and the point of this test is deletion, not verification.
-    run_config["configurable"]["client"] = _ShortReplyClient()
     graph.invoke(state, config=run_config)
 
     before = graph.get_state(config)
