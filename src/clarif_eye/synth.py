@@ -29,7 +29,7 @@ regularly (see vision.py's module docstring):
 
 from clarif_eye.client import OpenRouterClient
 from clarif_eye.ladder import call_ladder
-from clarif_eye.prompting import fence_untrusted
+from clarif_eye.prompting import fence_untrusted, verbosity_instruction
 from clarif_eye.speech import to_spoken_text as _to_spoken_text
 from clarif_eye.vision import is_degraded_scene
 
@@ -68,7 +68,7 @@ def _default_client():
     return OpenRouterClient()
 
 
-def _build_messages(ocr_output, scene_context):
+def _build_messages(ocr_output, scene_context, verbosity=None):
     if ocr_output:
         body = (
             f"Text found in the photo:\n{fence_untrusted(ocr_output)}"
@@ -76,7 +76,12 @@ def _build_messages(ocr_output, scene_context):
         )
     else:
         body = f"No text was found in the photo.\n\nScene description: {scene_context}"
-    return [{"role": "user", "content": [{"type": "text", "text": f"{SYNTH_PROMPT}\n\n{body}"}]}]
+    # Cross-thread verbosity preference (issue #86 / P9.7) - see
+    # clarif_eye.prompting.verbosity_instruction for the shared wording and
+    # clarif_eye.graph.fast_synth_node for where `verbosity` is read from
+    # the store. "" (no preference) leaves the prompt exactly as before.
+    prompt = f"{SYNTH_PROMPT}{verbosity_instruction(verbosity)}"
+    return [{"role": "user", "content": [{"type": "text", "text": f"{prompt}\n\n{body}"}]}]
 
 
 def _degraded(message):
@@ -100,7 +105,7 @@ def _degrade_from_known(ocr_output, scene_context):
     return _degraded(scene_context)
 
 
-def run_fast_synth(ocr_output, scene_context, client=None, deadline_exceeded=False):
+def run_fast_synth(ocr_output, scene_context, client=None, deadline_exceeded=False, verbosity=None):
     """Call the eyes ladder to turn (ocr_output, scene_context) into final_output.
 
     `client` is injectable (tests pass a fake); when omitted, a real
@@ -115,6 +120,13 @@ def run_fast_synth(ocr_output, scene_context, client=None, deadline_exceeded=Fal
     this point (vision already ran), so the model call is skipped and
     final_output is built straight from them instead - see
     _degrade_from_known.
+
+    `verbosity` (issue #86 / P9.7): "short", "detailed", or None (no stored
+    preference) - see clarif_eye.graph.fast_synth_node, which reads it from
+    the Store, and clarif_eye.prompting.verbosity_instruction for the
+    wording folded into the prompt. Never applied on a degraded return
+    below: those paths build final_output straight from known text with no
+    model call, so there is no prompt for an instruction to change.
     """
     ocr_output = ocr_output or ""
     scene_context = scene_context or ""
@@ -150,7 +162,7 @@ def run_fast_synth(ocr_output, scene_context, client=None, deadline_exceeded=Fal
     # site, because it is the one thing the three callers genuinely differ on.
     result, failure_message = call_ladder(
         "eyes",
-        lambda: _build_messages(ocr_output, scene_context),
+        lambda: _build_messages(ocr_output, scene_context, verbosity),
         client,
         _default_client,
         "The spoken description could not be prepared because of an "
