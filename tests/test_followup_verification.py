@@ -49,6 +49,7 @@ from clarif_eye.graph import (
     next_node_after,
 )
 from clarif_eye.ui import (
+    ASK_BUTTON_ELEM_ID,
     AppResources,
     NOTHING_TO_RESUME_MESSAGE,
     QUESTION_PENDING_MESSAGE,
@@ -57,6 +58,7 @@ from clarif_eye.ui import (
     STATUS_ASKING,
     ThreadRegistry,
     _PauseSignal,
+    build_interface,
     handle_ask_staged,
     handle_resume_staged,
     handle_submit_staged,
@@ -306,9 +308,12 @@ def test_an_unverifiable_follow_up_answer_pauses_and_carries_the_questioned_text
     assert payload["script"] == INVENTED_ANSWER
     assert payload["numbers"] == ["500"]
 
-    # A paused run speaks nothing and records nothing.
-    assert snapshot.values.get("messages") == []
-    assert not snapshot.values.get("audio_file_path")
+    # A paused run records nothing: only the PHOTO run's own description is
+    # in history, and neither side of the unanswered question is.
+    recorded = [message.content for message in snapshot.values["messages"]]
+    assert len(recorded) == 1
+    assert QUESTION not in recorded[0]
+    assert INVENTED_ANSWER not in recorded[0]
 
 
 def test_a_clean_follow_up_answer_never_pauses():
@@ -583,6 +588,49 @@ def test_a_fresh_photo_submitted_while_a_follow_up_question_is_pending_leaves_no
     assert snapshot.next == ()
     assert not snapshot.interrupts
     assert snapshot.values["verification_hold"] is None
+
+
+def test_the_ask_handler_reveals_the_answer_buttons_but_never_hides_them():
+    """The Gradio wiring, read off the BUILT Blocks rather than the source.
+
+    Two halves, and the second is the one an obvious implementation gets
+    wrong. A follow-up that pauses must REVEAL the two answer buttons, or a
+    user who cannot see the screen is asked a question with nothing on the
+    page to answer it with. But a follow-up typed while a question is
+    already pending is REFUSED - and that yield must leave the buttons
+    alone, because hiding them would take away the only way to answer the
+    question the refusal has just told the user to answer.
+    """
+    resources = _resources(RecordingClient(INVENTED_ANSWER))
+    demo = build_interface(resources)
+    try:
+        question_id = next(
+            block_id
+            for block_id, block in demo.blocks.items()
+            if getattr(block, "elem_id", None) == ASK_BUTTON_ELEM_ID
+        )
+        ask_handler = next(
+            fn.fn
+            for fn in demo.fns.values()
+            if (question_id, "click") in (fn.targets or []) and fn.fn is not None
+        )
+
+        list(handle_submit_staged(FakeImage(), resources, thread_id="ui-wiring"))
+
+        paused = list(ask_handler(QUESTION, "ui-wiring", "ui-wiring-session"))
+        _status, _audio, _text, continue_update, retake_update = paused[-1]
+        assert dict(continue_update).get("visible") is True
+        assert dict(retake_update).get("visible") is True
+
+        refused = list(ask_handler("what colour is it?", "ui-wiring", "ui-wiring-session"))
+        _status, _audio, text, continue_update, retake_update = refused[-1]
+        assert text == QUESTION_PENDING_MESSAGE, "setup: the refusal branch"
+        # An empty update carries no `visible` key at all, which is what
+        # "leave them exactly as they are" looks like on the wire.
+        assert "visible" not in dict(continue_update)
+        assert "visible" not in dict(retake_update)
+    finally:
+        demo.close()
 
 
 def test_the_asking_node_never_runs_when_no_photo_has_been_described():

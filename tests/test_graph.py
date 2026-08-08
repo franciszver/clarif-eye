@@ -20,6 +20,7 @@ from clarif_eye.graph import (
     _UNCONDITIONAL_SUCCESSOR,
     DEEP_PATH_NODE,
     TTS_NODE,
+    VERIFY_ANSWER_NODE,
     build_graph,
     dynamic_router,
     next_node_after,
@@ -390,8 +391,17 @@ def test_tts_node_constant_names_a_node_the_compiled_graph_actually_has():
     # cannot leave half the topology pointing at a stale string.
     assert next_node_after(TTS_NODE, {}) is None
     assert _UNCONDITIONAL_SUCCESSOR["fast_synth"] == TTS_NODE
-    assert _UNCONDITIONAL_SUCCESSOR["followup"] == TTS_NODE
     assert _UNCONDITIONAL_SUCCESSOR[DEEP_PATH_NODE] == TTS_NODE
+    # `followup` left this table in issue #92 / P9.11: its edge is CONDITIONAL
+    # now (followup_destination), because an answer holding an unverifiable
+    # number goes to the parent's own asking node first. With nothing held it
+    # still resolves to this same constant, which is what a clean follow-up
+    # does - and that asking node's own successor is tts, unlike the child
+    # graph's, so a rename still cannot leave half the topology stale.
+    assert "followup" not in _UNCONDITIONAL_SUCCESSOR
+    assert next_node_after("followup", {}) == TTS_NODE
+    assert _UNCONDITIONAL_SUCCESSOR[VERIFY_ANSWER_NODE] == TTS_NODE
+    assert next_node_after(VERIFY_ANSWER_NODE, {}) == TTS_NODE
     # verify_numbers points at END, not at tts, since issue #84 / P9.5: it is
     # the last node of the CHILD graph, which cannot name the parent's tts.
     # That is also what keeps "Turning it into speech" from being announced

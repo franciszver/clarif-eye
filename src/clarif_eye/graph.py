@@ -1,8 +1,12 @@
 """Compiling LangGraph skeleton for Clarif-Eye.
 
 Wires: entry -> vision -> dynamic_router -> fast_synth OR deep_path -> tts
--> END, with entry -> followup -> tts as the second way in (issue #82 /
-P9.3 - a typed question about a photo this thread already described).
+-> END, with entry -> followup -> [verify_answer] -> tts as the second way
+in (issue #82 / P9.3 - a typed question about a photo this thread already
+described). `verify_answer` is in brackets for the same reason
+`verify_numbers` is below: a conditional edge decides whether it runs at
+all, and it runs only when a number in the drafted ANSWER could not be
+traced back to the photographed text (issue #92 / P9.11).
 
 `deep_path` (issue #84 / P9.5) is ONE NODE HERE AND A WHOLE GRAPH INSIDE:
 research -> analysis -> [verify_numbers], compiled separately with its own
@@ -41,7 +45,11 @@ and neither is a leftover:
     clarif_eye.deep_path.build_deep_path_graph, which wires it). The
     mechanism and the reasoning are unchanged; only which graph declares
     the edge moved. analysis_destination itself still lives in this
-    module, next to the node functions it routes between.
+    module, next to the node functions it routes between. Issue #92 /
+    P9.11 added a THIRD use, out of `followup` (followup_destination), in
+    exactly the same shape and for exactly the same reason - and that one
+    IS declared in this graph, because both nodes it joins are this
+    graph's own.
 
   - Command(goto=...) (returned by `entry`): a node that decides its OWN
     successor. There is no upstream node to compute a flag for it - `entry`
@@ -361,12 +369,19 @@ def analysis_node(state, config=None, client=None, store=None):
 # --- Asking before speaking an unverifiable number (issue #83 / P9.4) ------
 #
 # THE PRODUCT RULE, stated here because it is a product decision and not a
-# framework one: this graph pauses ONLY when the number verification the
-# deep-analysis path already performs FAILS. Never on general low
-# confidence, never on the fast path, never on a follow-up answer. Every
-# user of this app is visually impaired and cannot glance at the screen to
-# see what is being asked; an unnecessary question costs them more than it
-# would most audiences, so the gate below is deliberately narrow.
+# framework one: this graph pauses ONLY when a NUMBER VERIFICATION FAILS.
+# Never on general low confidence, never on the fast path. Every user of
+# this app is visually impaired and cannot glance at the screen to see what
+# is being asked; an unnecessary question costs them more than it would
+# most audiences, so the gate below is deliberately narrow.
+#
+# WHICH PATHS VERIFY NUMBERS AT ALL grew by one in issue #92 / P9.11, and
+# this comment used to say "never on a follow-up answer". It now says never
+# on a follow-up answer whose numbers all trace back. The deep-analysis path
+# checks the description it drafts; the FOLLOW-UP path checks the answer it
+# drafts (clarif_eye.followup, which carries the reversal's full reasoning).
+# The fast path still has no check and so can still never pause. The rule
+# itself did not change - only how many drafts are held to it.
 #
 # The key LangGraph fact this design is built on, EMPIRICALLY VERIFIED on
 # langgraph 1.2.10 before anything was written (probes, not assumption):
@@ -412,6 +427,30 @@ UNVERIFIED_NUMBER_CAVEAT = (
 RETAKE_CONFIRMATION = (
     "All right, nothing was read out. Please take or upload a new photo, "
     'then activate "Describe this photo".'
+)
+
+# The same choice, answered on the FOLLOW-UP path (issue #92 / P9.11) - and
+# a DIFFERENT sentence, deliberately.
+#
+# THE BUTTONS AND THE PAYLOAD ARE UNCHANGED: two choices, the same labels,
+# the same interrupt fields, so every part of clarif_eye.ui's pause flow
+# works for either path with no idea which one asked. What differs is what
+# is TRUE afterwards. On the photo path the drafted DESCRIPTION could not be
+# verified, so there is nothing more to do with that photo and "take a new
+# one" is the honest next step. On a follow-up the photo is fine - the user
+# photographed it correctly and it is still on the thread - and it is the
+# ANSWER that could not be checked. Sending them off to re-photograph
+# something that was never the problem would be work for no reason, so this
+# names the two things that will actually help: ask again, or photograph the
+# part the question is about if it was not in frame.
+#
+# The retake button's own label ("I'll retake the photo") still reads as
+# "never mind" here, which is why no third button was added - see
+# clarif_eye.ui.RESUME_RETAKE_LABEL.
+ANSWER_RETAKE_CONFIRMATION = (
+    "All right, that answer was not read out. The photo you already sent is "
+    "still here, so you can ask your question again. If the part you are "
+    "asking about was not in the photo, please take a new photo of it."
 )
 
 
@@ -471,28 +510,73 @@ def analysis_destination(state):
     return "verify_numbers" if numbers_need_asking(state) else END
 
 
-def verify_numbers_node(state):
+def followup_destination(state):
+    """The node that runs after `followup` (issue #92 / P9.11):
+    VERIFY_ANSWER_NODE when the answer holds a number that could not be
+    traced to the photographed text, `tts` when it does not.
+
+    THE FOLLOW-UP PATH'S HALF of the same gate analysis_destination is the
+    deep path's half of - same predicate (numbers_need_asking), same shape,
+    same reason it is a conditional edge rather than a straight line through
+    the asking node (see this module's "TWO ROUTING MECHANISMS" block and
+    analysis_destination's own docstring): `followup` writes
+    verification_hold, a separate pure function reads it.
+
+    IT GOES TO `tts`, NOT END, and that is the one structural difference from
+    analysis_destination: this edge is declared in the PARENT graph, which
+    owns `tts` and can name it. The deep path's equivalent runs in a child
+    that cannot.
+
+    Reads with .get() for the same reason numbers_need_asking does: a
+    follow-up run's input is a partial state delta, so a key no node has
+    written yet is genuinely ABSENT rather than None.
+    """
+    return VERIFY_ANSWER_NODE if numbers_need_asking(state) else TTS_NODE
+
+
+def _ask_about_held_numbers(state, reason, retake_confirmation):
     """Ask the user before speaking a number that could not be checked
     (issue #83 / P9.4) - or pass straight through when there is nothing to
     ask about.
 
-    Reads ONE key, state["verification_hold"], which `analysis` wrote (see
-    clarif_eye.analysis.run_analysis and state.py's own comment on that
-    key), via the shared numbers_need_asking predicate above. In the graph
-    this node is only ENTERED when that predicate is already true
-    (analysis_destination routes past it otherwise), so the guard below is
-    the second line of defence, not the gate: it keeps a direct call - a
-    unit test, a future caller - from raising on a state that holds
-    nothing, which this pipeline must never do.
+    THE WHOLE BODY OF BOTH ASKING NODES, in one place (issue #92 / P9.11).
+    verify_numbers_node (the deep path's) and verify_answer_node (the
+    follow-up path's) differ by exactly two values - the `reason` they stamp
+    on the interrupt payload, and the sentence they speak when the user
+    declines - and by nothing else at all. Two copies of an interrupt-raising
+    node would be two places for the payload shape to drift, and the payload
+    shape is what clarif_eye.ui's entire pause flow is built on.
+
+    WHY TWO REGISTERED NODES RATHER THAN ONE SHARED REGISTRATION: the two
+    graphs' node names must stay DISJOINT. clarif_eye.graph's
+    _UNCONDITIONAL_SUCCESSOR and clarif_eye.ui's _NODE_PHRASE are flat dicts
+    keyed by BARE node names that answer for the parent AND the deep-path
+    child (see tests/test_deep_path_subgraph.py's disjointness test), so a
+    parent node also called "verify_numbers" would make one graph's entry
+    answer for the other graph's node - silently, since a dict lookup cannot
+    notice. Registering the parent's under its own name (VERIFY_ANSWER_NODE)
+    keeps that property while the behaviour stays shared here.
+
+    Reads ONE key, state["verification_hold"], which `analysis` or
+    `followup` wrote (see clarif_eye.analysis.run_analysis,
+    clarif_eye.followup.run_followup, and state.py's own comment on that
+    key), via the shared numbers_need_asking predicate above. In both graphs
+    these nodes are only ENTERED when that predicate is already true
+    (analysis_destination / followup_destination route past them otherwise),
+    so the guard below is the second line of defence, not the gate: it keeps
+    a direct call - a unit test, a future caller - from raising on a state
+    that holds nothing, which this pipeline must never do.
     - RESUME_CONTINUE: the held draft IS spoken, with UNVERIFIED_NUMBER_CAVEAT
       in front of it. The user asked to hear it; hiding it now would be a
-      second, quieter refusal.
-    - ANYTHING ELSE (including RESUME_RETAKE): the retake confirmation is
+      second, quieter refusal. THE SAME CAVEAT on both paths, on purpose:
+      what it warns about ("a number in this could not be checked against the
+      photo") is identical whichever draft is being spoken.
+    - ANYTHING ELSE (including RESUME_RETAKE): `retake_confirmation` is
       spoken and the draft is discarded. Defaulting the unrecognised case to
       "do not speak it" is deliberate - only an answer this app actually
       sent may be read as consent to speak an unverified number.
     Either way `verification_hold` is cleared, so the thread is left ready
-    for the next photo with nothing pending.
+    for the next photo or question with nothing pending.
 
     MAKES NO CALL OF ANY KIND - no model, no network, no filesystem - which
     is exactly what makes it safe to re-execute on resume. See this
@@ -519,9 +603,17 @@ def verify_numbers_node(state):
         return {}
     hold = state["verification_hold"]
 
+    # THE PAYLOAD SHAPE IS FIXED - three fields, always the same three - so
+    # clarif_eye.ui._interrupt_question, the resume buttons, the refusals and
+    # the staging all work identically whichever node raised it. `reason` is
+    # the ONE field that says which flow asked; it is a value, not an extra
+    # key, so the shape does not widen. Nothing in the UI branches on it
+    # today (the spoken question is built from `script` and `numbers`); it is
+    # carried because a structural signal beats re-deriving the flow later
+    # from the wording of a sentence.
     answer = interrupt(
         {
-            "reason": "unverified_numbers",
+            "reason": reason,
             "script": hold.get("script", ""),
             "numbers": list(hold.get("numbers") or []),
         }
@@ -546,10 +638,27 @@ def verify_numbers_node(state):
     # real description" while final_output says "please take another photo"
     # would be a lie waiting for the next reader of this state.
     return {
-        "final_output": RETAKE_CONFIRMATION,
+        "final_output": retake_confirmation,
         "verification_hold": None,
         "output_degraded": True,
     }
+
+
+def verify_numbers_node(state):
+    """The deep path's asking node - a node of the CHILD graph (see
+    clarif_eye.deep_path.build_deep_path_graph, which wires it). Asks about a
+    number in a drafted DESCRIPTION; declining means the photo itself is the
+    thing to retake. All behaviour is in _ask_about_held_numbers above."""
+    return _ask_about_held_numbers(state, "unverified_numbers", RETAKE_CONFIRMATION)
+
+
+def verify_answer_node(state):
+    """The follow-up path's asking node (issue #92 / P9.11) - a node of the
+    PARENT graph, registered as VERIFY_ANSWER_NODE. Asks about a number in a
+    drafted ANSWER; declining leaves the photo where it is, so it speaks
+    ANSWER_RETAKE_CONFIRMATION instead. All behaviour is in
+    _ask_about_held_numbers above."""
+    return _ask_about_held_numbers(state, "unverified_answer", ANSWER_RETAKE_CONFIRMATION)
 
 
 # The name the deep path's child graph is mounted under in the parent. A
@@ -559,6 +668,19 @@ def verify_numbers_node(state):
 # ("deep_path:<task id>" - see clarif_eye.ui._trim_thread_to_latest_checkpoint,
 # which has to recognise those namespaces to bound them).
 DEEP_PATH_NODE = "deep_path"
+
+# The name the follow-up path's asking node is registered under (issue #92 /
+# P9.11). A CONSTANT for the same reasons TTS_NODE and DEEP_PATH_NODE are:
+# the string leaves this module (clarif_eye.ui's _NODE_PHRASE, and the
+# conditional-edge mapping below), and it must never collide with the child
+# graph's "verify_numbers" - see _ask_about_held_numbers's docstring for what
+# a collision would silently break, and tests/test_deep_path_subgraph.py's
+# disjointness test, which reads both compiled graphs' node sets.
+#
+# NAMED FOR WHAT IT ASKS ABOUT, not for what it does: this node verifies an
+# ANSWER to a typed question, the child's verifies the NUMBERS in a drafted
+# description. Both raise the same interrupt from the same function body.
+VERIFY_ANSWER_NODE = "verify_answer"
 
 
 def make_deep_path_node(child):
@@ -847,6 +969,9 @@ def build_graph(checkpointer=None, store=None):
     # never share one.
     builder.add_node(DEEP_PATH_NODE, make_deep_path_node(build_deep_path_graph()))
     builder.add_node("followup", followup_node)
+    # issue #92 / P9.11: the follow-up path's own asking node. Registered
+    # under a name the deep-path child does not use - see VERIFY_ANSWER_NODE.
+    builder.add_node(VERIFY_ANSWER_NODE, verify_answer_node)
     builder.add_node(TTS_NODE, tts_node)
 
     # entry has NO outgoing edge of any kind: it returns Command(goto=...)
@@ -870,8 +995,18 @@ def build_graph(checkpointer=None, store=None):
     # keeps its own comments for why each edge is the shape it is.
     builder.add_edge(DEEP_PATH_NODE, TTS_NODE)
     # A follow-up answer is spoken exactly like a description is: same tts
-    # node, same provider chain, same staged delivery in the UI.
-    builder.add_edge("followup", TTS_NODE)
+    # node, same provider chain, same staged delivery in the UI - unless a
+    # number in it could not be traced back to the photographed text, in
+    # which case the run stops to ask first (issue #92 / P9.11). A STATIC
+    # branch on a flag `followup` already computed, so a conditional edge,
+    # exactly like the one out of `vision` and the one the deep-path child
+    # declares out of `analysis`.
+    builder.add_conditional_edges(
+        "followup",
+        followup_destination,
+        {VERIFY_ANSWER_NODE: VERIFY_ANSWER_NODE, TTS_NODE: TTS_NODE},
+    )
+    builder.add_edge(VERIFY_ANSWER_NODE, TTS_NODE)
     builder.add_edge(TTS_NODE, END)
 
     return builder.compile(checkpointer=checkpointer, store=store)
@@ -892,8 +1027,9 @@ TTS_NODE = "tts"
 
 # Unconditional successor for every edge above EXCEPT the ones out of
 # "entry" (self-routed by Command, resolved by entry_destination instead),
-# "vision" and "analysis" (conditional edges, resolved by dynamic_router
-# and analysis_destination instead) and "tts" (the last node - see
+# "vision", "analysis" and "followup" (conditional edges, resolved by
+# dynamic_router, analysis_destination and followup_destination instead)
+# and "tts" (the last node - see
 # next_node_after's END case below). Kept
 # literally next to build_graph()'s add_edge calls, which is the ONLY
 # reason this is safe to hand-maintain rather than deriving it from the
@@ -903,7 +1039,16 @@ TTS_NODE = "tts"
 _UNCONDITIONAL_SUCCESSOR = {
     "fast_synth": TTS_NODE,
     DEEP_PATH_NODE: TTS_NODE,
-    "followup": TTS_NODE,
+    # TTS_NODE, not END (issue #92 / P9.11), unlike the child's
+    # `verify_numbers` below: this asking node is the PARENT's, and the
+    # parent's own edge out of it leads to speech. So the narration announces
+    # "turning it into speech" exactly once when a resumed follow-up
+    # continues, the same as any other node that precedes tts.
+    #
+    # `followup` itself is NO LONGER IN THIS TABLE: its edge is conditional
+    # now (followup_destination), so next_node_after resolves it by calling
+    # that function rather than by looking it up here.
+    VERIFY_ANSWER_NODE: TTS_NODE,
     # BOTH GRAPHS' TOPOLOGY, IN ONE TABLE (issue #84 / P9.5). The two names
     # below belong to the CHILD graph (clarif_eye.deep_path), not this one.
     # They are here because the narration that reads this table now sees
@@ -964,6 +1109,8 @@ def next_node_after(node_name, state):
         return dynamic_router(state)
     if node_name == "analysis":
         return _successor_or_none(analysis_destination(state))
+    if node_name == "followup":
+        return _successor_or_none(followup_destination(state))
     if node_name == TTS_NODE:
         return None
     return _successor_or_none(_UNCONDITIONAL_SUCCESSOR.get(node_name))

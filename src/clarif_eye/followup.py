@@ -19,24 +19,52 @@ scrape and no research path behind it. Folding them together would mean a
 prompt with two modes and a scraper_data parameter that is always empty
 here - more branching than either case needs.
 
-NO NUMBER-VERIFICATION BACKSTOP HERE, AND THAT IS A JUDGMENT CALL WORTH
-STATING: clarif_eye.verification.numbers_verified rejects a script whose
-numeric tokens don't trace back to the photographed text. It is not reused
-here because this node's whole job is often to READ A NUMBER BACK ("what is
-the expiry date", "what's the total") - and the check's own docstring is
-explicit that it is a loose token-equality check, not a parser. A legitimate
-answer that reformats a date it read correctly ("the nineteenth of April")
-would be rejected by it, turning a correct answer into a refusal. The prompt
-below carries the same "reproduce exactly, never invent" instruction
-ANALYSIS_PROMPT does, and the answer is drawn from text this same pipeline
-captured rather than from a web scrape.
+THE NUMBER-VERIFICATION BACKSTOP IS WIRED IN HERE AS OF ISSUE #92 / P9.11,
+and the reversal is worth stating because this docstring used to argue the
+other way. clarif_eye.verification.unverified_numbers names the numeric
+tokens in a drafted script that don't trace back to the photographed text.
+It was NOT reused here originally, for a real reason: this node's whole job
+is often to READ A NUMBER BACK ("what is the expiry date", "what's the
+total"), the check is a loose token-equality check rather than a parser, and
+a legitimate answer that reformats a date it read correctly ("19 April 2027"
+for a label printed "19/04/27") fails it. While the only available response
+to a failure was to REFUSE, wiring it in would have turned right answers
+into refusals.
 
-TRACKED AS ISSUE #92, not left as an opinion in a comment. That issue
-settles it alongside #83's ask-first mechanism, because the honest response
-to "this answer contains a number I cannot trace back" is probably to ASK
-the user to re-photograph the relevant line, which is exactly the mechanism
-#83 introduces - refusing outright, the only option available today, is the
-worse of the two. Do not wire the check in here ahead of that decision.
+WHAT CHANGED IS THE RESPONSE, NOT THE CHECK. Issue #83 built the ask-first
+mechanism: a failed check can now PAUSE the run and ask the user, who hears
+the drafted answer and decides. So a false positive costs ONE clarifying
+question instead of a wrong refusal, and that is the trade this module's
+earlier reasoning was waiting on. A follow-up is also the highest-stakes
+place this app reads a number aloud - the user asked for the expiry date,
+the total, the dosage - and a prompt instruction is not enforcement.
+
+HOW IT IS WIRED, structurally and not by speaking anything from here: this
+module writes the drafted answer and the failing tokens into
+`verification_hold`, exactly the shape and the key clarif_eye.analysis
+already uses, and clarif_eye.graph routes a held answer into its
+`verify_answer` node - which asks, and speaks nothing until the user
+answers. The draft is NOT spoken from here for the same reason analysis does
+not speak its own: resuming an interrupt re-executes the whole node it was
+raised in, so an interrupt raised after this module's brain call would buy a
+second brain call on every resume.
+
+THE HAYSTACK IS WHAT THE MODEL WAS SHOWN, AND NOTHING MORE - two decisions,
+both deliberate:
+  - `scraper_data` is passed as "" because this prompt contains no web
+    scrape (see _build_messages: ocr + scene + the question, full stop).
+    Matching the check's haystack to the prompt's own inputs is what keeps
+    the check meaningful; widening it to state this node never showed the
+    model would verify numbers against text the answer could not have come
+    from.
+  - THE USER'S QUESTION IS NOT IN THE HAYSTACK, even though the model was
+    shown it. "is it 200 mg?" is a fair question and "yes, 200 mg" is a fair
+    answer - but only if the photo says 200. Treating user-typed numbers as
+    verified would let a wrong guess launder itself into a confident-sounding
+    confirmation, read aloud to someone who cannot check it. The haystack
+    stays "what the camera saw", the same rule clarif_eye.analysis applies.
+    The cost is a question on a run where the user guessed right, which is
+    precisely the cost this issue decided was acceptable.
 
 Follows the same never-raise contract every other node module in this
 pipeline does: LadderExhaustedError, a terminal OpenRouterError, an
@@ -50,6 +78,7 @@ from clarif_eye.client import OpenRouterClient
 from clarif_eye.ladder import call_ladder
 from clarif_eye.prompting import fence_untrusted, verbosity_instruction
 from clarif_eye.speech import to_spoken_text as _to_spoken_text
+from clarif_eye.verification import unverified_numbers as _unverified_numbers
 from clarif_eye.vision import is_degraded_scene
 
 # Spoken when a question arrives on a thread that has never described a
@@ -127,7 +156,18 @@ def _degraded(message):
     # back as one. Set in the ONE helper every degrading return here goes
     # through. See clarif_eye.state.ClarifEyeState.output_degraded, and
     # clarif_eye.ui._record_turn for what reads it.
-    return {"final_output": _to_spoken_text(message), "output_degraded": True}
+    #
+    # verification_hold=None on EVERY return path (issue #92 / P9.11), the
+    # same discipline clarif_eye.analysis._degraded already applies and for
+    # the same reason: it is a plain, non-reducer state key, so a hold left
+    # over from an earlier run on this checkpointed thread would otherwise
+    # survive and route THIS answer into `verify_answer` to ask about a
+    # number nobody just heard. See state.py's ClarifEyeState.verification_hold.
+    return {
+        "final_output": _to_spoken_text(message),
+        "verification_hold": None,
+        "output_degraded": True,
+    }
 
 
 def has_described_photo(ocr_output, scene_context):
@@ -181,8 +221,10 @@ def run_followup(ocr_output, scene_context, question, client=None, deadline_exce
     OpenRouterClient is constructed lazily. A client built here (not
     injected) is closed in a `finally`; an injected client is owned by the
     caller and never closed here. Mirrors analysis.run_analysis's structure
-    exactly, minus scraper_data and the number-verification backstop (see
-    module docstring for why that one is not reused).
+    exactly, minus scraper_data - including, since issue #92 / P9.11, the
+    number-verification backstop and the `verification_hold` it writes on
+    every return path (see this module's docstring for the reversal, and for
+    which text the check's haystack is built from).
 
     `deadline_exceeded`: True means the pipeline's total budget is already
     spent (checked by clarif_eye.graph at node entry), so the brain call is
@@ -244,6 +286,29 @@ def run_followup(ocr_output, scene_context, question, client=None, deadline_exce
     if not spoken:
         return _degraded("The model returned an empty answer.")
 
+    failing_numbers = _unverified_numbers(spoken, ocr_output, scene_context, "")
+    if failing_numbers:
+        # THE SAME SHAPE clarif_eye.analysis uses when its own check fails
+        # (issue #92 / P9.11): a safe refusal in final_output, and the
+        # questioned material carried FORWARD in `verification_hold` so
+        # clarif_eye.graph's `verify_answer` node can ask the user about it
+        # without re-running the brain model.
+        #
+        # THE REFUSAL WORDING IS NOT WHAT THE USER HEARS in this app: the
+        # graph always routes a held answer into the asking node, which
+        # rewrites final_output either way. It is what a caller that does NOT
+        # wire the asking node gets - a script, a direct run_followup() call -
+        # and for those it is the right answer, because they have no way to
+        # ask. Built by _degraded, not by hand, so the sanitising and the
+        # output_degraded flag cannot drift from every other degraded return
+        # here; the hold is attached on top.
+        held = _degraded(
+            "This answer could not be checked against the text in the photo, "
+            "so it is not safe to read aloud as fact. Please ask again."
+        )
+        held["verification_hold"] = {"script": spoken, "numbers": failing_numbers}
+        return held
+
     # The one success return: a real answer to the user's question (issue
-    # #93 / P9.12).
-    return {"final_output": spoken, "output_degraded": False}
+    # #93 / P9.12), with every number in it traced back to the photo.
+    return {"final_output": spoken, "verification_hold": None, "output_degraded": False}

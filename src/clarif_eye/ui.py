@@ -246,8 +246,10 @@ UPLOADED_PHOTO_ALT = "The photo you submitted"
 # see build_interface() below. Content below is checked against the source
 # it describes, not against the
 # issue's own wording or the (older, no longer accurate) architecture doc:
-#   - graph.py: build_graph() registers exactly 6 nodes (entry, vision,
-#     fast_synth, deep_path, followup, tts). `deep_path` is a whole COMPILED
+#   - graph.py: build_graph() registers exactly 7 nodes (entry, vision,
+#     fast_synth, deep_path, followup, verify_answer, tts) - `verify_answer`
+#     added by issue #92 / P9.11, the follow-up path's own asking node.
+#     `deep_path` is a whole COMPILED
 #     CHILD GRAPH mounted as one node (issue #84 / P9.5, see
 #     clarif_eye.deep_path): research, analysis and verify_numbers are its
 #     nodes now, not the parent's. "router" is NOT one of
@@ -272,15 +274,17 @@ UPLOADED_PHOTO_ALT = "The photo you submitted"
 #   - tts.py: DEFAULT_PROVIDER_CHAIN is (EdgeTtsProvider, GttsProvider); if
 #     every provider fails, audio_file_path == "" and the UI falls back to
 #     text (see this module's "THE THREE OUTCOMES" docstring above).
-#   - verification.py (imported by analysis.py as _unverified_numbers): on
-#     the deep-analysis path only, every number-like token in the drafted
-#     script is checked against the photographed text (+ scene description
-#     + any web lookup) before it is spoken. A token that doesn't trace
-#     back now stops the run and asks the user (issue #83 / P9.4 - see
-#     graph.verify_numbers_node), rather than silently degrading to a
-#     "could not be verified" message. fast_synth.py has no equivalent
-#     check - the text below says "on the deep-analysis path", not
-#     "always", so it stays true to that asymmetry.
+#   - verification.py (imported by analysis.py and, since issue #92 / P9.11,
+#     by followup.py, both as _unverified_numbers): on the deep-analysis
+#     path and on the follow-up path, every number-like token in the drafted
+#     script is checked against the photographed text (+ scene description,
+#     + any web lookup on the deep path - the follow-up prompt has no web
+#     lookup in it, so neither does its haystack) before it is spoken. A
+#     token that doesn't trace back stops the run and asks the user (issue
+#     #83 / P9.4 - see graph.verify_numbers_node and graph.verify_answer_node),
+#     rather than silently degrading to a "could not be verified" message.
+#     fast_synth.py has no equivalent check, so the text below says which
+#     paths have one rather than claiming "always".
 #   - graph.py: DEFAULT_PIPELINE_BUDGET_SECONDS = 60.0, a total-pipeline
 #     deadline after which nodes degrade rather than block further (tts is
 #     deliberately exempt - see graph.py - so a blown deadline still ends in
@@ -347,6 +351,12 @@ code actually does with your photo.
    from the text and scene description it already read, so it does not look
    at the photo again and you do not have to take another one. That answer
    is spoken the same way the description is.
+9. An answer to your question goes through the same number check, and the
+   same two buttons, for the same reason: a question about an expiry date, a
+   total or a dose is exactly where a made-up number would do the most harm.
+   The check is a strict one, so it sometimes stops on a number the app read
+   correctly and simply wrote out differently. That is why it asks instead of
+   refusing: you still get to hear the answer.
 
 ### Inside the LangGraph pipeline
 
@@ -357,8 +367,8 @@ LangChain in this codebase). The graph state is a 10-key `TypedDict`:
 `scraper_data`, `final_output`, `audio_file_path`, `messages`, `question`,
 `verification_hold`.
 
-Six nodes are registered: `entry`, `vision`, `fast_synth`, `deep_path`,
-`followup`, and `tts`. Every run starts at
+Seven nodes are registered: `entry`, `vision`, `fast_synth`, `deep_path`,
+`followup`, `verify_answer`, and `tts`. Every run starts at
 `entry`, which does
 no work of its own: it looks at whether this run carries a photo or a typed
 question and sends the run to `vision` or to `followup` accordingly, by
@@ -378,8 +388,13 @@ the closer-look steps have no copy of your picture at all), and the same
 graph can be used on its own by something that has no photo to begin with -
 there is an API endpoint that describes a document from its text alone.
 
-`verify_numbers` is the one step that can PAUSE the whole run, and a
-conditional edge inside `deep_path` decides whether it runs at all. When `analysis` writes a
+Two steps can PAUSE the whole run: `verify_numbers` inside `deep_path`, and
+`verify_answer` on the question route. They are the same code, wired into
+two graphs under two names, and each is guarded by a conditional edge that
+decides whether it runs at all.
+
+Taking the first one:
+When `analysis` writes a
 number it cannot trace back to the photographed text, it records that fact
 in the state, and the edge out of `analysis` sends the run to
 `verify_numbers` instead of straight to the end of that inner graph. That
@@ -395,6 +410,13 @@ after the writing model means answering it never spends a second model
 call. A paused run lives in this server's memory only, so if the service
 restarts while it is waiting, the question is gone and you are asked to
 submit the photo again.
+
+`verify_answer` is the same story on the question route: `followup` checks
+the answer it drafted against the photographed text, records any number it
+cannot trace back, and the edge out of `followup` sends the run to
+`verify_answer` rather than straight to `tts`. You get the same two buttons
+and the same choice. Only the wording after "never mind" differs, because
+there your photo was never the problem - you can simply ask again.
 That routing decision is evaluated locally in Python, with no model call -
 it is a deliberate design point, not an implementation shortcut: the router
 only ever needs to read text density and keywords, so it would be wasteful
@@ -2569,7 +2591,24 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
         # The DELTA, and nothing else - see this function's docstring.
         state = {"question": question}
         result = dict(state)
-        yield from _narrate_stream(graph, state, config, result)
+        # DRAINED, not `yield from` (issue #92 / P9.11): this function has to
+        # SEE an ("interrupt", ...) event go past, exactly like
+        # _run_pipeline_events does and for the same reason. A follow-up run
+        # can now pause - `followup` holds an answer back when a number in it
+        # could not be traced to the photographed text, and `verify_answer`
+        # stops to ask about it. A paused run has produced no outcome yet:
+        # final_output currently holds followup's safe "could not be checked"
+        # refusal and there is no audio, so everything below (recording the
+        # turn, mapping an outcome) would speak a non-answer AND record it as
+        # this question's answer. It gets none of that; the run resumes, or it
+        # doesn't.
+        paused = False
+        for kind, payload in _narrate_stream(graph, state, config, result):
+            if kind == "interrupt":
+                paused = True
+            yield kind, payload
+        if paused:
+            return
     except LadderExhaustedError as exc:
         yield "outcome", _degraded_outcome(message_for_ladder_exhausted(exc))
         return
@@ -2614,7 +2653,7 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
 
 def handle_ask_staged(
     question, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUDGET_SECONDS, thread_id=None,
-    session_id=None,
+    session_id=None, pause_signal=None,
 ):
     """The follow-up sibling of handle_submit_staged (issue #82 / P9.3):
     answers a typed question and yields the SAME staged (status_text,
@@ -2634,12 +2673,22 @@ def handle_ask_staged(
     the namespace a recognised preference COMMAND is written under, and the
     namespace later runs (on this thread or another) read a stored
     preference back from.
+
+    `pause_signal` (issue #92 / P9.11) is OPTIONAL and defaults to None,
+    same shape and same purpose as handle_submit_staged's own - see
+    _PauseSignal. It exists here now because a follow-up CAN pause: an
+    answer whose numbers do not trace back to the photographed text stops to
+    ask the user, exactly as a drafted description already could. Without
+    it, build_interface would have no way to reveal the two answer buttons
+    for a question raised on this path, and a blind user would be asked
+    something with nothing on screen to answer it with.
     """
     yield from _stage_events(
         STATUS_ASKING,
         _run_followup_events(
             question, resources, pipeline_budget_seconds, thread_id=thread_id, session_id=session_id
         ),
+        pause_signal=pause_signal,
     )
 
 
@@ -3206,18 +3255,30 @@ def build_interface(resources):
 
     # The two resume buttons (issue #83 / P9.4) are hidden until a run
     # actually pauses, so nothing appears in the tab order offering a choice
-    # about a question nobody was asked. _submit is the only handler that
-    # can reveal them; _resume always hides them again, whichever way the
-    # answer went.
+    # about a question nobody was asked. _resume always hides them again,
+    # whichever way the answer went.
     #
-    # _ask does NOT touch them, and it no longer needs to: a follow-up
-    # typed while a question is pending is REFUSED before the graph is
-    # touched (see QUESTION_PENDING_MESSAGE and _run_followup_events), so
-    # the pause it would once have silently destroyed is still there and
-    # the buttons still point at something real. An earlier version of this
-    # comment claimed the follow-up left the pause alone; it did not - it
-    # superseded the pending task and left these two buttons wired to
-    # nothing. That is the bug the refusal fixes.
+    # _ask REVEALS THEM TOO, as of issue #92 / P9.11, and it did not before.
+    # A follow-up ANSWER is now held to the same number check a drafted
+    # description is, so a typed question can raise the same pause - and a
+    # question asked with no visible way to answer it would be worse than
+    # not asking, for a user who cannot see that there is nothing there.
+    # Both handlers use the same _PauseSignal mechanism and the same
+    # gr.update, so the two paths cannot drift into revealing the buttons
+    # differently.
+    #
+    # _ask ONLY EVER REVEALS THEM, NEVER HIDES THEM, and that asymmetry with
+    # _submit is load-bearing rather than an oversight. A follow-up typed
+    # while a question is ALREADY pending is REFUSED before the graph is
+    # touched (see QUESTION_PENDING_MESSAGE and _run_followup_events): no
+    # interrupt event is produced, so pause_signal stays False - and hiding
+    # the buttons on that yield would take away the only way to answer a
+    # question that is still very much pending, immediately after telling the
+    # user to activate one of them. An empty gr.update() changes no property
+    # at all (verified: it serialises to {"__type__": "update"} with no
+    # `visible` key), which is exactly "leave them as they are". _submit can
+    # safely hide, because submitting a photo RESOLVES any pending question
+    # (an implicit retake - see _run_pipeline_events' cache-hit branch).
     def _submit(image, thread_id, session_id):
         pause_signal = _PauseSignal()
         for status, audio, text in handle_submit_staged(
@@ -3232,7 +3293,13 @@ def build_interface(resources):
             yield status, audio, text, hidden, hidden
 
     def _ask(question, thread_id, session_id):
-        yield from handle_ask_staged(question, resources, thread_id=thread_id, session_id=session_id)
+        pause_signal = _PauseSignal()
+        for status, audio, text in handle_ask_staged(
+            question, resources, thread_id=thread_id, session_id=session_id,
+            pause_signal=pause_signal,
+        ):
+            reveal = gr.update(visible=True) if pause_signal.paused else gr.update()
+            yield status, audio, text, reveal, reveal
 
     # Issue #84 / P9.5. Fully type-hinted because gr.api derives the
     # endpoint's typing from the signature rather than from components -
@@ -3399,9 +3466,10 @@ def build_interface(resources):
         gr.api(_describe_document_text, api_name=DESCRIBE_TEXT_API_NAME)
 
         result_outputs = [status_output, audio_output, text_output]
-        # The two resume buttons are outputs of the photo and resume
-        # handlers only (issue #83 / P9.4) - see _submit/_resume above for
-        # why the ask handler is deliberately left out.
+        # The two resume buttons are outputs of all three handlers (issue
+        # #83 / P9.4, extended by #92 / P9.11 to the ask handler, which can
+        # now raise the same pause) - see _submit/_resume/_ask above for what
+        # each one is allowed to do with them.
         result_and_controls = result_outputs + [resume_continue_button, resume_retake_button]
 
         submit_event = submit_button.click(
@@ -3441,12 +3509,12 @@ def build_interface(resources):
             ask_button.click(
                 fn=_ask,
                 inputs=[question_input, thread_state, session_id_state],
-                outputs=result_outputs,
+                outputs=result_and_controls,
             ),
             question_input.submit(
                 fn=_ask,
                 inputs=[question_input, thread_state, session_id_state],
-                outputs=result_outputs,
+                outputs=result_and_controls,
             ),
         ):
             ask_event.then(fn=None, inputs=None, outputs=None, js=FOCUS_RESULT_JS)
