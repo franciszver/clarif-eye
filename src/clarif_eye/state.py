@@ -131,6 +131,42 @@ class ClarifEyeState(TypedDict):
     # earlier photo would otherwise survive into the next run and stop it
     # to ask about a number nobody just heard.
     verification_hold: dict | None
+    # bool (issue #93 / P9.12): True means final_output is a DEGRADATION
+    # message - "every model was busy", "the photo could not be read", "there
+    # is no photo to answer questions about yet" - rather than an answer
+    # about what was photographed. False means it is the real thing.
+    #
+    # WHY THIS HAD TO TRAVEL IN STATE, rather than being worked out at the
+    # conversation boundary where it is used (clarif_eye.ui._record_turn):
+    # only the node that degraded knows. Every degradation message here is
+    # SPOKEN - it goes through tts exactly like a description does, because a
+    # blind user must hear why they got nothing - so by the time the run
+    # reaches the boundary it has real audio and non-empty text, and looks
+    # byte-for-byte like a success. clarif_eye.ui's outcome status
+    # (STATUS_DEGRADED) describes how the RUN ended, not whether the ANSWER
+    # is honest, and reports STATUS_SUCCESS_AUDIO for both. The only other
+    # way to tell them apart from outside would be to match the failure
+    # wording, which this codebase does not do (D15) and which would break
+    # silently the first time a message was reworded.
+    #
+    # WRITTEN BY EVERY NODE THAT WRITES final_output, on every return path:
+    # clarif_eye.synth, clarif_eye.analysis and clarif_eye.followup each set
+    # it from their single `_degraded()` helper (True) and from their one
+    # success return (False), and clarif_eye.graph.verify_numbers_node sets
+    # it for the two answers it can be resumed with. A plain, non-reducer
+    # key like every other scalar here, so a True left over from an earlier
+    # failed run is REPLACED by the next run rather than surviving - and
+    # make_initial_state seeds False for the same reason it seeds
+    # question/verification_hold explicitly.
+    #
+    # DEFAULTS TO "not degraded" WHEN ABSENT at the reading end, deliberately:
+    # a follow-up run's input is only {"question": ...} (see
+    # clarif_eye.ui._run_followup_events), so nothing seeds this key on that
+    # path and the answering node is what puts it there. Absent therefore
+    # means "no node claimed a degradation", which is the honest reading and
+    # keeps a future node that forgets to set it recording turns exactly as
+    # it does today rather than silently losing them.
+    output_degraded: bool
     # See "messages: the app's first LangGraph reducer" above.
     messages: Annotated[list, _keep_last_n_messages]
 
@@ -162,6 +198,11 @@ def make_initial_state(image_data):
         # to ask about the old photo's number. See
         # ClarifEyeState.verification_hold.
         verification_hold=None,
+        # False = "nothing has degraded yet" - and, on a checkpointed thread
+        # whose previous run degraded, this explicitly RESETS that flag so
+        # the new run is judged on its own outcome. See
+        # ClarifEyeState.output_degraded.
+        output_degraded=False,
         # [] is safe to pass on every run, including a second run on an
         # already-checkpointed thread: add_messages merges an empty `right`
         # as "nothing new to append", never as "replace with []" - verified

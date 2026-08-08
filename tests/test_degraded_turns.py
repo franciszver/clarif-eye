@@ -1,9 +1,9 @@
 """A degraded run's wording must never enter conversation memory (issue #93 / P9.12).
 
-RED FIRST (original commit): every "records no turn" test in this file
-failed before clarif_eye.state grew the `output_degraded` key and
-clarif_eye.ui._record_turn learned to read it. The two failures were not
-theoretical - they were the exact two shapes the issue was filed for:
+RED FIRST (original commit): three of this file's tests failed before
+clarif_eye.state grew the `output_degraded` key and
+clarif_eye.ui._record_turn learned to read it. The failures were not
+theoretical - they were the exact shapes the issue was filed for:
 
   - a follow-up on a thread that has never described a photo answers with
     clarif_eye.followup.NO_PHOTO_YET_MESSAGE, which TTS then speaks
@@ -28,6 +28,11 @@ NO PROSE MATCHING ANYWHERE (D15): nothing here asserts that a particular
 failure sentence is absent from history. The tests assert on the number of
 recorded messages, which is what the guard actually controls.
 
+The deep-path test below came with the FIX rather than with that red
+commit, and it is honest to say why: mutation testing showed the
+parent/child half of the wiring was unpinned, so a test was added to pin
+it. Its own docstring records what the mutation actually proved.
+
 Same no-network discipline as tests/test_ui.py: real compiled graph, real
 checkpointer, real ThreadRegistry, fake client, fake TTS provider.
 """
@@ -46,6 +51,7 @@ from clarif_eye.ui import (
 )
 from clarif_eye.vision import is_degraded_scene
 
+from tests.test_ask_before_speaking import BILL_OCR, BILL_SCENE
 from tests.test_ui import BrokenImage, FakeImage
 
 QUESTION = "what is the expiry date?"
@@ -89,6 +95,46 @@ class _FailingClient:
         pass
 
 
+class _EmptyBrainClient:
+    """Vision reads a DENSE DOCUMENT (so clarif_eye.router sends the run
+    down the deep path and `analysis` is what writes final_output), and the
+    brain model then returns an empty reply - one of clarif_eye.analysis's
+    own degradation branches.
+
+    THIS IS THE ONLY WAY TO REACH THE PARENT/CHILD BOUNDARY with a degraded
+    answer: `analysis` runs inside the deep-path CHILD graph, so its flag
+    has to be declared by clarif_eye.deep_path.DeepPathState AND mapped
+    back out by clarif_eye.graph.make_deep_path_node's wrapper. LangGraph
+    drops an undeclared update key without raising, so nothing but a test
+    that runs the whole graph can catch that half of the wiring.
+    """
+
+    def complete(self, role, messages, **params):
+        has_image = any(
+            isinstance(message.get("content"), list)
+            and any(part.get("type") == "image_url" for part in message["content"])
+            for message in messages
+        )
+        if has_image:
+            return CompletionResult(
+                content=f"OCR_TEXT: {BILL_OCR}\nSCENE: {BILL_SCENE}",
+                model="fake-eyes-model:free",
+            )
+        return CompletionResult(content="   ", model="fake-brain-model:free")
+
+    def close(self):
+        pass
+
+
+class _EmptySearcher:
+    """No search results, so `research` degrades to "found nothing" without
+    opening a socket. The web lookup is not what this file is about - it is
+    just on the road to `analysis`."""
+
+    def text(self, query, **kwargs):
+        return []
+
+
 class _FakeTtsProvider:
     def synthesize(self, text, out_path):
         with open(out_path, "wb") as f:
@@ -102,7 +148,7 @@ def _resources(client):
         client=client,
         client_error=None,
         tts_providers=[_FakeTtsProvider()],
-        searcher=None,
+        searcher=_EmptySearcher(),
         research_client=None,
         thread_registry=ThreadRegistry(checkpointer),
     )
@@ -161,6 +207,32 @@ def test_a_photo_run_that_degraded_inside_the_pipeline_records_no_turn():
     assert is_degraded_scene(final_text)
 
     assert _messages(resources, thread_id) == []
+
+
+def test_a_deep_path_run_that_degraded_inside_the_child_graph_records_no_turn():
+    """THE PARENT/CHILD BOUNDARY, pinned by behaviour rather than by schema.
+
+    `analysis` degrades inside the deep-path child graph, so its flag has to
+    cross back into the parent's state before the recording boundary can see
+    it. MEASURED BY MUTATION, not assumed, and the answer was not the
+    obvious one: removing clarif_eye.deep_path.DeepPathState's declaration
+    of the key reds THIS test (the wrapper's bracket read raises KeyError,
+    which the never-raise boundary turns into a spoken failure with no
+    audio) - while removing the wrapper's write-back LINE changes nothing,
+    because clarif_eye.ui._narrate_stream streams with subgraphs=True and
+    `analysis`'s own chunk already carries the flag to the boundary. See
+    that write-back's comment, which now says so.
+    """
+    resources = _resources(_EmptyBrainClient())
+    thread_id = "degraded-deep-path"
+
+    updates = list(handle_submit_staged(FakeImage(), resources, thread_id=thread_id))
+
+    final_status, final_audio, final_text = updates[-1]
+    assert final_audio, "the failure message is spoken - this is not a TTS failure"
+    assert final_text
+    assert _messages(resources, thread_id) == []
+    assert resources.image_cache._entries == {}
 
 
 def test_a_degraded_photo_run_is_not_cached_so_no_hit_can_record_it_later():

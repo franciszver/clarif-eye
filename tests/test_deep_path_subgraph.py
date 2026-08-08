@@ -115,6 +115,9 @@ def test_child_schema_is_its_own_and_never_carries_the_photo():
         "scraper_data",
         "verification_hold",
         "final_output",
+        # issue #93 / P9.12: the child must declare this or LangGraph drops
+        # `analysis`'s degradation flag on the floor - see DeepPathState.
+        "output_degraded",
     }
     assert "image_data" not in DeepPathState.__annotations__
     # And it is genuinely a DIFFERENT schema, not a subset of the parent's:
@@ -164,7 +167,7 @@ def test_the_keys_the_wrapper_maps_back_out_exist_in_both_schemas():
     """
     from clarif_eye.deep_path import DeepPathState
 
-    mapped_back_out = {"scraper_data", "verification_hold", "final_output"}
+    mapped_back_out = {"scraper_data", "verification_hold", "final_output", "output_degraded"}
 
     for schema in (DeepPathState, ClarifEyeState):
         missing = mapped_back_out - set(schema.__annotations__)

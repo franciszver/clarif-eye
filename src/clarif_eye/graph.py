@@ -528,11 +528,28 @@ def verify_numbers_node(state):
     )
 
     if answer == RESUME_CONTINUE:
+        # output_degraded=False (issue #93 / P9.12): the caveated script IS
+        # this photo's answer - the user asked to hear it and it is what
+        # they heard - so the thread should remember it. This OVERWRITES the
+        # True `analysis` set alongside its refusal (see that module's
+        # _degraded), which is exactly the point of writing the flag on
+        # every path: the last node to speak owns it.
         return {
             "final_output": f"{UNVERIFIED_NUMBER_CAVEAT} {hold.get('script', '')}".strip(),
             "verification_hold": None,
+            "output_degraded": False,
         }
-    return {"final_output": RETAKE_CONFIRMATION, "verification_hold": None}
+    # A retake confirmation is not an answer about the photo - it is the
+    # user declining one. clarif_eye.ui._run_resume_events already declines
+    # to record anything but a RESUME_CONTINUE, so this flag changes no
+    # behaviour today; it is set because leaving the key saying "this is a
+    # real description" while final_output says "please take another photo"
+    # would be a lie waiting for the next reader of this state.
+    return {
+        "final_output": RETAKE_CONFIRMATION,
+        "verification_hold": None,
+        "output_degraded": True,
+    }
 
 
 # The name the deep path's child graph is mounted under in the parent. A
@@ -586,16 +603,32 @@ def make_deep_path_node(child):
                 "scene_description": state["scene_context"],
             }
         )
-        # MAPPED BACK OUT, all three of them, so the parent's checkpoint says
+        # MAPPED BACK OUT, all four of them, so the parent's checkpoint says
         # what it said before this extraction. They are the child's OUTPUTS
         # being translated, not shared channels: the child owns producing
         # them, and the parent never writes into them.
         #
         # HOW MUCH EACH ONE ACTUALLY DOES, measured by deleting it rather
-        # than asserted from intent - because two of these three are not
-        # equally load-bearing and pretending otherwise would mislead the
-        # next editor:
+        # than asserted from intent - because they are not equally
+        # load-bearing and pretending otherwise would mislead the next
+        # editor:
         #   - final_output: the deliverable. Everything depends on it.
+        #   - output_degraded (issue #93 / P9.12): NOT observable through any
+        #     real flow today, exactly like verification_hold below, and
+        #     measured the same way rather than assumed - deleting this line
+        #     leaves the whole suite green. The reason is worth knowing: the
+        #     consumer of this flag (clarif_eye.ui._record_turn) reads it off
+        #     the run's STREAMED updates, and clarif_eye.ui._narrate_stream
+        #     streams with subgraphs=True, so `analysis`'s own chunk carries
+        #     the flag to the boundary whether or not this wrapper maps it.
+        #     It is kept because the parent's CHECKPOINT would otherwise say
+        #     output_degraded=False on a thread whose last spoken output was
+        #     a failure message - a stored lie waiting for the first
+        #     consumer to read this key from state rather than from a live
+        #     run. What IS load-bearing and IS pinned is the CHILD-side
+        #     declaration (clarif_eye.deep_path.DeepPathState): undeclare it
+        #     and the bracket read below raises KeyError, which
+        #     tests/test_degraded_turns.py's deep-path test catches.
         #   - scraper_data: genuinely observable. Without it the parent stays
         #     at make_initial_state's None ("research never ran") after a run
         #     in which research demonstrably did. Pinned by
@@ -619,17 +652,20 @@ def make_deep_path_node(child):
         #     no behaviour changed - but it is a real difference and is
         #     recorded here rather than left to be rediscovered.
         #
-        # BRACKET ACCESS, NOT .get(), ON PURPOSE - LOUD BEATS SILENT. All three
+        # BRACKET ACCESS, NOT .get(), ON PURPOSE - LOUD BEATS SILENT. All four
         # keys are written by the child on every path it can finish through
         # (`research` writes scraper_data in every branch including its
-        # degradations; `analysis` writes verification_hold in every return,
-        # None when there is nothing held; `verify_numbers` rewrites both), so
+        # degradations; `analysis` writes verification_hold AND
+        # output_degraded in every return, None/True-or-False as the case
+        # may be; `verify_numbers` rewrites all three of those), so
         # a missing one means the child's contract changed and this wrapper
         # was not updated with it. A KeyError says that immediately; a .get()
         # would quietly write None over a real value and nobody would find out
-        # until a user was told the wrong thing. It cannot reach Gradio as a
-        # traceback either - clarif_eye.ui._run_pipeline_events catches it and
-        # speaks a message, per this pipeline's never-raise contract.
+        # until a user was told the wrong thing (or, for output_degraded,
+        # until a failure message was replayed as a description). It cannot
+        # reach Gradio as a traceback either - clarif_eye.ui._run_pipeline_events
+        # catches it and speaks a message, per this pipeline's never-raise
+        # contract.
         #
         # THE OTHER HALF OF THIS BOUNDARY CANNOT BE CHECKED FROM HERE, and
         # that is why a test pins it instead. LangGraph SILENTLY DROPS an
@@ -644,6 +680,7 @@ def make_deep_path_node(child):
             "final_output": result["final_output"],
             "scraper_data": result["scraper_data"],
             "verification_hold": result["verification_hold"],
+            "output_degraded": result["output_degraded"],
         }
 
     return deep_path_node

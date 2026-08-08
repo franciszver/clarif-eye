@@ -1858,8 +1858,9 @@ def _update_thread_state(graph, config, thread_id, update, as_node=None):
         pass
 
 
-def _record_turn(graph, config, thread_id, messages):
-    """Record `messages` against `thread_id` at the conversation boundary.
+def _record_turn(graph, config, thread_id, messages, degraded):
+    """Record `messages` against `thread_id` at the conversation boundary -
+    unless the run DEGRADED, in which case nothing is recorded.
 
     Called only after a run has fully COMPLETED and produced something worth
     remembering - see _run_pipeline_events's "CONVERSATION-BOUNDARY
@@ -1867,11 +1868,58 @@ def _record_turn(graph, config, thread_id, messages):
     clarif_eye.graph.tts_node's docstring for why this lives at the boundary
     rather than inside a node.
 
-    KNOWN GAP, TRACKED AS ISSUE #93: a DEGRADED run's message ("every model
-    was busy", "the photo could not be read") is recorded here exactly like
-    a real description, so it becomes part of the thread's history a later
-    turn reads back. Deliberately not changed in this PR.
+    `degraded` IS THE ANSWER TO ISSUE #93 / P9.12, and it comes from state:
+    clarif_eye.state.ClarifEyeState.output_degraded, written by whichever
+    node produced final_output. Read that key's comment for why the signal
+    could not be derived here. In short: every failure in this pipeline is
+    SPOKEN, so a degraded run arrives at this boundary with real audio and
+    real text and is indistinguishable from a success by anything except
+    the wording - and matching the wording is exactly what this codebase
+    does not do (D15).
+
+    SKIPPED, NOT MARKED - the decision, and why, since the alternative was
+    real. Marking (an additional_kwargs flag on the recorded message, or a
+    parallel list) would keep the history complete and let a reader decide
+    what to do with a failed turn. It was rejected because it is FAIL-OPEN:
+    every future consumer - #92's verification rework, the ask-before-
+    speaking flows, anything that builds a model prompt out of `messages` -
+    would have to remember to filter, and the one that forgets reads "every
+    model was busy" back to a blind user as if it were what their photo
+    said. Skipping is FAIL-SAFE: a message that was never written cannot be
+    replayed by a consumer that has not been written yet. It also matches
+    every precedent already in this module - a paused run records nothing, a
+    retake records nothing, a failed run is not cached (issue #75's "a
+    failure must never be replayed as that photo's answer"). What is lost is
+    real and worth naming: the thread forgets that a degraded turn happened
+    at all. That is acceptable because history exists to GROUND later
+    answers, and a failure grounds nothing - the user heard it live, which
+    is where it mattered.
+
+    BOTH SIDES OF A FOLLOW-UP GO OR STAY TOGETHER, which is why this takes
+    the whole `messages` list rather than filtering it. Recording the user's
+    question alone would leave a question in history with no answer beneath
+    it and the NEXT run's real answer sitting directly under it - a reader
+    pairing them off would attach the wrong answer to it. The user did
+    genuinely ask, but a turn that produced no answer is better left out
+    whole than left half-written.
+
+    THE TRIM STILL RUNS on a skipped turn: a degraded run still created
+    checkpoints, and bounding this thread's checkpoint history is
+    housekeeping that has nothing to do with what was said (see
+    _trim_thread_to_latest_checkpoint's measured defect). Same call
+    _run_resume_events's retake branch already makes for the same reason.
+
+    THE RESIDUAL GAP, NAMED HONESTLY: this flag says "the node that wrote
+    final_output degraded". It does NOT catch a run that answered well from
+    partly-degraded inputs - e.g. research came back empty and `analysis`
+    still wrote a good description from ocr + scene alone. That is recorded,
+    and deliberately so: it IS a real description of the photo. The line
+    drawn here is "was the spoken text an answer, or an explanation of why
+    there is none", not "was every step of the pipeline healthy".
     """
+    if degraded:
+        _trim_thread_to_latest_checkpoint(getattr(graph, "checkpointer", None), thread_id)
+        return
     _update_thread_state(graph, config, thread_id, {"messages": messages})
 
 
@@ -2028,9 +2076,17 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
     measured defect this closes). Neither happens on a cache hit (nothing
     ran) or an early/exception failure (no final_output was produced) -
     same "no bleed of a bad run into cached/replayed state" discipline the
-    image cache above already follows. Wrapped in try/except - see the
-    call site's own comment for why a recording failure must never cost
-    the user the answer that was already computed.
+    image cache above already follows. NOR ON A RUN THAT DEGRADED INSIDE
+    THE PIPELINE (issue #93 / P9.12): that run COMPLETED and produced real
+    spoken audio, but its text explains why there is no description rather
+    than being one, so _record_turn skips it (the trim still runs) and the
+    image cache is not written either - see _record_turn's docstring for the
+    skip-not-mark decision, and clarif_eye.state.ClarifEyeState.output_degraded
+    for where the signal comes from.
+
+    Wrapped in try/except - see the call site's own comment for why a
+    recording failure must never cost the user the answer that was already
+    computed.
 
     ACCUMULATION IS BEST-EFFORT UNDER CONCURRENT SUBMITS ON ONE
     thread_id: two overlapping requests on the SAME thread_id (e.g. a
@@ -2097,11 +2153,15 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
             # and quietly gets the wrong one (#83's ask-first flows are the
             # obvious candidate). "" is the loud answer: not available.
             #
-            # THE DESCRIPTION IS RECORDED AS A TURN in the same write. Only
-            # real, successful, audio-bearing outcomes are ever cached (see
-            # ImageResultCache and the put site below - failures and
-            # text-only degradations are deliberately not), so cached_text
-            # is exactly what the user just heard, and a thread carrying
+            # THE DESCRIPTION IS RECORDED AS A TURN in the same write, and
+            # it needs no degradation check of its own (issue #93 / P9.12):
+            # only real, successful, audio-bearing, NON-DEGRADED outcomes are
+            # ever cached (see ImageResultCache and the put site below -
+            # failures, text-only degradations and, since #93, any run whose
+            # node degraded are deliberately not), so cached_text is exactly
+            # what the user just heard AND a genuine description. That is the
+            # invariant this branch depends on: a hit has no state left to
+            # read a flag from, only this entry. A thread carrying
             # ocr/scene with an empty history would be inconsistent for the
             # consumers reading that history (#93, #83, #84). One combined
             # update, not two: `messages` goes through state.py's reducer
@@ -2242,8 +2302,17 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
     # any future graph/thread_registry combination this module hasn't
     # anticipated degrades to "the turn wasn't recorded" instead of "the
     # user got no answer at all".
+    # `degraded` (issue #93 / P9.12) comes from the RUN's own merged state,
+    # written by whichever node produced final_output - see
+    # clarif_eye.state.ClarifEyeState.output_degraded and _record_turn.
+    # .get() with a falsy default, not bracket access: a run that somehow
+    # reached here without any node claiming a degradation records exactly
+    # as it did before this flag existed.
+    degraded = bool(result.get("output_degraded"))
     if thread_id is not None and final_output:
-        _record_turn(graph, config, thread_id, [{"role": "assistant", "content": final_output}])
+        _record_turn(
+            graph, config, thread_id, [{"role": "assistant", "content": final_output}], degraded
+        )
 
     outcome = _outcome_for(final_output, audio_path)
 
@@ -2262,7 +2331,22 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
     # later hit can put them back on the hitting caller's thread - see
     # ImageResultCache's docstring for the two ways a hit used to leave the
     # thread describing a different photo than the user had just heard about.
-    if audio_path:
+    #
+    # NOR IS A DEGRADED ONE (issue #93 / P9.12) - and this closes a real
+    # hole, not a hypothetical one. Every failure inside the pipeline is
+    # SPOKEN, so a photo whose vision call failed still reaches here with a
+    # working audio path and was, until now, cached: "the photo could not be
+    # read" was stored as that image's result and replayed to the next
+    # visitor, which is precisely what this cache's own docstring says never
+    # happens ("only successful results are ever stored here"). It also fed
+    # back into conversation memory - the cache-hit branch above records the
+    # cached text as the hitting thread's turn, and that branch has no node
+    # left to ask, only this entry. Keeping the degraded result out of the
+    # cache is what keeps that branch honest without smuggling the flag
+    # through the cache entry. The cost is a repeat of a failed photo paying
+    # its quota again, which is the right trade: the failure may well have
+    # been transient, and replaying it forever cannot be.
+    if audio_path and not degraded:
         resources.image_cache.put(
             cache_key,
             (audio_path, outcome[1], result.get("ocr_output") or "", result.get("scene_context") or ""),
@@ -2486,6 +2570,15 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
     # photograph, not text, and the base64 JPEG is already in the checkpoint
     # under image_data). Here the user's side IS text and is the thing that
     # makes the assistant's answer make sense when read back.
+    #
+    # AND BOTH SIDES GO OR STAY TOGETHER when the answer degraded (issue #93
+    # / P9.12): the pair is handed to _record_turn whole and it decides - see
+    # its docstring for why a question recorded without its answer is worse
+    # than no record at all. This is THE path the issue was filed from: a
+    # question typed before any photo is answered with
+    # clarif_eye.followup.NO_PHOTO_YET_MESSAGE, which is spoken perfectly
+    # normally and used to be written into history as this thread's answer.
+    degraded = bool(result.get("output_degraded"))
     if thread_id is not None and final_output:
         _record_turn(
             graph,
@@ -2495,6 +2588,7 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
                 {"role": "user", "content": question},
                 {"role": "assistant", "content": final_output},
             ],
+            degraded,
         )
 
     yield "outcome", _outcome_for(final_output, audio_path)
@@ -2702,14 +2796,17 @@ def _run_resume_events(answer, resources, pipeline_budget_seconds, thread_id=Non
     comes first, and the answer is a spoken explanation - see
     NOTHING_TO_RESUME_MESSAGE, which covers both situations honestly.
 
-    RECORDING (issue #93's neighbourhood): only a RESUME_CONTINUE that
-    produced something spoken records a turn. The caveated script IS this
-    photo's honest answer, so the thread should remember it. A retake is
-    NOT an answer about the photo - it is the user declining one - so
-    recording it would put "please take a new photo" into the history a
-    later follow-up reads back as if it described the document. Issue #93
-    owns the wider question of which degraded outcomes belong in that
-    history at all; this function deliberately does not settle it.
+    RECORDING: only a RESUME_CONTINUE that produced something spoken records
+    a turn. The caveated script IS this photo's honest answer, so the thread
+    should remember it. A retake is NOT an answer about the photo - it is the
+    user declining one - so recording it would put "please take a new photo"
+    into the history a later follow-up reads back as if it described the
+    document. Issue #93 / P9.12 has since settled the wider question this
+    branch was an early instance of: no degraded outcome enters conversation
+    memory on ANY path, decided from state rather than per call site - see
+    _record_turn and clarif_eye.state.ClarifEyeState.output_degraded. The
+    answer-specific check below stays as well, because "the user declined"
+    is a fact only this function knows.
 
     THE IMAGE CACHE IS NEVER WRITTEN HERE, even on a fully-spoken continue.
     Caching is keyed on image CONTENT and this function never sees the
@@ -2754,7 +2851,18 @@ def _run_resume_events(answer, resources, pipeline_budget_seconds, thread_id=Non
     audio_path = result.get("audio_file_path") or ""
 
     if answer == RESUME_CONTINUE and final_output:
-        _record_turn(graph, config, thread_id, [{"role": "assistant", "content": final_output}])
+        # The caveated script IS this photo's answer, so
+        # clarif_eye.graph.verify_numbers_node writes output_degraded=False
+        # on the continue branch and this records (issue #93 / P9.12). The
+        # flag is passed through rather than hard-coded False so that if a
+        # future resume path can degrade, it degrades here too.
+        _record_turn(
+            graph,
+            config,
+            thread_id,
+            [{"role": "assistant", "content": final_output}],
+            bool(result.get("output_degraded")),
+        )
     else:
         # No turn to record, but the run DID complete, so this thread's
         # checkpoint history still wants bounding - see

@@ -132,8 +132,18 @@ class DeepPathState(TypedDict):
     # clarif_eye.state.ClarifEyeState.verification_hold - same shape, same
     # meaning, now owned by the graph that actually produces and consumes it.
     verification_hold: dict | None
-    # OUTPUT: the spoken script. The one key the wrapper maps back out.
+    # OUTPUT: the spoken script.
     final_output: str
+    # OUTPUT (issue #93 / P9.12): whether `final_output` is a degradation
+    # message rather than a description. DECLARED HERE OR IT VANISHES:
+    # LangGraph silently drops an update key the target schema does not
+    # declare (see clarif_eye.graph.make_deep_path_node's write-back
+    # comment), so without this line `analysis` would set the flag, the
+    # child would discard it, and a degraded deep-path run would be
+    # remembered as a real description again. Same name as the parent's -
+    # see clarif_eye.state.ClarifEyeState.output_degraded, and this module's
+    # docstring for why only the two INPUT keys are renamed.
+    output_degraded: bool
 
 
 def build_deep_path_graph():
