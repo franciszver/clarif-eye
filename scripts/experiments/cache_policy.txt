@@ -1,0 +1,71 @@
+python scripts/experiment_cache_policy.py
+========================================================================
+EXPERIMENT: cache_policy/compile(cache=...) vs ImageResultCache/
+DocumentTextCache
+========================================================================
+
+--- Scenario 1: repeat input is served from cache, not re-run ---
+node invocations for [x=1, x=1, x=2]: 2 (calls=[1, 2])
+results: [{'x': 1, 'result': 'computed-1'}, {'x': 1, 'result': 'computed-1'}, {'x': 2, 'result': 'computed-2'}]
+OBSERVATION: the second x=1 call did not re-invoke the node - a
+cache hit, same shape as ImageResultCache short-circuiting a
+repeat photo. The key is the pickled node INPUT by default
+(langgraph.types.default_cache_key), which is content-keyed the
+same way ImageResultCache hashes image bytes - a reasonable match
+here.
+
+--- Scenario 2: DECISIVE - is a FAILED run cached and replayed? ---
+node_invocations: 1
+first_call_raised: RuntimeError: simulated model-call failure
+second_call_raised: None
+second_call_result: {'x': 999}
+stream_chunks_on_replay: []
+
+OBSERVATION: node_invocations == 1 means the node was called
+exactly ONCE across two graph.invoke({'x': 999}) calls that both
+should fail. The FIRST call raised RuntimeError, as expected. The
+SECOND call, hitting the cache, did NOT raise, did NOT re-run the
+node, and returned the state with no 'result' key added - not an
+error, not a value, nothing indicating anything went wrong. The
+streaming surface confirms this is not just an invoke() quirk:
+stream_mode='updates' on the replay produced ZERO chunks - total
+silence downstream, exactly what a blind user must never get.
+This means cache_policy's DEFAULT behaviour is the opposite of
+ImageResultCache's explicit rule: it caches failures and replays
+them as if the node had quietly done nothing.
+
+========================================================================
+COMPARISON
+========================================================================
+cache_policy:  content-keyed via pickling the node's input (matches
+               ImageResultCache's content-hash approach) but admits
+               BOTH successful and FAILED runs into the cache with no
+               opt-out - Scenario 2 shows a failure is cached and its
+               replay is silent (no exception, no result, no stream
+               chunk). There is no ttl-based invalidation tied to
+               anything except wall-clock time (CachePolicy.ttl), and
+               no equivalent of a stale-file guard (this app's audio
+               cache entries can outlive their mp3 on disk; a bare
+               InMemoryCache has no notion of an external resource
+               going stale at all).
+
+our caches:    ImageResultCache/DocumentTextCache (ui.py) only ever
+               .put() on a verified SUCCESS path (see handle_submit) -
+               a quota/API failure is never written to either cache, so
+               it can never be replayed to a later request. Bounded LRU
+               eviction (IMAGE_CACHE_MAX_ENTRIES/DOCUMENT_CACHE_MAX_
+               ENTRIES), never persisted to disk, and ImageResultCache
+               carries a stale-file guard so a cache hit whose mp3 was
+               pruned from disk is treated as a miss, not a lying hit.
+
+VERDICT: KEEP OURS
+DECISIVE REASON: Scenario 2 is a product-safety regression, not a
+style difference. cache_policy's default behaviour caches a failed
+model call and replays it on the next identical submission as total
+silence - no exception, no degraded message, no audio, nothing a
+blind user could act on. ImageResultCache's entire reason for
+existing (issue #75) is the opposite guarantee: never cache a
+failure. Adopting cache_policy as-is would need a custom cache_policy
+or a wrapper that inspects outcomes before admitting them - at which
+point it is no longer buying anything over the explicit, already-
+correct hand-rolled cache.

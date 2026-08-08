@@ -18,6 +18,7 @@ DOCS_TO_CHECK = [
     REPO_ROOT / "README.md",
     REPO_ROOT / "docs" / "ACCESSIBILITY.md",
     REPO_ROOT / "docs" / "SCENARIOS.md",
+    REPO_ROOT / "docs" / "NODE-POLICIES.md",
     REPO_ROOT / "CONTRIBUTING.md",
 ]
 

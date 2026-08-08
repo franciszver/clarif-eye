@@ -1,0 +1,66 @@
+python scripts/experiment_error_handler.py
+========================================================================
+EXPERIMENT: error_handler vs the per-node run_* degradation contract
+========================================================================
+
+--- Scenario 1: error_handler fires on a raised exception ---
+result: {'x': 1, 'result': 'degraded: n raised RuntimeError'}
+OBSERVATION: error_handler catches the raised exception and lets
+the node still produce a state update - the basic capability works.
+
+--- Scenario 2: error_handler can distinguish exception types ---
+transient-shaped failure degrades to: {'x': 1, 'result': 'degraded: ConnectionError'}
+caller-bug-shaped failure re-raised as: ValueError: caller bug - malformed-request-shaped failure
+OBSERVATION: error_handler CAN replicate vision.run_vision's real
+branching (LadderExhaustedError/OpenRouterError degrade, an
+unexpected caller bug does not have to be swallowed) - a handler
+can isinstance-check error.error and choose to re-raise.
+
+--- Scenario 3: DECISIVE - does error_handler see a non-raising degradation? ---
+result: {'x': 2, 'result': 'degraded: malformed reply (no exception raised)'}
+handler invocations: 0
+OBSERVATION: run_vision's 'malformed/empty reply' and 'unparseable
+reply' cases are plain early RETURNS, not exceptions (see
+vision.py: 'if parsed is None: return _degraded(...)'). This
+scenario reproduces that shape and error_handler was invoked ZERO
+times - it only sees exceptions a node RAISES, so it covers a
+strict subset of what every run_* function already degrades from.
+
+========================================================================
+COMPARISON
+========================================================================
+error_handler: fires only on a RAISED exception from the node body,
+               receives (state, NodeError(node, error)), and its return
+               value merges into state like a normal node update (or it
+               can re-raise to let the failure propagate). Covers
+               exceptions; does not see a node's own early-return
+               degradation, so adopting it as THE degradation mechanism
+               would mean rewriting every non-raising degradation path
+               (malformed reply, unparseable reply, empty content, ...)
+               in vision.py/synth.py/analysis.py/research.py to raise
+               instead of return - inverting an already-working,
+               already-tested control-flow style for no new capability.
+
+run_* contract: EVERY run_* function's OWN module docstring states the
+               rule directly: 'must NEVER let a raw exception escape
+               into the graph'. Each function catches its own
+               exceptions (LadderExhaustedError, OpenRouterError,
+               bare Exception) AND its own non-exceptional failure
+               modes (empty/malformed/unparseable replies) in ONE
+               place, with domain-specific spoken messages
+               (message_for_ladder_exhausted, message_for_terminal_
+               error, DEGRADED_* constants) - the node function
+               (vision_node etc.) stays a thin adapter with nothing to
+               configure.
+
+VERDICT: KEEP OURS
+DECISIVE REASON: error_handler can express the exception-type
+distinctions this codebase already makes (Scenario 2), but it is not a
+superset of what run_* modules degrade from - Scenario 3 shows it is
+blind to the non-raising degradation paths (malformed/empty/
+unparseable replies) that make up a large share of each module's real
+failure handling. Using it would mean either leaving those paths
+uncovered by the new mechanism (two degradation systems doing the same
+job) or rewriting working, tested control flow to raise instead of
+return, purely to fit a policy that does not cover more ground than
+what already exists.

@@ -1,0 +1,61 @@
+python scripts/experiment_timeout.py
+========================================================================
+EXPERIMENT: per-node timeout= vs the whole-pipeline deadline
+========================================================================
+
+--- Probe 1: add_node(timeout=...) on a SYNC node (this app's shape) ---
+raised at compile() time: ValueError: Node timeouts are only supported for async nodes because sync Python execution cannot be safely cancelled in-process. Node 'slow' is sync.
+OBSERVATION: every node in this app's graph (vision_node,
+analysis_node, fast_synth_node, followup_node, tts_node, ...)
+is a plain synchronous function called via graph.invoke() /
+graph.stream() - this codebase never calls .ainvoke()/.astream().
+langgraph's timeout= relies on asyncio cancellation and simply
+REFUSES TO COMPILE a graph with timeout= on a sync node.
+
+--- Probe 2: add_node(timeout=...) on an ASYNC node (confirms it works) ---
+outcome: NodeTimeoutError: Node 'slow' exceeded its run timeout of 0.100s (elapsed: 0.110s).
+elapsed: 0.110s (timeout was set to 0.1s, sleep was 1.0s)
+OBSERVATION: with an async node, timeout= does fire at the stated
+deadline and raises langgraph.errors.NodeTimeoutError. The policy
+itself works - the app's synchronous node style is what blocks it.
+
+========================================================================
+COMPARISON
+========================================================================
+timeout=:      a HARD per-attempt wall-clock cap on ONE node, enforced
+               via asyncio cancellation. Requires every timed node to be
+               an async function; a sync node with timeout= set fails at
+               compile() time, before any run ever starts. Firing raises
+               NodeTimeoutError - the node's partial work is discarded,
+               there is no built-in 'degrade from what is known so far'
+               path, only whatever an error_handler or graph-level except
+               chooses to do with the exception.
+
+our mechanism: TWO layers, deliberately different scopes (see graph.py's
+               top-level docstring):
+                 1. client.ROLE_TIMEOUTS - a TOTAL budget per ROLE (eyes
+                    30s, brain 45s) spent across however many ladder
+                    rungs are tried, not per HTTP call.
+                 2. graph.py's config['configurable']['deadline'] - an
+                    ABSOLUTE time.monotonic() deadline for the WHOLE
+                    pipeline run, read by _deadline_exceeded() inside each
+                    model-calling node, which then asks its module's
+                    run_* function to DEGRADE FROM KNOWN STATE (return a
+                    spoken-ready partial result) instead of raising.
+               tts_node reads neither: it is deliberately never gated, by
+               product rule, because skipping it turns a degraded answer
+               into a silent one for a blind user.
+
+VERDICT: KEEP OURS
+DECISIVE REASON: Probe 1 shows timeout= cannot even be applied to this
+app's synchronous nodes without rewriting every run_* call chain as
+async - not a config change but an architecture change. Even ignoring
+that, the scope is wrong: timeout= caps one node's one attempt, while the
+actual problem this app solved (issue #17/P6.1) was an unbounded TAIL
+across the whole run (vision + brain + research + tts), which per-node
+caps do not bound - the sum of several under-budget nodes can still blow
+the pipeline deadline. And a node timing out raises by default, which is
+the wrong failure mode here: every model-calling node must degrade to a
+spoken-ready partial result, never raise past the UI boundary, and tts
+must never be gated at all - a rule a per-node timeout has no way to
+express short of exempting tts from the very policy being adopted.
