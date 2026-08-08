@@ -168,10 +168,16 @@ def test_the_keys_the_wrapper_maps_back_out_exist_in_both_schemas():
     covers the half that cannot be made loud from inside the wrapper.
     """
     from clarif_eye.deep_path import DeepPathState
+    from clarif_eye.graph import PhotoState
 
     mapped_back_out = {"scraper_data", "verification_hold", "final_output", "output_degraded"}
 
-    for schema in (DeepPathState, ClarifEyeState):
+    # PhotoState, not ClarifEyeState, since issue #110 / P10.2: the wrapper
+    # writes onto the graph that MOUNTS it, and the deep path is mounted in
+    # the per-photo graph now. Checking the parent's schema would have been
+    # checking a boundary this wrapper no longer crosses - the exact silent
+    # mismatch this test exists to catch, pointed at the wrong pair.
+    for schema in (DeepPathState, PhotoState):
         missing = mapped_back_out - set(schema.__annotations__)
         assert not missing, (
             f"{schema.__name__} no longer declares {sorted(missing)}, which "

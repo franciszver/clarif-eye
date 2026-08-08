@@ -105,26 +105,31 @@ def _photo_entry(image):
 
 
 class ClarifEyeState(TypedDict):
+    # TWO KEYS LEFT THIS SCHEMA IN ISSUE #110 / P10.2, and are named here
+    # rather than silently absent, because both had a long comment justifying
+    # their presence and their disappearance is a real change:
+    #
+    #   - complexity_flag: which path ONE photo takes. dynamic_router reads
+    #     it, and that conditional edge now lives inside the per-photo child
+    #     graph, so the key lives in clarif_eye.graph.PhotoState. It never
+    #     meant anything at turn level even before the fan-out, and a turn of
+    #     several photos has no single value for it - one photo can be a
+    #     dense bill while the next is a doorway.
+    #   - scraper_data: what the web lookup found for ONE photo, with the
+    #     None/"" distinction ("never ran" vs "ran, found nothing") issue #81
+    #     introduced. That distinction is intact and still documented, in
+    #     clarif_eye.deep_path.DeepPathState where research and analysis
+    #     actually produce and consume it.
+    #
+    # Nothing at parent level read either one: no parent node writes them,
+    # and next_node_after's dynamic_router call is made against the merged
+    # STREAM, where vision's own chunk has just supplied complexity_flag.
+    # Declaring them here would leave two channels that no node in this graph
+    # can fill - permanently at their initial values, which is worse than
+    # absent because a future reader would trust them.
     image_data: str
     ocr_output: str
     scene_context: str
-    complexity_flag: bool
-    # str | None (issue #81 / P9.2 - see this key's history below):
-    #   None -> research never ran (fast path).
-    #   ""   -> research ran and found nothing usable.
-    # Previously both cases collapsed to "" with no way to tell them apart
-    # (see git history / issue #10's module docstring in research.py for
-    # why that was a deliberate, reasoned choice at the time - analysis.py
-    # never needed to distinguish them, and still doesn't; see
-    # analysis.run_analysis, which treats both None and "" as falsy and
-    # proceeds identically either way). This is the explicit sentinel this
-    # issue's schema-change moment introduces: make_initial_state seeds
-    # None (never ran); research.run_research still returns "" in every one
-    # of its own degrade-to-nothing branches (ran, found nothing) - that
-    # module's own behavior is UNCHANGED, only the value it starts from
-    # before it ever runs is now distinguishable from the value it produces
-    # when it runs and comes up empty.
-    scraper_data: str | None
     final_output: str
     audio_file_path: str
     # str | None (issue #82 / P9.3): the typed follow-up question for THIS
@@ -293,9 +298,6 @@ def make_initial_state_for_photos(images):
         image_data=photos[0]["image_data"],
         ocr_output="",
         scene_context="",
-        complexity_flag=False,
-        # None = "research never ran yet" - see ClarifEyeState.scraper_data.
-        scraper_data=None,
         final_output="",
         audio_file_path="",
         # None = "this is a photo run, not a question" - and, on a thread

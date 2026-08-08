@@ -420,7 +420,12 @@ def test_full_compiled_graph_runs_end_to_end_on_fast_path_with_fake_client():
         config={"configurable": {"client": client, "tts_provider": _FakeTtsProvider()}},
     )
 
-    assert result["complexity_flag"] is False
+    # complexity_flag and scraper_data left ClarifEyeState in issue #110 /
+    # P10.2 - see that schema's own comment. They are PER-PHOTO values
+    # (which path one photo takes; what the lookup found for one photo) and
+    # a turn of several photos has no single value for either, so they live
+    # in clarif_eye.graph.PhotoState and clarif_eye.deep_path.DeepPathState
+    # where the nodes that produce them actually run.
     assert_tts_safe(result["final_output"])
     assert result["audio_file_path"] != ""
 

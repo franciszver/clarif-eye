@@ -116,12 +116,10 @@ def test_make_initial_state_has_every_key_with_correct_types():
     assert state["image_data"] == "base64imagedata"
     assert state["ocr_output"] == ""
     assert state["scene_context"] == ""
-    assert state["complexity_flag"] is False
-    # None, not "" - issue #81 / P9.2's explicit sentinel: None means
-    # "research never ran yet" (this key), distinct from "" (research ran
-    # and found nothing usable) - see state.py's ClarifEyeState.scraper_data
-    # comment.
-    assert state["scraper_data"] is None
+    # `scraper_data`'s None/"" sentinel (issue #81 / P9.2's "research never
+    # ran" vs "ran and found nothing") is asserted in
+    # tests/test_research.py now, against the per-photo graph it moved into
+    # with issue #110 / P10.2 - see the expected-key set below.
     assert state["final_output"] == ""
     assert state["audio_file_path"] == ""
     assert state["messages"] == []
@@ -140,8 +138,6 @@ def test_make_initial_state_has_every_key_with_correct_types():
         "image_data",
         "ocr_output",
         "scene_context",
-        "complexity_flag",
-        "scraper_data",
         "final_output",
         "audio_file_path",
         "messages",
@@ -163,8 +159,6 @@ def test_state_typeddict_has_exactly_the_expected_keys():
         "image_data",
         "ocr_output",
         "scene_context",
-        "complexity_flag",
-        "scraper_data",
         "final_output",
         "audio_file_path",
         "messages",
@@ -381,7 +375,7 @@ def test_compiled_graph_runs_end_to_end_and_returns_every_state_key():
         assert key in result
 
 
-def test_fast_path_populates_every_key_it_touches_scraper_data_stays_empty():
+def test_fast_path_populates_every_key_it_touches():
     graph = build_graph()
     state = make_initial_state("base64imagedata")
     client = FakeVisionClient(_reply("some text", "a room"))
@@ -392,13 +386,21 @@ def test_fast_path_populates_every_key_it_touches_scraper_data_stays_empty():
     assert result["scene_context"] != ""
     assert result["final_output"] != ""
     assert result["audio_file_path"] != ""
-    assert result["complexity_flag"] is False
-    # Fast path never runs research_node, so scraper_data legitimately
-    # stays at its make_initial_state default - present, but not
-    # populated. That default is None (issue #81 / P9.2), not "": None
-    # means "research never ran", distinct from research.run_research's
-    # own "" ("ran, found nothing") - see state.py.
-    assert result["scraper_data"] is None
+    # complexity_flag and scraper_data left ClarifEyeState in issue #110 /
+    # P10.2 - see that schema's own comment. They are PER-PHOTO values
+    # (which path one photo takes; what the lookup found for one photo) and
+    # a turn of several photos has no single value for either, so they live
+    # in clarif_eye.graph.PhotoState and clarif_eye.deep_path.DeepPathState
+    # where the nodes that produce them actually run.
+    # `scraper_data` used to be asserted None here ("the fast path never
+    # ran research"). The same claim is now made where the key lives - see
+    # tests/test_research.py's never-ran/found-nothing test, which drives
+    # the per-photo graph's fast path for it - and the route itself is
+    # already pinned by the trace test below. Both keys still show up in
+    # `result` here, and correctly so: this helper merges the SUBGRAPH
+    # chunks too, so it sees the per-photo values as the child produces
+    # them. What they are absent from is the parent's SCHEMA, which the
+    # expected-key test above is what pins.
 
 
 # --- Fast path: complexity_flag False -----------------------------------
