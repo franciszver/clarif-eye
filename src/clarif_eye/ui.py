@@ -1790,13 +1790,26 @@ class AppResources:
 def build_resources():
     """Construct every injectable ONCE for the life of the process.
 
-    Never raises: a missing OPENROUTER_API_KEY (the likely state of a
-    fresh Hugging Face Space with no secret set yet) must not crash the
-    app at import/startup time - it degrades to client=None plus a spoken
-    message, checked by handle_submit before the graph is ever invoked.
-    The research searcher/client are best-effort shared instances too (see
-    module docstring); if either fails to construct, they're left None and
-    research_node falls back to its own lazy per-call defaults.
+    Never raises IN THE DEFAULT DEPLOYMENT (CLARIFEYE_CHECKPOINT_DB unset,
+    the case every existing caller and the live app hit today): a missing
+    OPENROUTER_API_KEY (the likely state of a fresh Hugging Face Space with
+    no secret set yet) must not crash the app at import/startup time - it
+    degrades to client=None plus a spoken message, checked by handle_submit
+    before the graph is ever invoked. The research searcher/client are
+    best-effort shared instances too (see module docstring); if either
+    fails to construct, they're left None and research_node falls back to
+    its own lazy per-call defaults.
+
+    THE ONE DELIBERATE EXCEPTION (issue #109 / P10.1): setting
+    CLARIFEYE_CHECKPOINT_DB to an unusable path (an unwritable directory, a
+    file the process has no permission to open) makes make_checkpointer's
+    sqlite3.connect raise EAGERLY, right here, before the app finishes
+    booting - and that is by design, not an oversight this function's
+    "never raises" promise was supposed to cover. A checkpointer is either
+    real or the process should not start claiming to offer durable
+    checkpointing it cannot actually provide; failing loudly at startup
+    beats silently falling back to a saver whose name no longer matches
+    what an operator configured.
 
     CHECKPOINTING (issue #81 / P9.2): the live app compiles WITH a fresh
     langgraph.checkpoint.memory.InMemorySaver, one per process (the same

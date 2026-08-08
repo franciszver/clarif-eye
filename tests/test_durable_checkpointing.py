@@ -49,43 +49,51 @@ def _run_config(thread_id):
 def test_pause_survives_a_brand_new_sqlitesaver_on_the_same_file(tmp_path):
     db_path = str(tmp_path / "checkpoints.sqlite")
     thread_id = "restart-thread"
-
-    # First "process": pause a run on a SqliteSaver over db_path.
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    first_saver = SqliteSaver(conn)
-    first_graph = build_graph(checkpointer=first_saver)
     config = _run_config(thread_id)
 
-    chunks = list(
-        first_graph.stream(make_initial_state("base64photo"), config=config, stream_mode="updates")
-    )
-    keys = [key for chunk in chunks for key in chunk]
-    assert "__interrupt__" in keys, f"run did not pause: {keys}"
+    # First "process": pause a run on a SqliteSaver over db_path. The
+    # connection is closed via try/finally so a failing assertion above it
+    # can't leak a Windows file lock into pytest's tmp_path cleanup.
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    try:
+        first_graph = build_graph(checkpointer=SqliteSaver(conn))
 
-    snapshot = first_graph.get_state(config)
-    assert snapshot.next == (DEEP_PATH_NODE,)
-    assert snapshot.interrupts, "no pending interrupt was checkpointed"
-    conn.close()
+        chunks = list(
+            first_graph.stream(
+                make_initial_state("base64photo"), config=config, stream_mode="updates"
+            )
+        )
+        keys = [key for chunk in chunks for key in chunk]
+        assert "__interrupt__" in keys, f"run did not pause: {keys}"
+
+        snapshot = first_graph.get_state(config)
+        assert snapshot.next == (DEEP_PATH_NODE,)
+        assert snapshot.interrupts, "no pending interrupt was checkpointed"
+    finally:
+        conn.close()
 
     # "Restart": a brand-new SqliteSaver, a brand-new connection, over the
     # SAME file - simulating a fresh process picking up where the last one
     # left off.
     second_conn = sqlite3.connect(db_path, check_same_thread=False)
-    second_saver = SqliteSaver(second_conn)
-    second_graph = build_graph(checkpointer=second_saver)
+    try:
+        second_graph = build_graph(checkpointer=SqliteSaver(second_conn))
 
-    resumed_snapshot = second_graph.get_state(config)
-    assert resumed_snapshot.interrupts, "the pause did not survive the restart"
+        resumed_snapshot = second_graph.get_state(config)
+        assert resumed_snapshot.interrupts, "the pause did not survive the restart"
 
-    resumed_chunks = list(
-        second_graph.stream(Command(resume=RESUME_CONTINUE), config=config, stream_mode="updates")
-    )
-    resumed_keys = [key for chunk in resumed_chunks for key in chunk]
-    assert "tts" in resumed_keys, f"resume did not reach speech: {resumed_keys}"
+        resumed_chunks = list(
+            second_graph.stream(
+                Command(resume=RESUME_CONTINUE), config=config, stream_mode="updates"
+            )
+        )
+        resumed_keys = [key for chunk in resumed_chunks for key in chunk]
+        assert "tts" in resumed_keys, f"resume did not reach speech: {resumed_keys}"
 
-    final_state = second_graph.get_state(config)
-    assert "$999.99" in final_state.values["final_output"]
-    second_conn.close()
+        final_state = second_graph.get_state(config)
+        assert "$999.99" in final_state.values["final_output"]
+    finally:
+        second_conn.close()
 
 
 # --- (b) Factory selection ---------------------------------------------------
@@ -112,32 +120,37 @@ def test_make_checkpointer_returns_sqlite_saver_on_named_file(monkeypatch, tmp_p
 
 def test_delete_thread_removes_state_from_sqlite_saver(tmp_path):
     db_path = str(tmp_path / "delete.sqlite")
+    # Closed via try/finally so a failing assertion can't leak a Windows
+    # file lock into pytest's tmp_path cleanup.
     conn = sqlite3.connect(db_path, check_same_thread=False)
-    saver = SqliteSaver(conn)
-    graph = build_graph(checkpointer=saver)
-    thread_id = "delete-me"
-    config = {"configurable": {"thread_id": thread_id}}
+    try:
+        saver = SqliteSaver(conn)
+        graph = build_graph(checkpointer=saver)
+        thread_id = "delete-me"
+        config = {"configurable": {"thread_id": thread_id}}
 
-    state = make_initial_state("image-payload")
-    # A short OCR keeps this on the fast path so the run completes with no
-    # pause, and the point of this test is deletion, not verification.
-    run_config = {
-        "configurable": {
-            "thread_id": thread_id,
-            "client": _ShortReplyClient(),
-            "tts_provider": _FakeTtsProvider(),
+        state = make_initial_state("image-payload")
+        # A short OCR keeps this on the fast path so the run completes with
+        # no pause, and the point of this test is deletion, not
+        # verification.
+        run_config = {
+            "configurable": {
+                "thread_id": thread_id,
+                "client": _ShortReplyClient(),
+                "tts_provider": _FakeTtsProvider(),
+            }
         }
-    }
-    graph.invoke(state, config=run_config)
+        graph.invoke(state, config=run_config)
 
-    before = graph.get_state(config)
-    assert before.values, "setup is broken: nothing was checkpointed"
+        before = graph.get_state(config)
+        assert before.values, "setup is broken: nothing was checkpointed"
 
-    saver.delete_thread(thread_id)
+        saver.delete_thread(thread_id)
 
-    after = graph.get_state(config)
-    assert not after.values, "delete_thread left state behind on a SqliteSaver"
-    conn.close()
+        after = graph.get_state(config)
+        assert not after.values, "delete_thread left state behind on a SqliteSaver"
+    finally:
+        conn.close()
 
 
 class _ShortReplyClient:
@@ -152,27 +165,56 @@ class _ShortReplyClient:
         pass
 
 
-# --- (d) Trim guard: SqliteSaver is never poked ------------------------------
+# --- (d) Trim guard: a non-InMemorySaver's internals are never touched ------
 
 
-def test_trim_helper_skips_sqlite_saver_without_touching_its_internals(tmp_path):
-    """MUTATION TARGET: deleting the isinstance(checkpointer, InMemorySaver)
-    guard inside _trim_thread_to_latest_checkpoint (clarif_eye.ui) makes this
-    test fail - SqliteSaver has no `.storage` attribute, so the unguarded
-    body would raise AttributeError the instant it tried
-    `checkpointer.storage.get(thread_id)`. The guard is what turns that
-    crash into "run only for InMemorySaver, otherwise return immediately".
+class _RecordingStorageStub:
+    """A bare stub - NOT an InMemorySaver, NOT a SqliteSaver, nothing that
+    isinstance(checkpointer, InMemorySaver) could accidentally still match -
+    whose `storage` attribute is a property that flips a flag the instant
+    it is READ, so a test can observe whether the trim guard actually
+    stopped `_trim_thread_to_latest_checkpoint` before it touched
+    checkpointer-internals, rather than merely stopped it from raising.
+
+    WHY THIS EXISTS INSTEAD OF JUST ASSERTING "no exception" (the previous
+    version of this test, against a real SqliteSaver): the trim helper
+    wraps its ENTIRE body in `try/except Exception: pass` (its own
+    docstring: housekeeping must never take down a real photo's run over a
+    langgraph version mismatch). That swallow means an AttributeError from
+    reading `.storage` on an unguarded, non-InMemorySaver checkpointer is
+    caught and discarded - NOT raised - so a test that only checked for "no
+    exception escaped" would pass identically whether the isinstance guard
+    exists or not; deleting the guard does not turn this into a red test,
+    because the swallow hides it. A property that records ACCESS, not
+    outcome, is observable straight through that swallow: it flips its flag
+    the moment `.storage` is read, before whatever happens next (a crash,
+    a silent no-op) even matters.
     """
-    db_path = str(tmp_path / "trim-guard.sqlite")
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    saver = SqliteSaver(conn)
-    assert not hasattr(saver, "storage"), (
-        "test assumption broken: SqliteSaver now exposes .storage, so the "
-        "unguarded trim body would no longer raise AttributeError on it"
-    )
 
-    # Must return cleanly (no exception) with no state ever having been
-    # written for this thread_id - the trim helper is a no-op for anything
-    # that is not an InMemorySaver.
-    _trim_thread_to_latest_checkpoint(saver, "never-touched")
-    conn.close()
+    def __init__(self):
+        self.storage_was_read = False
+
+    @property
+    def storage(self):
+        self.storage_was_read = True
+        return {}
+
+
+def test_trim_helper_never_reads_a_non_inmemory_savers_storage():
+    """MUTATION TARGET: delete the isinstance(checkpointer, InMemorySaver)
+    guard inside _trim_thread_to_latest_checkpoint (clarif_eye.ui) and this
+    test fails - the unguarded body reads `checkpointer.storage.get(...)`
+    as its very first line, which flips _RecordingStorageStub's flag. See
+    that class's own docstring for why the assertion is ACCESS-based rather
+    than exception-based: the function's blanket `except Exception: pass`
+    would otherwise hide the very AttributeError a naive version of this
+    test might have expected to see.
+    """
+    stub = _RecordingStorageStub()
+
+    _trim_thread_to_latest_checkpoint(stub, "never-touched")
+
+    assert not stub.storage_was_read, (
+        "the trim helper read a non-InMemorySaver's .storage - the "
+        "isinstance guard did not stop it before touching internals"
+    )

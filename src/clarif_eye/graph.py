@@ -989,6 +989,14 @@ def make_checkpointer():
     still is not durable on Render's free tier even though it survives a
     same-process restart.
 
+    FAILS LOUDLY ON A BAD PATH, BY DESIGN: an unwritable directory or an
+    unopenable file makes sqlite3.connect raise EAGERLY, right here, at app
+    build time - not caught and not degraded to a silent InMemorySaver
+    fallback. See clarif_eye.ui.build_resources's own docstring for why: a
+    misconfigured checkpoint path should stop the app from booting, not
+    quietly hand back a checkpointer that isn't the durable one an operator
+    asked for.
+
     WHAT SETTING THE PATH ACTUALLY PUTS ON DISK, stated here because this is
     where the operator deciding whether to set it reads: a LangGraph
     checkpoint stores the WHOLE state of the graph that wrote it (see
