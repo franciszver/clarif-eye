@@ -3246,6 +3246,19 @@ def handle_submit_staged(
 # speak it.
 DESCRIBE_TEXT_API_NAME = "describe_document_text"
 
+# A DEPLOYMENT-LEVEL OFF SWITCH (issue #108), because this route earns its
+# own risk assessment separate from the photo UI's: it spends the SAME
+# shared daily model allowance (see the cache discussion below) but, unlike
+# the photo UI, sits behind no login and no per-visitor throttle of its own
+# - an API caller in a retry loop can drain the day's quota for everyone.
+# Set CLARIFEYE_TEXT_ROUTE=disabled on a deployment that would rather not
+# carry that exposure. The route, its tests, and a local run are unaffected
+# either way: the code stays exactly as capable as it is today, this is
+# purely a per-deployment choice about whether to serve it.
+TEXT_ROUTE_DISABLED_MESSAGE = (
+    "This deployment does not serve the text route; run the app locally to use it."
+)
+
 # What the deep path is told about "the scene" when there is no photo. The
 # child graph needs a scene description (clarif_eye.analysis refuses to call
 # the model on a blank one), and the truthful answer for this route is that
@@ -3312,6 +3325,8 @@ def describe_document_text(
     NO THREAD (nothing to remember between calls - a follow-up question is a
     UI feature and belongs to a session, which an API caller does not have).
     """
+    if os.environ.get("CLARIFEYE_TEXT_ROUTE") == "disabled":
+        return TEXT_ROUTE_DISABLED_MESSAGE
     if not isinstance(document_text, str) or not document_text.strip():
         return NO_DOCUMENT_TEXT_MESSAGE
     if resources.client is None:
