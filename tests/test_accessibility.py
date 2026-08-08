@@ -983,6 +983,134 @@ def test_diagram_introduces_no_positive_tabindex():
         demo.close()
 
 
+# --- P9.8 / issue #87: two tabs, product and explanation -------------------
+#
+# Owner request, directly: "two tabs on top, one tab for the product, and
+# one tab on the explanation". Today everything (photo input through the
+# how-it-works diagram) sits on one long page. This splits it into
+# gr.Tabs/gr.Tab: the product tab keeps every existing control (photo,
+# submit, status live region, audio, description, question box + ask
+# button, resume buttons) behaving exactly as before; the explanation tab
+# holds HOW_IT_WORKS_MARKDOWN and PIPELINE_DIAGRAM_HTML, and nothing else
+# from the product flow leaks into it.
+#
+# TRAVERSAL: gr.Blocks tracks a FLAT dict of every component in
+# demo.blocks (see _components() above), so tab membership is not visible
+# from that dict alone. Every component built inside a `with gr.Tab(...):`
+# block carries a `.parent` pointing at that Tab instance (verified by
+# building a throwaway Tabs/Tab interface and inspecting .parent by hand,
+# per this issue's "verify what 6.22 emits" instruction) - `.parent` chains
+# up through Tab -> Tabs -> Blocks, so walking it structurally answers
+# "which tab is this component in", the same id/container discipline
+# ARIA_LIVE_HEAD's #48 image exemption already uses (.closest(), never a
+# string/content match).
+#
+# RED-FIRST: written to FAIL against the pre-#87 single-page layout, which
+# has no gr.Tabs/gr.Tab at all - every component's ancestor chain stops at
+# gr.Blocks with no Tab in between.
+def _tab_ancestor(component):
+    """Walk a component's .parent chain and return the nearest gr.Tab
+    ancestor, or None if it isn't inside one. Structural (by object
+    identity along the real component tree), never a label/string match."""
+    parent = getattr(component, "parent", None)
+    while parent is not None:
+        if isinstance(parent, gr.Tab):
+            return parent
+        parent = getattr(parent, "parent", None)
+    return None
+
+
+def test_two_tabs_exist_with_expected_accessible_labels():
+    from clarif_eye.ui import EXPLANATION_TAB_LABEL, PRODUCT_TAB_LABEL
+
+    resources = _resources(FakeGraph())
+    demo = build_interface(resources)
+    try:
+        tabs = [c for c in _components(demo) if isinstance(c, gr.Tab)]
+        labels = [t.label for t in tabs]
+        assert PRODUCT_TAB_LABEL in labels
+        assert EXPLANATION_TAB_LABEL in labels
+        assert len(tabs) == 2
+    finally:
+        demo.close()
+
+
+def test_product_tab_contains_the_whole_product_flow():
+    from clarif_eye.ui import (
+        AUDIO_ELEM_ID,
+        ASK_BUTTON_ELEM_ID,
+        IMAGE_INPUT_ELEM_ID,
+        PRODUCT_TAB_ELEM_ID,
+        QUESTION_INPUT_ELEM_ID,
+        RESUME_CONTINUE_BUTTON_ELEM_ID,
+        RESUME_RETAKE_BUTTON_ELEM_ID,
+    )
+
+    resources = _resources(FakeGraph())
+    demo = build_interface(resources)
+    try:
+        components = _components(demo)
+        product_tab = next(t for t in components if isinstance(t, gr.Tab) and t.elem_id == PRODUCT_TAB_ELEM_ID)
+
+        product_elem_ids = (
+            IMAGE_INPUT_ELEM_ID,
+            STATUS_ELEM_ID,
+            AUDIO_ELEM_ID,
+            RESULT_ELEM_ID,
+            QUESTION_INPUT_ELEM_ID,
+            ASK_BUTTON_ELEM_ID,
+            RESUME_CONTINUE_BUTTON_ELEM_ID,
+            RESUME_RETAKE_BUTTON_ELEM_ID,
+        )
+        for elem_id in product_elem_ids:
+            component = next(c for c in components if getattr(c, "elem_id", None) == elem_id)
+            assert _tab_ancestor(component) is product_tab, f"{elem_id} is not inside the product tab"
+
+        # The submit button itself (no elem_id) - found by its unique label.
+        submit_button = next(
+            c for c in components if isinstance(c, gr.Button) and c.value == "Describe this photo"
+        )
+        assert _tab_ancestor(submit_button) is product_tab
+    finally:
+        demo.close()
+
+
+def test_explanation_tab_contains_how_it_works_and_diagram_only():
+    from clarif_eye.ui import DIAGRAM_ELEM_ID, EXPLANATION_TAB_ELEM_ID, HOW_IT_WORKS_ELEM_ID
+
+    resources = _resources(FakeGraph())
+    demo = build_interface(resources)
+    try:
+        components = _components(demo)
+        explanation_tab = next(
+            t for t in components if isinstance(t, gr.Tab) and t.elem_id == EXPLANATION_TAB_ELEM_ID
+        )
+
+        how_it_works = next(c for c in components if getattr(c, "elem_id", None) == HOW_IT_WORKS_ELEM_ID)
+        diagram = next(c for c in components if getattr(c, "elem_id", None) == DIAGRAM_ELEM_ID)
+        assert _tab_ancestor(how_it_works) is explanation_tab
+        assert _tab_ancestor(diagram) is explanation_tab
+    finally:
+        demo.close()
+
+
+def test_how_it_works_and_diagram_are_no_longer_in_the_product_tab():
+    from clarif_eye.ui import DIAGRAM_ELEM_ID, HOW_IT_WORKS_ELEM_ID, PRODUCT_TAB_ELEM_ID
+
+    resources = _resources(FakeGraph())
+    demo = build_interface(resources)
+    try:
+        components = _components(demo)
+        product_tab = next(t for t in components if isinstance(t, gr.Tab) and t.elem_id == PRODUCT_TAB_ELEM_ID)
+
+        how_it_works = next(c for c in components if getattr(c, "elem_id", None) == HOW_IT_WORKS_ELEM_ID)
+        diagram = next(c for c in components if getattr(c, "elem_id", None) == DIAGRAM_ELEM_ID)
+        assert _tab_ancestor(how_it_works) is not product_tab
+        assert _tab_ancestor(diagram) is not product_tab
+    finally:
+        demo.close()
+
+
 def test_ordered_list_is_still_present_alongside_the_diagram():
     # The diagram is additive - the ordered list remains the accessible
     # source of truth (a listener gets the list; a sighted reader gets
