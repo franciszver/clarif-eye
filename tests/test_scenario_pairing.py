@@ -154,6 +154,16 @@ SCENARIOS = [
             # still record) against the real stack, and the degraded half is
             # reachable only with a fake that refuses.
             "tests/test_degraded_turns.py",
+            # Issue #92 / P9.11: drives handle_ask_staged with a recording
+            # fake client whose ANSWER carries a number the stored photo text
+            # does not, so the follow-up path pauses to ask. Paired with the
+            # same UI scenario script, and carrying the same honest limit the
+            # #83 entry above states: a live model cannot be made to invent a
+            # number on demand, so ui_smoke.py proves the clean half against
+            # the real stack (a real photo, a real question, a real answer
+            # that verifies and is spoken without a question) and the pausing
+            # half is reachable only with a fake that fabricates one.
+            "tests/test_followup_verification.py",
         ],
         "scenario_paths": [
             "scripts/ui_smoke.py",
