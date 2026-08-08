@@ -42,6 +42,7 @@ from clarif_eye.graph import (
     RESUME_CONTINUE,
     RESUME_RETAKE,
     RETAKE_CONFIRMATION,
+    UNVERIFIED_ANSWER_CAVEAT,
     UNVERIFIED_NUMBER_CAVEAT,
     VERIFY_ANSWER_NODE,
     build_graph,
@@ -49,6 +50,7 @@ from clarif_eye.graph import (
     next_node_after,
 )
 from clarif_eye.ui import (
+    ANSWER_QUESTION_PENDING_MESSAGE,
     ASK_BUTTON_ELEM_ID,
     AppResources,
     NOTHING_TO_RESUME_MESSAGE,
@@ -376,7 +378,7 @@ def test_a_correctly_reformatted_number_becomes_a_question_never_a_refusal():
     assert REFORMATTED_ANSWER in spoken
 
 
-def test_resume_continue_speaks_the_answer_with_the_caveat_and_records_it():
+def test_resume_continue_speaks_the_answer_with_the_caveat_and_records_the_pair():
     resources = _resources(RecordingClient(INVENTED_ANSWER))
     _photo_then_question(resources, "followup-continue")
 
@@ -387,9 +389,11 @@ def test_resume_continue_speaks_the_answer_with_the_caveat_and_records_it():
     _status, audio, text = updates[-1]
     assert audio, "the caveated answer must be spoken as audio"
     assert INVENTED_ANSWER in text
-    # THE SAME CAVEAT the photo path uses - the user hears the warning
-    # BEFORE the number it is about, whichever flow asked.
-    assert UNVERIFIED_NUMBER_CAVEAT in text
+    # THE ANSWER-WORDED CAVEAT: the user asked a question and is about to
+    # hear its answer, so calling it "this description" would describe
+    # something they never asked for.
+    assert UNVERIFIED_ANSWER_CAVEAT in text
+    assert UNVERIFIED_NUMBER_CAVEAT not in text
     # The staged audio-delay contract: the same status/text without audio,
     # then again with it.
     assert updates[-2] == (_status, None, text)
@@ -397,10 +401,75 @@ def test_resume_continue_speaks_the_answer_with_the_caveat_and_records_it():
     snapshot = _state_of(resources, "followup-continue")
     assert snapshot.values["verification_hold"] is None
     assert not snapshot.interrupts
+    # BOTH SIDES OF THE TURN (deep-review MEDIUM, issue #92 / P9.11).
     # output_degraded=False on a continued answer (issue #93 / P9.12), so
-    # the turn IS recorded: the photo's description, then this answer.
-    recorded = [message.content for message in snapshot.values["messages"]]
-    assert recorded[-1] == text
+    # the turn IS recorded - and it must be recorded as a PAIR. Recording
+    # the answer alone would leave it sitting directly under the photo's
+    # description with no question above it, so a reader pairing history off
+    # would read "The jar holds 500 grams." as a second description of the
+    # photo: exactly the orphan-message failure #93 exists to prevent.
+    recorded = [(message.type, message.content) for message in snapshot.values["messages"]]
+    assert recorded[-2:] == [("human", QUESTION), ("ai", text)]
+
+
+def test_the_spoken_question_for_a_follow_up_pause_is_worded_for_an_answer():
+    """THE SPOKEN FLOW MUST NOT CONTRADICT ITSELF (deep-review MAJOR, issue
+    #92 / P9.11).
+
+    This is an audio-only product: the pause question is the whole interface
+    at the moment it is read out. Photo-path wording on a follow-up pause
+    told the user they were about to hear "the description that was
+    written", and that the second button would "take a new photo instead" -
+    and then the retake button spoke the honest answer wording ("the photo
+    you already sent is still here"), flatly contradicting the instruction
+    the user had just followed. The payload already carries a structural
+    `reason`; this is what reads it.
+
+    The photo path's own wording is byte-unchanged - the tests in
+    tests/test_ask_before_speaking.py are the net for that.
+    """
+    resources = _resources(RecordingClient(INVENTED_ANSWER))
+    updates, signal = _photo_then_question(resources, "followup-question-wording")
+    assert signal.paused is True
+    status, _audio, text = updates[-1]
+    assert status == text
+
+    # What was written is an ANSWER, and the second choice says what it
+    # actually does rather than sending the user to re-photograph a photo
+    # that was never the problem.
+    assert "the answer that was written" in status
+    assert "ask again" in status
+    assert RESUME_CONTINUE_LABEL in status and RESUME_RETAKE_LABEL in status
+    # And none of the photo-path wording survives on this path.
+    assert "the description that was written" not in status
+    assert "to take a new photo instead" not in status
+
+
+def test_the_pending_refusal_is_worded_for_whichever_flow_is_paused():
+    """The refusal a user hears when they type while a question is pending
+    must describe the question that is ACTUALLY pending.
+
+    Chosen STRUCTURALLY, from the pending interrupt payload's own `reason`
+    (D15 - never by matching prose, and never by a flag this module keeps
+    alongside the checkpointer).
+    """
+    resources = _resources(RecordingClient(INVENTED_ANSWER))
+    _photo_then_question(resources, "followup-refusal-wording")
+
+    updates = _staged(
+        handle_ask_staged(
+            "and what colour is it?", resources, thread_id="followup-refusal-wording"
+        )
+    )
+
+    text = updates[-1][2]
+    assert text == ANSWER_QUESTION_PENDING_MESSAGE
+    assert text != QUESTION_PENDING_MESSAGE
+    # It still names BOTH ways out - a user who cannot see the screen has no
+    # other way to find out how to get unstuck.
+    assert RESUME_CONTINUE_LABEL in text and RESUME_RETAKE_LABEL in text
+    # And it does not tell them a DESCRIPTION is waiting when an ANSWER is.
+    assert "description" not in text
 
 
 def test_resume_retake_speaks_honest_wording_for_a_follow_up_and_records_nothing():
@@ -498,7 +567,9 @@ def test_a_follow_up_typed_while_a_follow_up_question_is_pending_is_refused():
 
     _status, audio, text = updates[-1]
     assert audio is None
-    assert text == QUESTION_PENDING_MESSAGE
+    # The ANSWER variant, because an answer is what is pending here - see
+    # test_the_pending_refusal_is_worded_for_whichever_flow_is_paused.
+    assert text == ANSWER_QUESTION_PENDING_MESSAGE
     assert RESUME_CONTINUE_LABEL in text and RESUME_RETAKE_LABEL in text
     # It cost nothing: no graph run, so no model call.
     assert len(resources.client.calls) == calls_before
@@ -514,7 +585,7 @@ def test_a_follow_up_typed_while_a_follow_up_question_is_pending_is_refused():
             RESUME_CONTINUE, resources, thread_id="followup-ask-while-paused"
         )
     )
-    assert UNVERIFIED_NUMBER_CAVEAT in resumed[-1][2]
+    assert UNVERIFIED_ANSWER_CAVEAT in resumed[-1][2]
 
 
 def test_a_cached_photo_submitted_while_a_follow_up_question_is_pending_resolves_it():

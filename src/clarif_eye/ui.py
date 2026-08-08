@@ -177,6 +177,20 @@ QUESTION_PENDING_MESSAGE = (
     f'"{RESUME_RETAKE_LABEL}" to take a new photo. Then you can ask your '
     "question."
 )
+# The same refusal when what is pending is a question about a follow-up
+# ANSWER (issue #92 / P9.11 deep-review MAJOR). Which one is spoken is
+# decided STRUCTURALLY, from the pending interrupt payload's own `reason` -
+# see _question_pending_message. The message above would tell this user a
+# DESCRIPTION is waiting when an answer to their own question is, and would
+# offer "take a new photo" as the way past it when the photo was never the
+# problem: they can simply ask again.
+ANSWER_QUESTION_PENDING_MESSAGE = (
+    "There is still a question waiting for your answer: a number in the "
+    "answer to your last question could not be checked against the photo. "
+    f'Please activate "{RESUME_CONTINUE_LABEL}" to hear that answer anyway, '
+    f'or "{RESUME_RETAKE_LABEL}" to leave it unread. Then you can ask your '
+    "new question."
+)
 
 # --- Accessibility (issue #15 / P5.1) ---------------------------------------
 #

@@ -420,6 +420,17 @@ UNVERIFIED_NUMBER_CAVEAT = (
     "so please treat it with care."
 )
 
+# The same warning, in front of a follow-up ANSWER (issue #92 / P9.11
+# deep-review MAJOR). This app is audio-only at the moment it speaks, so the
+# noun matters: the user asked a question and is about to hear its answer,
+# and calling that "this description" describes something they never asked
+# for. Same structure, same placement, same plain language - one word apart,
+# and that word is the whole point.
+UNVERIFIED_ANSWER_CAVEAT = (
+    "A number in this answer could not be checked against the photo, "
+    "so please treat it with care."
+)
+
 # Spoken when the user chooses to take a new photo instead. This is a real
 # spoken outcome, not silence - it goes through tts exactly like a
 # description does, because a blind user who pressed a button and heard
