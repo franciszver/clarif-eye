@@ -1753,6 +1753,17 @@ def _encode_image(image):
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def _degraded_outcome(text):
+    """The "outcome" payload for a guard/early-failure exit that never
+    attempted TTS (no image, no client, an exception escaping the graph,
+    ...) - always STATUS_DEGRADED, never is_chain_exhausted()-derived (see
+    _outcome_for's ISSUE #88 / P9.9 note for why). One helper instead of
+    the same (None, text, STATUS_DEGRADED) literal repeated at every such
+    call site, so the invariant lives in one place.
+    """
+    return (None, text, STATUS_DEGRADED)
+
+
 def _outcome_for(final_output, audio_path):
     """Map a completed run's (final_output, audio_path) to the
     (audio_path_or_None, text, status) tuple every "outcome" event carries.
@@ -2036,17 +2047,17 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
     exercise the race itself.
     """
     if image is None:
-        yield "outcome", (None, NO_IMAGE_MESSAGE, STATUS_DEGRADED)
+        yield "outcome", _degraded_outcome(NO_IMAGE_MESSAGE)
         return
 
     if resources.client is None:
-        yield "outcome", (None, resources.client_error or CONFIG_ERROR_MESSAGE, STATUS_DEGRADED)
+        yield "outcome", _degraded_outcome(resources.client_error or CONFIG_ERROR_MESSAGE)
         return
 
     try:
         image_data = _encode_image(image)
     except Exception:
-        yield "outcome", (None, UNREADABLE_IMAGE_MESSAGE, STATUS_DEGRADED)
+        yield "outcome", _degraded_outcome(UNREADABLE_IMAGE_MESSAGE)
         return
 
     # Issue #75: key on a hash of the DECODED image content (never the
@@ -2197,13 +2208,13 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
         # collapsing into the generic UNEXPECTED_ERROR_MESSAGE below. Not
         # cached (issue #75): a quota/API failure must never be replayed
         # to the next visitor as if it were that photo's own answer.
-        yield "outcome", (None, message_for_ladder_exhausted(exc), STATUS_DEGRADED)
+        yield "outcome", _degraded_outcome(message_for_ladder_exhausted(exc))
         return
     except OpenRouterError as exc:
-        yield "outcome", (None, message_for_terminal_error(exc), STATUS_DEGRADED)
+        yield "outcome", _degraded_outcome(message_for_terminal_error(exc))
         return
     except Exception:
-        yield "outcome", (None, UNEXPECTED_ERROR_MESSAGE, STATUS_DEGRADED)
+        yield "outcome", _degraded_outcome(UNEXPECTED_ERROR_MESSAGE)
         return
 
     final_output = (result.get("final_output") or "").strip()
@@ -2395,7 +2406,7 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
     is waiting.
     """
     if resources.client is None:
-        yield "outcome", (None, resources.client_error or CONFIG_ERROR_MESSAGE, STATUS_DEGRADED)
+        yield "outcome", _degraded_outcome(resources.client_error or CONFIG_ERROR_MESSAGE)
         return
 
     # See NO_QUESTION_MESSAGE: a blank question must never reach the graph,
@@ -2415,11 +2426,11 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
     # was: the second layer, for a question that reaches the graph by some
     # other route.
     if not isinstance(question, str):
-        yield "outcome", (None, NO_QUESTION_MESSAGE, STATUS_DEGRADED)
+        yield "outcome", _degraded_outcome(NO_QUESTION_MESSAGE)
         return
     question = question.strip()
     if not question:
-        yield "outcome", (None, NO_QUESTION_MESSAGE, STATUS_DEGRADED)
+        yield "outcome", _degraded_outcome(NO_QUESTION_MESSAGE)
         return
 
     try:
@@ -2444,7 +2455,7 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
         # the SAME refusal an ordinary follow-up gets, not be silently
         # accepted while the safety question goes unanswered and unheard.
         if _has_pending_interrupt(graph, config):
-            yield "outcome", (None, QUESTION_PENDING_MESSAGE, STATUS_DEGRADED)
+            yield "outcome", _degraded_outcome(QUESTION_PENDING_MESSAGE)
             return
 
         verbosity_command = detect_preference_command(question)
@@ -2457,13 +2468,13 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
         result = dict(state)
         yield from _narrate_stream(graph, state, config, result)
     except LadderExhaustedError as exc:
-        yield "outcome", (None, message_for_ladder_exhausted(exc), STATUS_DEGRADED)
+        yield "outcome", _degraded_outcome(message_for_ladder_exhausted(exc))
         return
     except OpenRouterError as exc:
-        yield "outcome", (None, message_for_terminal_error(exc), STATUS_DEGRADED)
+        yield "outcome", _degraded_outcome(message_for_terminal_error(exc))
         return
     except Exception:
-        yield "outcome", (None, UNEXPECTED_ERROR_MESSAGE, STATUS_DEGRADED)
+        yield "outcome", _degraded_outcome(UNEXPECTED_ERROR_MESSAGE)
         return
 
     final_output = (result.get("final_output") or "").strip()
@@ -2708,7 +2719,7 @@ def _run_resume_events(answer, resources, pipeline_budget_seconds, thread_id=Non
     An interrupted photo simply costs its quota again, and asks again.
     """
     if resources.client is None:
-        yield "outcome", (None, resources.client_error or CONFIG_ERROR_MESSAGE, STATUS_DEGRADED)
+        yield "outcome", _degraded_outcome(resources.client_error or CONFIG_ERROR_MESSAGE)
         return
 
     try:
@@ -2724,18 +2735,18 @@ def _run_resume_events(answer, resources, pipeline_budget_seconds, thread_id=Non
         # checkpointer, no registry, or no thread at all) - then nothing
         # can be paused, because a pause only exists in a checkpoint.
         if "thread_id" not in configurable or not _has_pending_interrupt(graph, config):
-            yield "outcome", (None, NOTHING_TO_RESUME_MESSAGE, STATUS_DEGRADED)
+            yield "outcome", _degraded_outcome(NOTHING_TO_RESUME_MESSAGE)
             return
         result = {}
         yield from _narrate_stream(graph, Command(resume=answer), config, result)
     except LadderExhaustedError as exc:
-        yield "outcome", (None, message_for_ladder_exhausted(exc), STATUS_DEGRADED)
+        yield "outcome", _degraded_outcome(message_for_ladder_exhausted(exc))
         return
     except OpenRouterError as exc:
-        yield "outcome", (None, message_for_terminal_error(exc), STATUS_DEGRADED)
+        yield "outcome", _degraded_outcome(message_for_terminal_error(exc))
         return
     except Exception:
-        yield "outcome", (None, UNEXPECTED_ERROR_MESSAGE, STATUS_DEGRADED)
+        yield "outcome", _degraded_outcome(UNEXPECTED_ERROR_MESSAGE)
         return
 
     final_output = (result.get("final_output") or "").strip()
