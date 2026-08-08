@@ -57,6 +57,7 @@ from clarif_eye.ui import (
     RESUME_RETAKE_BUTTON_ELEM_ID,
     RESUME_RETAKE_LABEL,
     STATUS_RESUMING,
+    STATUS_SUCCESS_TEXT_ONLY,
     STATUS_WORKING,
     ThreadRegistry,
     _PauseSignal,
@@ -156,6 +157,17 @@ class _FakeTtsProvider:
     def synthesize(self, text, out_path):
         with open(out_path, "wb") as f:
             f.write(b"ID3" + b"\x00" * 32)
+
+
+class _FailingTtsProvider:
+    """Raises TtsError on every synthesize() call, so run_tts genuinely
+    exhausts the whole chain rather than faking the exhausted state via
+    tts_module._last_result_set - used only by
+    test_resume_continue_announces_text_only_status_when_chain_exhausted
+    below (issue #88 / P9.9 coverage)."""
+
+    def synthesize(self, text, out_path):
+        raise tts_module.TtsError("boom")
 
 
 def setup_function(_fn):
@@ -518,6 +530,29 @@ def test_resume_continue_stages_a_spoken_outcome_and_records_the_turn():
     snapshot = resources.graph.get_state({"configurable": {"thread_id": "ui-continue"}})
     recorded = [message.content for message in snapshot.values["messages"]]
     assert recorded == [final_text]
+
+
+def test_resume_continue_announces_text_only_status_when_chain_exhausted():
+    # Issue #88 / P9.9 coverage: the resume path shares _outcome_for with
+    # every other path (see that function's docstring "Shared by
+    # _run_pipeline_events, _run_followup_events and _run_resume_events"),
+    # so a REAL chain exhaustion on THIS run must still announce
+    # STATUS_SUCCESS_TEXT_ONLY, not just on the photo path - named here so
+    # the sharing can't silently unshare later.
+    resources = _resources(RecordingClient(INVENTED_DRAFT))
+    list(handle_submit_staged(FakeImage(), resources, thread_id="ui-continue-exhausted"))
+    # Only the RESUME call needs every provider to fail - the initial submit
+    # paused before TTS ever ran (see this file's module docstring).
+    resources.tts_providers = [_FailingTtsProvider()]
+
+    updates = _staged(
+        handle_resume_staged(RESUME_CONTINUE, resources, thread_id="ui-continue-exhausted")
+    )
+
+    final_status, final_audio, final_text = updates[-1]
+    assert final_status == STATUS_SUCCESS_TEXT_ONLY
+    assert final_audio is None
+    assert INVENTED_DRAFT in final_text
 
 
 def test_resume_retake_speaks_a_confirmation_and_records_no_turn():

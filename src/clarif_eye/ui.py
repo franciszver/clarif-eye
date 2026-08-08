@@ -2275,16 +2275,17 @@ def _handle_preference_command(verbosity, resources, session_id):
     graph run, NO model call (issue #86 / P9.7's own rule).
 
     THE STAGED CONTRACT, EVEN THOUGH THE GRAPH NEVER RUNS: this yields
-    exactly the same ("outcome", (audio_path_or_None, text)) shape every
-    other branch of _run_followup_events/_run_pipeline_events yields, so
+    exactly the same ("outcome", (audio_path_or_None, text, status)) shape
+    every other branch of _run_followup_events/_run_pipeline_events yields
+    (see _outcome_for's issue #88 / P9.9 note for `status`), so
     _stage_events (the caller two levels up) stages it identically to a
     real answer - the confirmation is genuinely SPOKEN (through run_tts,
     called directly here since there is no graph run to produce it), not
     merely written to the text box. clarif_eye.tts.run_tts already never
     raises (see its own docstring) and always returns {"audio_file_path":
     "" } on any failure, so this function inherits that same guarantee with
-    no try/except of its own needed. The (audio_path, text) MAPPING itself
-    is _outcome_for, the SAME helper _run_pipeline_events/_run_followup_events
+    no try/except of its own needed. The (audio_path, text, status) MAPPING
+    itself is _outcome_for, the SAME helper _run_pipeline_events/_run_followup_events
     use for every other outcome - reused rather than hand-rolled, so a
     confirmation spoken while the TTS provider chain happens to be
     exhausted gets the same AUDIO_UNAVAILABLE_NOTE fallback wording every
