@@ -83,11 +83,12 @@ side-channel, and needs nothing extra recorded by the nodes themselves.
 import os
 import sqlite3
 import time
+from typing import TypedDict
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
-from langgraph.types import Command, interrupt
+from langgraph.types import Command, Send, interrupt
 
 from clarif_eye.analysis import run_analysis
 from clarif_eye.deep_path import build_deep_path_graph
@@ -155,7 +156,15 @@ def _deadline_exceeded(config):
 
 def entry_destination(state):
     """The node a run should START at: "followup" when this run carries a
-    typed question, "vision" when it carries a photo.
+    typed question, DESCRIBE_ONE_NODE when it carries photos.
+
+    IT NAMED "vision" UNTIL ISSUE #110 / P10.2. `vision` is now the first
+    node of the PER-PHOTO child graph (build_photo_graph below), which the
+    parent sees as the single node DESCRIBE_ONE_NODE - once per submitted
+    photo. Nothing about the question-or-photo decision itself changed, and
+    this function still names ONE destination because that is all the
+    narration needs to know: entry_node builds the actual fan-out (see
+    below).
 
     Pulled out of entry_node so next_node_after (this module's single source
     of truth for topology, used by clarif_eye.ui's narration) can name the
@@ -187,12 +196,56 @@ def entry_destination(state):
             "entry_destination: state['question'] must be str or None, got "
             f"{type(question).__name__} ({question!r})"
         )
-    return "followup" if (question or "").strip() else "vision"
+    return "followup" if (question or "").strip() else DESCRIBE_ONE_NODE
+
+
+def photo_sends(state):
+    """One langgraph.types.Send per submitted photo, in submission order -
+    the fan-out (issue #110 / P10.2).
+
+    Each Send carries that photo's OWN payload to DESCRIBE_ONE_NODE:
+    `index` (the position it was submitted in, which is what the join sorts
+    by), its image data, and whatever cached result the app already had for
+    it. A Send payload becomes the target node's ENTIRE input state, which
+    is the reason the per-photo pipeline had to become a child graph: three
+    photos routed into the parent's own `vision` would have written three
+    different OCR texts into ONE shared `ocr_output` and the last one would
+    have won, silently.
+
+    A SUBMISSION OF ONE PRODUCES A LIST OF ONE, deliberately. That is the
+    whole N=1 claim: a single photo takes the same Send, the same
+    describe_one branch and the same join as three do, so the common case
+    cannot drift away from the multi-photo one.
+
+    FALLS BACK TO state["image_data"] when `photos` is absent, so a caller
+    that builds a state by hand (several tests do) still runs. See
+    clarif_eye.state.ClarifEyeState.photos for the entry shape.
+    """
+    photos = state.get("photos")
+    if not photos:
+        photos = [{"image_data": state.get("image_data", ""), "cached": None}]
+    return [
+        Send(
+            DESCRIBE_ONE_NODE,
+            {
+                "index": index,
+                "image_data": photo.get("image_data", ""),
+                "cached": photo.get("cached"),
+            },
+        )
+        for index, photo in enumerate(photos)
+    ]
 
 
 def entry_node(state):
-    """Entry node (issue #82 / P9.3): sends the run to `vision` or `followup`
-    by returning Command(goto=...).
+    """Entry node (issue #82 / P9.3): sends the run to the per-photo fan-out
+    or to `followup` by returning Command(goto=...).
+
+    A PHOTO RUN'S goto IS A LIST OF Send OBJECTS as of issue #110 / P10.2,
+    one per submitted photo (see photo_sends above), rather than the bare
+    node name it used to be. A question run's goto is still the single name
+    "followup" - a typed question is about the whole thread, not about one
+    photo, so there is nothing to fan out.
 
     Writes NO state of its own and makes no call of any kind - it completes
     instantly. See this module's top-level "TWO ROUTING MECHANISMS" block
@@ -212,8 +265,14 @@ def entry_node(state):
         is None, not an empty dict. Every consumer of that stream in this
         repo must tolerate it; see clarif_eye.ui._run_pipeline_events and
         tests/_stream_helpers.py, both of which skip a None update.
+      - Command(goto=[Send(...), ...]) from a node registered with
+        set_entry_point fans out correctly, and the fanned tasks all run in
+        ONE superstep (issue #110 / P10.2, probed before being written).
     """
-    return Command(goto=entry_destination(state))
+    destination = entry_destination(state)
+    if destination == "followup":
+        return Command(goto="followup")
+    return Command(goto=photo_sends(state))
 
 
 def vision_node(state, config=None, client=None):
@@ -963,6 +1022,259 @@ def dynamic_router(state):
     return DEEP_PATH_NODE if flag else "fast_synth"
 
 
+# --- The per-photo pipeline, fanned out with Send (issue #110 / P10.2) -----
+#
+# The name the per-photo child graph is mounted under in the parent, and the
+# name every Send targets. A CONSTANT for the same reasons TTS_NODE and
+# DEEP_PATH_NODE are: the string leaves this module (clarif_eye.ui's
+# narration counts this node's completions to say how many photos are done,
+# and LangGraph builds every one of the branch's checkpoint namespaces out of
+# it - "describe_one:<task id>", which clarif_eye.ui's checkpoint trimming
+# has to recognise).
+DESCRIBE_ONE_NODE = "describe_one"
+
+# The join. Named for what it does to the branches' results, not for what
+# comes out of it - `tts` speaks what this writes, and calling this one
+# "synthesis" would collide with the two nodes that write a script.
+COMPOSE_NODE = "compose"
+
+
+class PhotoState(TypedDict):
+    """The per-photo child graph's schema (issue #110 / P10.2).
+
+    THE SAME KEY NAMES AS THE PARENT'S, on purpose, and that is the whole
+    difference from clarif_eye.deep_path's schema: this child is not a
+    different vocabulary, it is the SAME pipeline run over ONE photo in
+    isolation. The nodes inside it - `vision`, `fast_synth`, `deep_path` -
+    are byte-for-byte the parent's old ones and read the keys they always
+    read, so nothing had to be renamed and no mapping layer exists inside
+    the branch.
+
+    WHAT IT DELIBERATELY DOES NOT HAVE: `photos`, `photo_results`,
+    `messages`, `question`, `audio_file_path`. A branch knows about ONE
+    photo and nothing about the submission it belongs to, which is what
+    keeps three branches from writing over each other - LangGraph gives each
+    Send its own copy of this state, and only the wrapper's one-element
+    `photo_results` update ever reaches the parent.
+    """
+
+    image_data: str
+    ocr_output: str
+    scene_context: str
+    complexity_flag: bool
+    scraper_data: str | None
+    final_output: str
+    verification_hold: dict | None
+    output_degraded: bool
+
+
+def build_photo_graph():
+    """Compile the per-photo pipeline: vision -> [fast_synth | deep_path].
+
+    THIS IS THE GRAPH THAT USED TO BE THE TOP HALF OF build_graph(), moved
+    down one level unchanged. Same node functions, same conditional edge,
+    same router - see build_graph below for what the parent kept.
+
+    NO `tts` IN IT, and that is the point of the split: speech is a property
+    of the TURN, not of a photo. Three photos produce three scripts and ONE
+    spoken file, so tts stays in the parent, after the join.
+
+    Both branches END here rather than naming a successor, for the same
+    reason clarif_eye.deep_path's `verify_numbers` does: a child cannot name
+    the parent's nodes. next_node_after translates that END back to None, so
+    the narration announces "Turning it into speech" once - when the
+    parent's own `compose` completes - instead of once per photo.
+
+    No checkpointer, like the deep path's child: it is mounted inside a
+    parent that has one, and LangGraph gives each fanned branch its own
+    checkpoint namespace automatically.
+    """
+    builder = StateGraph(PhotoState)
+
+    builder.add_node("vision", vision_node)
+    builder.add_node("fast_synth", fast_synth_node)
+    # A fresh deep-path child per compiled photo graph, the same discipline
+    # build_graph already applied when this node lived in the parent.
+    builder.add_node(DEEP_PATH_NODE, make_deep_path_node(build_deep_path_graph()))
+
+    builder.set_entry_point("vision")
+    builder.add_conditional_edges(
+        "vision",
+        dynamic_router,
+        {"fast_synth": "fast_synth", DEEP_PATH_NODE: DEEP_PATH_NODE},
+    )
+    builder.add_edge("fast_synth", END)
+    builder.add_edge(DEEP_PATH_NODE, END)
+
+    return builder.compile()
+
+
+def make_describe_one_node(child):
+    """Build the parent's `describe_one` node: ONE photo's whole pipeline,
+    run in isolation, reported back as ONE element of `photo_results`.
+
+    A CLOSURE OVER AN ALREADY-COMPILED CHILD, for the same reasons
+    make_deep_path_node's is: compiling per request would be work repeated
+    per photo for a result that never differs, and a module-level singleton
+    would compile at import time, before the node functions it is built from
+    exist.
+
+    ITS INPUT IS A Send PAYLOAD, NOT THE PARENT'S STATE - {"index",
+    "image_data", "cached"} - because LangGraph hands a fanned task exactly
+    what its Send carried. That is what isolates the branches from each
+    other; see photo_sends above.
+
+    A CACHED PHOTO SKIPS THE CHILD ENTIRELY (issue #110's cache rule): the
+    app looked this photo's content up before the run and put the stored
+    result in the payload, so the branch makes no model call at all and
+    still contributes its part to the combined script. The graph knows
+    nothing about a cache - it only knows that a payload may already carry a
+    result. See clarif_eye.ui._run_pipeline_events for the pre-pass.
+
+    IT RETURNS ONLY `photo_results`, never the child's own keys. Writing
+    ocr_output or final_output from here would put three branches back into
+    one channel - the exact clobbering the fan-out exists to avoid. The join
+    (compose_node) is the single place those keys are written for the turn.
+    """
+
+    def describe_one_node(payload):
+        index = payload.get("index", 0)
+        cached = payload.get("cached")
+        if cached is not None:
+            return {"photo_results": [dict(cached, index=index)]}
+        result = child.invoke(
+            {
+                "image_data": payload.get("image_data", ""),
+                "ocr_output": "",
+                "scene_context": "",
+                "complexity_flag": False,
+                "scraper_data": None,
+                "final_output": "",
+                "verification_hold": None,
+                "output_degraded": False,
+            }
+        )
+        return {
+            "photo_results": [
+                {
+                    "index": index,
+                    "final_output": result["final_output"],
+                    "ocr_output": result["ocr_output"],
+                    "scene_context": result["scene_context"],
+                    "output_degraded": result["output_degraded"],
+                }
+            ]
+        }
+
+    return describe_one_node
+
+
+# How each part of a multi-photo script is introduced, so a listener with no
+# screen knows which photo is being described without counting. NOT used for
+# a single-photo turn - see compose_node.
+PHOTO_LABEL_TEMPLATE = "Photo {position} of {total}."
+
+# Ordinal words for naming WHICH photo failed. Words, not digits, because
+# this sentence is spoken: "the second photo could not be described" is a
+# sentence, "the 2 photo" is not. Beyond this list the position is spoken as
+# a number, which is still correct English ("photo number 11").
+_ORDINALS = (
+    "first",
+    "second",
+    "third",
+    "fourth",
+    "fifth",
+    "sixth",
+    "seventh",
+    "eighth",
+    "ninth",
+    "tenth",
+)
+
+
+def _ordinal(position):
+    """"second" for 2, "photo number 11" fallback handled by the caller."""
+    if 1 <= position <= len(_ORDINALS):
+        return _ORDINALS[position - 1]
+    return f"number {position}"
+
+
+def _failure_sentence(positions):
+    """The one sentence that tells a listener which photos did not work."""
+    names = [f"the {_ordinal(position)}" for position in positions]
+    if len(names) == 1:
+        return f"The {_ordinal(positions[0])} photo could not be described."
+    joined = ", ".join(names[:-1]) + f" and {names[-1]}"
+    return f"{joined.capitalize()} photos could not be described."
+
+
+def compose_node(state):
+    """The join (issue #110 / P10.2): every branch's result, in SUBMISSION
+    order, composed into the one script `tts` will speak.
+
+    SORTS BY THE SUBMISSION INDEX each branch carried, never by arrival
+    order. The reducer behind `photo_results`
+    (clarif_eye.state._accumulate_photo_results) appends as branches finish,
+    and nothing makes that match the order the user took the photos in - a
+    slow first photo would otherwise be spoken last. Pinned by
+    tests/test_send_fanout.py, which drives this function with its input
+    deliberately shuffled.
+
+    N=1 IS THE DEGENERATE CASE, not a separate branch: the loop below runs
+    once and the label is empty, so a single-photo turn's script is
+    byte-identical to what it was before this issue - which is what
+    tests/test_graph.py and the accessibility suite assert. The labels and
+    the failure sentence are WORDING that only makes sense with more than
+    one photo, not a different code path.
+
+    IT ALSO WRITES THE TURN'S ocr_output AND scene_context, as the union of
+    what every photo showed. That is what makes a follow-up question answer
+    about the whole submission and what makes the number-verification
+    haystack the union of the photographed texts (clarif_eye.followup,
+    clarif_eye.verification) - neither of those modules had to learn that
+    more than one photo exists.
+
+    ONE PHOTO FAILING DEGRADES THE WHOLE TURN. The successful photos are
+    still spoken - throwing away three good descriptions because a fourth
+    photo was blurred would be worse than useless - but output_degraded is
+    True for the turn, so clarif_eye.ui._record_turn skips it and the image
+    cache does not store it, exactly the skip-not-mark semantics issue #93 /
+    P9.12 established for a single photo.
+    """
+    results = sorted(state.get("photo_results") or [], key=lambda r: r.get("index", 0))
+    total = len(results)
+
+    parts = []
+    failed_positions = []
+    ocr_parts = []
+    scene_parts = []
+    for position, result in enumerate(results, start=1):
+        label = "" if total == 1 else PHOTO_LABEL_TEMPLATE.format(position=position, total=total)
+        text = (result.get("final_output") or "").strip()
+        parts.append(f"{label} {text}".strip())
+        if result.get("output_degraded"):
+            failed_positions.append(position)
+        ocr = (result.get("ocr_output") or "").strip()
+        if ocr:
+            ocr_parts.append(f"{label} {ocr}".strip())
+        scene = (result.get("scene_context") or "").strip()
+        if scene:
+            scene_parts.append(f"{label} {scene}".strip())
+
+    # The failure sentence only earns its place when there is more than one
+    # photo to tell apart: with one photo, that photo's own message already
+    # says what went wrong and naming it "the first photo" would be noise.
+    if failed_positions and total > 1:
+        parts.append(_failure_sentence(failed_positions))
+
+    return {
+        "final_output": " ".join(part for part in parts if part),
+        "output_degraded": bool(failed_positions),
+        "ocr_output": "\n\n".join(ocr_parts),
+        "scene_context": " ".join(scene_parts),
+    }
+
+
 # Env var name for issue #109 / P10.1's pluggable durable checkpointing.
 # Named here, next to the factory that reads it, so clarif_eye.ui.build_resources
 # (the sole caller) never has to repeat the literal.
@@ -1058,15 +1370,17 @@ def build_graph(checkpointer=None, store=None):
     builder = StateGraph(ClarifEyeState)
 
     builder.add_node("entry", entry_node)
-    builder.add_node("vision", vision_node)
-    builder.add_node("fast_synth", fast_synth_node)
-    # issue #84 / P9.5: research -> analysis -> [verify_numbers] are no
-    # longer this graph's own nodes. They are a compiled CHILD GRAPH with its
-    # own schema (clarif_eye.deep_path), mounted here as one node through the
-    # mapping wrapper make_deep_path_node builds. A fresh child per compiled
-    # parent, so two graphs built in one process (the app's, and a test's)
-    # never share one.
-    builder.add_node(DEEP_PATH_NODE, make_deep_path_node(build_deep_path_graph()))
+    # issue #110 / P10.2: vision -> [fast_synth | deep_path] are no longer
+    # this graph's own nodes either. They are the PER-PHOTO child graph
+    # (build_photo_graph above), mounted here as ONE node that the entry
+    # node targets once per submitted photo with a Send - so three photos
+    # run three isolated copies of the pipeline in one superstep, and one
+    # photo runs the same thing once. `deep_path` moved down with them: it
+    # is a stage of describing a photo, not of finishing a turn. A fresh
+    # child per compiled parent, so two graphs built in one process (the
+    # app's, and a test's) never share one.
+    builder.add_node(DESCRIBE_ONE_NODE, make_describe_one_node(build_photo_graph()))
+    builder.add_node(COMPOSE_NODE, compose_node)
     builder.add_node("followup", followup_node)
     # issue #92 / P9.11: the follow-up path's own asking node. Registered
     # under a name the deep-path child does not use - see VERIFY_ANSWER_NODE.
@@ -1080,19 +1394,18 @@ def build_graph(checkpointer=None, store=None):
     # `destinations=` declaration is needed on add_node for the goto to
     # resolve on langgraph 1.2.10.
     builder.set_entry_point("entry")
-    # A STATIC branch on a flag vision_node already computed - the shape a
-    # conditional edge fits (see "TWO ROUTING MECHANISMS" above).
-    builder.add_conditional_edges(
-        "vision",
-        dynamic_router,
-        {"fast_synth": "fast_synth", DEEP_PATH_NODE: DEEP_PATH_NODE},
-    )
-    builder.add_edge("fast_synth", TTS_NODE)
-    # The whole deep path is one edge from here now. Its internal wiring -
-    # research -> analysis, and the conditional edge into the asking node -
-    # moved with it into clarif_eye.deep_path.build_deep_path_graph, which
-    # keeps its own comments for why each edge is the shape it is.
-    builder.add_edge(DEEP_PATH_NODE, TTS_NODE)
+    # Every fanned branch converges here (issue #110 / P10.2). LangGraph
+    # runs `compose` ONCE, after the last branch has finished, because a
+    # node with a plain incoming edge waits for every task that targets it -
+    # which is exactly the join this needs, with no barrier to write.
+    #
+    # The whole per-photo pipeline is one edge from here now: vision, the
+    # complexity router and the deep path all moved into
+    # build_photo_graph(), which keeps its own comments for why each edge is
+    # the shape it is.
+    builder.add_edge(DESCRIBE_ONE_NODE, COMPOSE_NODE)
+    # ONE tts CALL PER TURN, over the combined script - not one per photo.
+    builder.add_edge(COMPOSE_NODE, TTS_NODE)
     # A follow-up answer is spoken exactly like a description is: same tts
     # node, same provider chain, same staged delivery in the UI - unless a
     # number in it could not be traced back to the photographed text, in
@@ -1136,8 +1449,20 @@ TTS_NODE = "tts"
 # in the same diff, or next_node_after silently starts lying to callers
 # like clarif_eye.ui's per-node progress narration (issue #80 / P9.1).
 _UNCONDITIONAL_SUCCESSOR = {
-    "fast_synth": TTS_NODE,
-    DEEP_PATH_NODE: TTS_NODE,
+    # The parent's own two edges after the fan-out (issue #110 / P10.2).
+    # `describe_one` -> `compose` has no phrase, so a branch finishing
+    # announces nothing about topology; the per-photo progress count that
+    # IS announced for it comes from clarif_eye.ui._narrate_stream, which
+    # counts completions rather than guessing a successor.
+    DESCRIBE_ONE_NODE: COMPOSE_NODE,
+    COMPOSE_NODE: TTS_NODE,
+    # END, not TTS_NODE, since issue #110 / P10.2 - the same rule
+    # `verify_numbers` already followed below. Both are last nodes of a
+    # CHILD graph (build_photo_graph) now and cannot name the parent's tts.
+    # That is what keeps "Turning it into speech" announced exactly once per
+    # TURN rather than once per photo: the parent's `compose` says it.
+    "fast_synth": END,
+    DEEP_PATH_NODE: END,
     # TTS_NODE, not END (issue #92 / P9.11), unlike the child's
     # `verify_numbers` below: this asking node is the PARENT's, and the
     # parent's own edge out of it leads to speech. So the narration announces
@@ -1205,6 +1530,9 @@ def next_node_after(node_name, state):
     if node_name == "entry":
         return entry_destination(state)
     if node_name == "vision":
+        # A node of the per-photo child graph since issue #110 / P10.2, but
+        # resolved exactly as before: the same conditional-edge function the
+        # child itself routes with.
         return dynamic_router(state)
     if node_name == "analysis":
         return _successor_or_none(analysis_destination(state))

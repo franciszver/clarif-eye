@@ -19,11 +19,12 @@ import httpx
 import pytest
 
 from clarif_eye import research
-from clarif_eye.graph import build_graph, research_node
+from clarif_eye.graph import build_graph, build_photo_graph, research_node
 from clarif_eye.client import CompletionResult
 from clarif_eye.research import _derive_query, run_research
 from clarif_eye.state import make_initial_state
 
+from tests.test_graph import DEEP_TRACE
 from tests._stream_helpers import drain_stream_collecting_trace
 
 
@@ -437,7 +438,7 @@ def test_full_compiled_graph_runs_end_to_end_on_research_path_with_fakes():
     # nodes it contains (issue #84 / P9.5) - the trace helper streams with
     # subgraphs=True so the child's nodes stay visible, then the node that
     # holds them reports its own completion. Nothing about the route changed.
-    assert trace == ["entry", "vision", "research", "analysis", "deep_path", "tts"]
+    assert trace == DEEP_TRACE
     assert result["scraper_data"] != ""
     assert "Background info" in result["scraper_data"]
     assert result["final_output"] != ""
@@ -455,8 +456,37 @@ def test_full_compiled_graph_runs_end_to_end_on_research_path_with_fakes():
 # feature, or a human debugging a run) aren't left guessing.
 
 
+class _ShortReplyClient:
+    """Short, signal-free OCR text, so the router keeps the per-photo graph
+    on the FAST path and research is genuinely never entered."""
+
+    def complete(self, role, messages, **params):
+        return CompletionResult(
+            content="OCR_TEXT: short text\nSCENE: a room", model="fake-model:free"
+        )
+
+
 def test_scraper_data_never_ran_is_none_ran_and_found_nothing_is_empty_string():
-    not_applicable = make_initial_state("data")["scraper_data"]
+    # READ OFF A REAL FAST-PATH RUN of the per-photo graph, not off an
+    # initial state (issue #110 / P10.2): `scraper_data` is a per-photo key
+    # now (clarif_eye.graph.PhotoState), seeded "never ran" by the fan-out
+    # wrapper. Driving the graph proves the sentinel survives a run that
+    # genuinely skipped research, which reading a constructor never did.
+    photo_graph = build_photo_graph()
+    fast_path = photo_graph.invoke(
+        {
+            "image_data": "base64data",
+            "ocr_output": "",
+            "scene_context": "",
+            "complexity_flag": False,
+            "scraper_data": None,
+            "final_output": "",
+            "verification_hold": None,
+            "output_degraded": False,
+        },
+        config={"configurable": {"client": _ShortReplyClient()}},
+    )
+    not_applicable = fast_path["scraper_data"]
 
     searcher = FakeSearcher(results=[])
     ran_and_found_nothing = run_research("some product", "a scene", searcher=searcher)["scraper_data"]

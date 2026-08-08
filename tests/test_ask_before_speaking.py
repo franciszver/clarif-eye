@@ -38,7 +38,7 @@ from clarif_eye import tts as tts_module
 from clarif_eye.analysis import run_analysis
 from clarif_eye.client import CompletionResult
 from clarif_eye.graph import (
-    DEEP_PATH_NODE,
+    DESCRIBE_ONE_NODE,
     INTERRUPT_CHUNK_KEY,
     RESUME_CONTINUE,
     RESUME_RETAKE,
@@ -69,6 +69,7 @@ from clarif_eye.ui import (
 )
 from clarif_eye.verification import unverified_numbers
 
+from tests.test_graph import DEEP_TRACE, PARENT_TRACE
 from tests._stream_helpers import drain_stream_collecting_trace
 from tests.test_ui import FakeImage
 
@@ -283,7 +284,7 @@ def test_unverifiable_number_pauses_the_run_and_carries_the_questioned_text():
     # child, and from up here the whole deep path is one node. The pending
     # interrupt itself still travels up unchanged, which is what
     # clarif_eye.ui._has_pending_interrupt reads.
-    assert snapshot.next == (DEEP_PATH_NODE,)
+    assert snapshot.next == (DESCRIBE_ONE_NODE,)
     assert snapshot.interrupts, "graph state shows no pending interrupt"
 
     payload = snapshot.interrupts[0].value
@@ -347,7 +348,7 @@ def test_resume_retake_ends_clean_and_leaves_the_thread_ready_for_a_new_photo():
     # so the conditional edge out of `analysis` never enters it. research and
     # analysis are the child graph's nodes (issue #84 / P9.5) and "deep_path"
     # is the parent's own node completing once they are done.
-    assert trace == ["entry", "vision", "research", "analysis", "deep_path", "tts"]
+    assert trace == DEEP_TRACE
     assert "$104.95" in result["final_output"]
 
 
@@ -388,7 +389,7 @@ def test_verified_numbers_never_interrupt():
     assert INTERRUPT_CHUNK_KEY not in keys, f"a clean run must never pause: {keys}"
     # The asking node is not merely silent on a clean run - it is never
     # ENTERED, so a clean run costs no extra checkpoint for it either.
-    assert keys == ["entry", "vision", "research", "analysis", "deep_path", "tts"]
+    assert keys == DEEP_TRACE
 
     snapshot = graph.get_state(config)
     assert not snapshot.interrupts
@@ -417,7 +418,12 @@ def test_fast_path_never_reaches_the_asking_node():
     )
 
     keys = [key for chunk in chunks for key in chunk]
-    assert keys == ["entry", "vision", "fast_synth", "tts"]
+    # PARENT_TRACE, not FAST_TRACE: this stream is opened WITHOUT
+    # subgraphs=True, so the per-photo graph's own nodes (vision, fast_synth)
+    # are not visible from here - the whole photo arrives as one
+    # `describe_one` completion (issue #110 / P10.2). What this test is about
+    # is unchanged: no asking node anywhere in it.
+    assert keys == PARENT_TRACE
     assert INTERRUPT_CHUNK_KEY not in keys
 
 
@@ -738,7 +744,7 @@ def test_a_follow_up_typed_while_a_question_is_pending_is_refused():
     # THE PAUSE SURVIVED: still pending, still resumable. Reported at the
     # node the deep-path child is mounted at - see issue #84 / P9.5.
     snapshot = _state_of(resources, "ask-while-paused")
-    assert snapshot.next == (DEEP_PATH_NODE,)
+    assert snapshot.next == (DESCRIBE_ONE_NODE,)
     assert snapshot.interrupts
 
     # And it cost nothing: no graph run, so no model call.
@@ -798,7 +804,7 @@ def test_a_preference_command_typed_while_a_question_is_pending_is_refused():
     # THE PAUSE SURVIVED: still pending, still resumable - same assertion
     # shape as the ordinary-follow-up collision above.
     snapshot = _state_of(resources, thread_id)
-    assert snapshot.next == (DEEP_PATH_NODE,)
+    assert snapshot.next == (DESCRIBE_ONE_NODE,)
     assert snapshot.interrupts
 
     # And it cost nothing: no graph run, so no model call.

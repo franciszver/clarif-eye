@@ -64,27 +64,72 @@ def _keep_last_n_messages(left, right):
     return merged[-MAX_MESSAGES_PER_THREAD:]
 
 
+def _accumulate_photo_results(left, right):
+    """Reducer for `photo_results` (issue #110 / P10.2): append, EXCEPT that
+    an empty incoming list means "start this turn over".
+
+    Plain operator.add would have been enough for the fan-out itself - the
+    branches each contribute one element and never an empty one - but it
+    could not RESET. LangGraph runs a reducer over the INPUT state too, so a
+    second turn on the same checkpointed thread passing photo_results=[]
+    would merge as "nothing to add" and the previous turn's photos would be
+    joined into this turn's script. Every other scalar key on this thread
+    resets simply by being present in the input (see `question` above); this
+    is how an accumulating key gets the same guarantee.
+
+    NO NODE EVER RETURNS AN EMPTY LIST HERE, which is what makes the
+    sentinel safe: clarif_eye.graph's describe_one node returns exactly one
+    element on every path, including the paths where the photo failed.
+    """
+    if not right:
+        return []
+    return list(left or []) + list(right)
+
+
+def _photo_entry(image):
+    """Normalise one submitted photo into the dict shape
+    ClarifEyeState.photos documents.
+
+    A bare string is the common case (a photo with no cached result); a dict
+    is what clarif_eye.ui's cache pre-pass produces and is passed through
+    untouched, so the two callers do not need to know about each other.
+    """
+    if isinstance(image, dict):
+        return image
+    if image is None or not str(image).strip():
+        raise ValueError(
+            "make_initial_state_for_photos: every photo's image_data must be "
+            "a non-empty, non-blank string"
+        )
+    return {"image_data": image, "cached": None}
+
+
 class ClarifEyeState(TypedDict):
+    # TWO KEYS LEFT THIS SCHEMA IN ISSUE #110 / P10.2, and are named here
+    # rather than silently absent, because both had a long comment justifying
+    # their presence and their disappearance is a real change:
+    #
+    #   - complexity_flag: which path ONE photo takes. dynamic_router reads
+    #     it, and that conditional edge now lives inside the per-photo child
+    #     graph, so the key lives in clarif_eye.graph.PhotoState. It never
+    #     meant anything at turn level even before the fan-out, and a turn of
+    #     several photos has no single value for it - one photo can be a
+    #     dense bill while the next is a doorway.
+    #   - scraper_data: what the web lookup found for ONE photo, with the
+    #     None/"" distinction ("never ran" vs "ran, found nothing") issue #81
+    #     introduced. That distinction is intact and still documented, in
+    #     clarif_eye.deep_path.DeepPathState where research and analysis
+    #     actually produce and consume it.
+    #
+    # Nothing at parent level read either one: no parent node writes them,
+    # and next_node_after's dynamic_router call is made against the merged
+    # STREAM, where vision's own chunk has just supplied complexity_flag.
+    # Declaring them here would leave two channels that no node in this graph
+    # can fill - permanently at their initial values, which is worse than
+    # absent because a future reader would trust them.
     image_data: str
     ocr_output: str
     scene_context: str
-    complexity_flag: bool
-    # str | None (issue #81 / P9.2 - see this key's history below):
-    #   None -> research never ran (fast path).
-    #   ""   -> research ran and found nothing usable.
-    # Previously both cases collapsed to "" with no way to tell them apart
-    # (see git history / issue #10's module docstring in research.py for
-    # why that was a deliberate, reasoned choice at the time - analysis.py
-    # never needed to distinguish them, and still doesn't; see
-    # analysis.run_analysis, which treats both None and "" as falsy and
-    # proceeds identically either way). This is the explicit sentinel this
-    # issue's schema-change moment introduces: make_initial_state seeds
-    # None (never ran); research.run_research still returns "" in every one
-    # of its own degrade-to-nothing branches (ran, found nothing) - that
-    # module's own behavior is UNCHANGED, only the value it starts from
-    # before it ever runs is now distinguishable from the value it produces
-    # when it runs and comes up empty.
-    scraper_data: str | None
     final_output: str
     audio_file_path: str
     # str | None (issue #82 / P9.3): the typed follow-up question for THIS
@@ -167,24 +212,92 @@ class ClarifEyeState(TypedDict):
     # keeps a future node that forgets to set it recording turns exactly as
     # it does today rather than silently losing them.
     output_degraded: bool
+    # list (issue #110 / P10.2): THE SUBMISSION - every photo this turn is
+    # about, in the order the user submitted them, one dict per photo:
+    #     {"image_data": "<base64 jpeg>", "cached": <result dict> | None}
+    #
+    # ALWAYS A LIST, NEVER A SCALAR, INCLUDING FOR ONE PHOTO, and that is the
+    # whole point: clarif_eye.graph.entry_node builds one
+    # langgraph.types.Send per entry, so a single-photo turn is a fan-out of
+    # ONE - the degenerate case of the same mechanism - rather than a
+    # separate branch that would drift away from the multi-photo one.
+    # make_initial_state (one photo) is a thin call through
+    # make_initial_state_for_photos below, for exactly that reason.
+    #
+    # `cached` CARRIES A RESULT THE APP ALREADY HAD, so that photo's branch
+    # can skip its model calls and still appear in the combined script. None
+    # means "no result yet, run the pipeline for this one". The graph never
+    # learns what a cache is: clarif_eye.ui.ImageResultCache is consulted
+    # before the run and its hits ride in here as plain data. See
+    # clarif_eye.ui._run_pipeline_events for where that pre-pass lives and
+    # what it deliberately does NOT do (write per-photo entries back for a
+    # multi-photo turn, which has no per-photo audio to store).
+    #
+    # A PLAIN (non-reducer) KEY like every other scalar here, so a previous
+    # turn's submission is REPLACED rather than accumulated on a
+    # checkpointed thread.
+    photos: list
+    # THE ONE ACCUMULATING KEY BESIDES `messages` (issue #110 / P10.2), and
+    # the reason the fan-out can join at all: every fanned `describe_one`
+    # branch returns a ONE-ELEMENT list here, and operator.add concatenates
+    # them into the whole submission's results as the branches finish.
+    #
+    # WHY A REDUCER AND NOT A PLAIN KEY: fanned branches run in the SAME
+    # superstep, so their state updates all merge at once. A plain key would
+    # be last-writer-wins - two photos, one surviving result, silently.
+    #
+    # EACH ELEMENT CARRIES ITS OWN `index`, the position the photo was
+    # submitted in, because the reducer appends in COMPLETION order and
+    # nothing guarantees that matches submission order. The join
+    # (clarif_eye.graph.compose_node) sorts by it, which is what makes the
+    # spoken script's order a property of the submission rather than of how
+    # fast each photo happened to be - see tests/test_send_fanout.py, which
+    # drives the join with its results deliberately shuffled.
+    #
+    # See _accumulate_photo_results above for why this is not plain
+    # operator.add.
+    photo_results: Annotated[list, _accumulate_photo_results]
     # See "messages: the app's first LangGraph reducer" above.
     messages: Annotated[list, _keep_last_n_messages]
 
 
 def make_initial_state(image_data):
-    """Build the initial state from `image_data`, every other key at its empty default."""
-    if image_data is None or not str(image_data).strip():
+    """Build the initial state for a ONE-PHOTO turn - the degenerate case of
+    make_initial_state_for_photos below, not a separate shape.
+
+    Kept as its own name because every existing caller in this repo submits
+    exactly one photo and reads better saying so.
+    """
+    return make_initial_state_for_photos([image_data])
+
+
+def make_initial_state_for_photos(images):
+    """Build the initial state for a submission of one or more photos
+    (issue #110 / P10.2), every other key at its empty default.
+
+    `images` is a list of base64 image-data strings, in submission order, OR
+    of per-photo dicts already carrying a cached result (see
+    ClarifEyeState.photos for that shape). Both forms are accepted because
+    clarif_eye.ui's cache pre-pass produces the second and every other
+    caller produces the first.
+
+    `image_data` IS STILL SET, to the FIRST photo's data, and that is
+    deliberate rather than vestigial: it is what
+    clarif_eye.ui._run_pipeline_events' cache-hit branch blanks on a thread,
+    and what a checkpointed thread carries as "the photo this turn was
+    about". The per-photo pipeline no longer reads it - each branch reads
+    its own Send payload - so for a multi-photo turn it names the first
+    photo and nothing routes on it.
+    """
+    photos = [_photo_entry(image) for image in images]
+    if not photos:
         raise ValueError(
-            "make_initial_state: image_data is required and must be a "
-            "non-empty, non-blank string"
+            "make_initial_state_for_photos: at least one photo is required"
         )
     return ClarifEyeState(
-        image_data=image_data,
+        image_data=photos[0]["image_data"],
         ocr_output="",
         scene_context="",
-        complexity_flag=False,
-        # None = "research never ran yet" - see ClarifEyeState.scraper_data.
-        scraper_data=None,
         final_output="",
         audio_file_path="",
         # None = "this is a photo run, not a question" - and, on a thread
@@ -203,6 +316,14 @@ def make_initial_state(image_data):
         # the new run is judged on its own outcome. See
         # ClarifEyeState.output_degraded.
         output_degraded=False,
+        # The submission itself - see ClarifEyeState.photos. One entry for a
+        # single-photo turn: the fan-out of one.
+        photos=photos,
+        # [] on every run, and unlike `messages` this IS a reset: a previous
+        # turn's per-photo results must never be joined into this turn's
+        # script. See _accumulate_photo_results for the reducer that makes
+        # an empty incoming list mean exactly that.
+        photo_results=[],
         # [] is safe to pass on every run, including a second run on an
         # already-checkpointed thread: add_messages merges an empty `right`
         # as "nothing new to append", never as "replace with []" - verified

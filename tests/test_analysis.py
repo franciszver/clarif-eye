@@ -20,6 +20,8 @@ import pytest
 
 from clarif_eye.client import CompletionResult, LadderExhaustedError, OpenRouterError
 from clarif_eye.graph import build_graph, analysis_node
+from tests._stream_helpers import drain_stream_collecting_trace
+
 from clarif_eye.state import make_initial_state
 from clarif_eye import analysis, vision
 from clarif_eye.analysis import run_analysis
@@ -707,12 +709,19 @@ def test_full_compiled_graph_runs_end_to_end_on_research_path_with_fake_client()
     graph = build_graph()
     state = make_initial_state("base64data")
 
-    result = graph.invoke(
+    result, trace = drain_stream_collecting_trace(
+        graph,
         state,
         config={"configurable": {"client": client, "tts_provider": _FakeTtsProvider()}},
     )
 
-    assert result["complexity_flag"] is True
+    # "deep_path" in the trace, not result["complexity_flag"], since issue
+    # #110 / P10.2: the complexity flag is a PER-PHOTO routing signal written
+    # inside the per-photo child graph, and a turn made of several photos has
+    # no single value for it - so the parent's state no longer carries one.
+    # What this line has always been about is that the DEEP PATH ran, and
+    # that is what it now says.
+    assert "deep_path" in trace
     assert_tts_safe(result["final_output"])
     assert "4471-2205-88" in result["final_output"]
     assert result["audio_file_path"] != ""

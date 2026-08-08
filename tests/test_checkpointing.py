@@ -198,16 +198,19 @@ def test_checkpoint_ids_are_time_ordered_across_namespaces():
     _invoke(graph, "ns-ordering-image-two", thread_id, ocr=long_ocr)
     namespaces = _child_namespaces()
 
-    assert len(namespaces) == 2, f"expected two child namespaces, got {namespaces}"
+    # TWO PER RUN since issue #110 / P10.2: child graphs nest two deep now
+    # ("describe_one:<id>" and "describe_one:<id>|deep_path:<id>"). What the
+    # ordering assumption is about is unchanged - which RUN max() picks.
+    assert len(namespaces) == 4, f"expected two runs' child namespaces, got {namespaces}"
 
-    # RECENCY, ESTABLISHED WITHOUT LOOKING AT AN ID: the newer namespace is
-    # simply the one that was not there after the first run. Comparing that
-    # against what max() picks is what makes this a proof of the ordering
+    # RECENCY, ESTABLISHED WITHOUT LOOKING AT AN ID: the newer namespaces are
+    # simply the ones that were not there after the first run. Comparing what
+    # max() picks against that set is what makes this a proof of the ordering
     # assumption rather than a restatement of it.
-    by_recency = (namespaces - after_first).pop()
+    by_recency = namespaces - after_first
     by_id = max(namespaces, key=lambda ns: max(saver.storage[thread_id][ns]))
 
-    assert by_id == by_recency, (
+    assert by_id in by_recency, (
         "checkpoint ids are no longer time-ordered across namespaces - "
         "clarif_eye.ui._drop_dead_subgraph_namespaces would delete the wrong "
         "namespace, possibly one holding a paused run."
@@ -257,3 +260,54 @@ def test_trimming_keeps_one_threads_checkpoint_count_flat_across_repeated_invoke
     state = graph.get_state(config)
     assert len(state.values["messages"]) == 6
     assert len(saver.storage[thread_id][""]) == 1
+
+
+# THE SAME RIGOR, ONE LEVEL DOWN (issue #110 / P10.2). The test above pins
+# the ROOT namespace's checkpoint count flat across repeated invokes; nothing
+# pinned the CHILD namespaces' count, and since this issue every photo run
+# creates two of them - "describe_one:<task id>" for the per-photo graph and,
+# on a deep run, "describe_one:<task id>|deep_path:<task id>" for the deep
+# path inside it. Both are fresh per run, so without pruning a thread
+# accumulates two more of them on every single turn - the same unbounded
+# growth #81 measured for the root, reopened two levels down and paid for in
+# the same 512MB of RAM.
+#
+# test_trimming_drops_the_child_namespaces_of_finished_runs (in
+# tests/test_deep_path_subgraph.py) asserts that only ONE RUN's worth of
+# namespaces survives, which is the right shape for that file's question but
+# does not pin a COUNT: it would pass unchanged if a future run started
+# mounting five child graphs. This one pins the count, on the fast path,
+# where the answer is exactly one.
+#
+# PROVEN TO FAIL AGAINST THE PLAUSIBLE MUTATION - the revert of this issue's
+# own trim fix. Making clarif_eye.ui._same_run_namespace return True for
+# every pair (i.e. "everything belongs to the live run, delete nothing")
+# turns this red at 5 stored child namespaces instead of 1, growing one per
+# invoke. Restored immediately after; not committed as a skipped variant,
+# for the same reason the test above gives.
+def test_trimming_keeps_one_threads_child_namespace_count_flat_too():
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    saver = InMemorySaver()
+    graph = build_graph(checkpointer=saver)
+    thread_id = "child-growth-probe-thread"
+
+    for i in range(5):
+        _invoke(graph, f"image-payload-{i}", thread_id, ocr=f"text {i}", scene=f"scene {i}", trim=True)
+
+    child_namespaces = [ns for ns in saver.storage[thread_id] if ns]
+    assert len(child_namespaces) == 1, (
+        f"expected exactly 1 stored child namespace after trimming, found "
+        f"{len(child_namespaces)}: {child_namespaces} - child checkpoint "
+        "history is growing unbounded, one namespace per photo run"
+    )
+
+    # The trim must not have broken the thread it pruned: the conversation
+    # is intact and a further turn still runs and still stays flat.
+    config = {"configurable": {"thread_id": thread_id}}
+    assert len(graph.get_state(config).values["messages"]) == 5
+
+    _invoke(graph, "image-payload-final", thread_id, ocr="final text", scene="final scene", trim=True)
+
+    assert len(graph.get_state(config).values["messages"]) == 6
+    assert len([ns for ns in saver.storage[thread_id] if ns]) == 1
