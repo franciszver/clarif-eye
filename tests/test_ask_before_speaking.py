@@ -347,6 +347,13 @@ def test_verified_numbers_never_interrupt():
     # P9.5) - without it "the asking node was never entered" could not be
     # asserted from up here at all, since the whole child would arrive as one
     # opaque "deep_path" chunk.
+    #
+    # NOTE FOR A FUTURE EDITOR: this consumer does NOT de-duplicate a
+    # namespaced "__interrupt__" the way clarif_eye.ui._narrate_stream does,
+    # and does not need to - this run is the CLEAN one and must never pause,
+    # which is the assertion below. A loop shaped like this one driving a
+    # PAUSING run would see the interrupt key TWICE: once from the child's
+    # namespace, once re-emitted at the parent level.
     chunks = [
         chunk
         for _namespace, chunk in graph.stream(

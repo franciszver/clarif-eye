@@ -36,6 +36,8 @@ from clarif_eye.ui import (
     status_for_result,
 )
 
+from tests._stream_helpers import SingleChunkStreamMixin
+
 
 class FakeImage:
     """Stand-in for a PIL Image good enough for base64 encoding."""
@@ -50,7 +52,7 @@ class FakeImage:
         buf.write(b"\xff\xd8\xff\xe0fakejpegbytes")
 
 
-class FakeGraph:
+class FakeGraph(SingleChunkStreamMixin):
     """Records the config it was invoked with and returns a canned result.
 
     stream() (issue #80 / P9.1) yields exactly one chunk, keyed "tts" -
@@ -68,11 +70,6 @@ class FakeGraph:
         self.invocations.append({"state": state, "config": config})
         return self.result
 
-    def stream(self, state, config=None, stream_mode="updates", subgraphs=False):
-        # See FakeGraph.stream in tests/test_ui.py for the (namespace, chunk)
-        # shape issue #84 / P9.5 introduced.
-        chunk = {"tts": self.invoke(state, config=config)}
-        yield ((), chunk) if subgraphs else chunk
 
 
 def _resources(graph, client="fake-client"):

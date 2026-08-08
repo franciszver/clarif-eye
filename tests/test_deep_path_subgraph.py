@@ -51,6 +51,7 @@ from tests.test_ask_before_speaking import (
     INVENTED_DRAFT,
     FakeSearcher,
     RecordingClient,
+    ScriptedClient,
     _FakeTtsProvider,
     _resources,
 )
@@ -146,7 +147,64 @@ def test_the_child_cannot_be_mounted_without_the_mapping_wrapper():
         raise AssertionError("mounting the child bare should not have worked")
 
 
+def test_the_keys_the_wrapper_maps_back_out_exist_in_both_schemas():
+    """THE BOUNDARY, PINNED - because LangGraph will not complain about it.
+
+    clarif_eye.graph.make_deep_path_node's returned node reads three keys off
+    the child's result and writes them into the parent's state. VERIFIED, and
+    this is why the test exists: LangGraph SILENTLY DROPS an update key the
+    target schema does not declare - a node returning {"not_in_schema": ...}
+    raises nothing and the key does not even appear in the stream chunk. So
+    renaming any of these three on the PARENT side would make that write-back
+    quietly stop updating that channel: no error, no failing assertion about
+    the mapping itself, just a state key that silently stops changing. The
+    reads are bracket-access so a CHILD-side rename is loud on its own; this
+    covers the half that cannot be made loud from inside the wrapper.
+    """
+    from clarif_eye.deep_path import DeepPathState
+
+    mapped_back_out = {"scraper_data", "verification_hold", "final_output"}
+
+    for schema in (DeepPathState, ClarifEyeState):
+        missing = mapped_back_out - set(schema.__annotations__)
+        assert not missing, (
+            f"{schema.__name__} no longer declares {sorted(missing)}, which "
+            "clarif_eye.graph.make_deep_path_node's wrapper maps across the "
+            "parent/child boundary. LangGraph drops an update key the target "
+            "schema does not declare WITHOUT raising, so this rename would "
+            "have silently stopped that key being written."
+        )
+
+
 # --- The child inside the parent ------------------------------------------
+
+
+def test_parent_and_child_node_names_never_collide():
+    """clarif_eye.graph's _UNCONDITIONAL_SUCCESSOR and clarif_eye.ui's
+    _NODE_PHRASE are flat dicts keyed by BARE node names, and since issue #84
+    / P9.5 they answer for BOTH graphs' nodes - which is only correct while
+    the two graphs' names are disjoint.
+
+    A collision would not raise anything. One graph's entry would silently
+    answer for the other graph's node, and the narration would announce the
+    wrong step - or announce one twice - to a user who cannot see the screen
+    to notice. Read off both COMPILED graphs rather than off the tables, so
+    this fails when a node is ADDED, not only when a table is edited.
+    """
+    from clarif_eye.deep_path import build_deep_path_graph
+
+    parent_nodes = set(build_graph().nodes)
+    child_nodes = set(build_deep_path_graph().nodes)
+    # LangGraph's own synthetic entry node is in every compiled graph's node
+    # set and is not a node either table ever sees.
+    shared = (parent_nodes & child_nodes) - {"__start__"}
+
+    assert not shared, (
+        f"parent and child graphs both have node(s) {sorted(shared)}. "
+        "clarif_eye.graph._UNCONDITIONAL_SUCCESSOR and clarif_eye.ui."
+        "_NODE_PHRASE are keyed by bare node name across both graphs, so a "
+        "shared name makes one graph's entry answer for the other's node."
+    )
 
 
 def test_the_parent_registers_the_child_as_one_node():
@@ -294,6 +352,52 @@ def test_trimming_drops_the_child_namespaces_of_finished_runs():
     namespaces = list(checkpointer.storage["growing"])
     child_namespaces = [ns for ns in namespaces if ns]
     assert len(child_namespaces) <= 1, f"dead child namespaces piled up: {namespaces}"
+
+
+def test_trimming_keeps_the_namespace_a_paused_run_needs_to_resume():
+    """WHICH namespace survives is not a detail - it is the difference
+    between a resumable safety question and one that is silently gone.
+
+    The trim is reachable while a thread is PAUSED (the cache-hit branch
+    trims mid-pause - see clarif_eye.ui's RESOLVE-THEN-WRITE block), and by
+    then the thread can hold both a finished run's dead namespace and the
+    paused run's live one. Deleting the wrong one destroys the pause with no
+    error anywhere: the buttons stay on screen, wired to nothing.
+
+    MUTATION TARGET: flipping _drop_dead_subgraph_namespaces to keep the
+    OLDEST namespace instead of the newest must turn this test RED. The
+    bounded-growth test above cannot catch that - one namespace survives
+    either way.
+    """
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from clarif_eye.ui import _trim_thread_to_latest_checkpoint
+
+    checkpointer = InMemorySaver()
+    graph = build_graph(checkpointer=checkpointer)
+    client = ScriptedClient(
+        vision_replies=[(BILL_OCR, BILL_SCENE), (BILL_OCR, BILL_SCENE)],
+        brain_replies=[HONEST_DRAFT, INVENTED_DRAFT],
+    )
+    config = _parent_config(client, thread_id="paused-trim")
+
+    # A clean deep run first, so its (now dead) child namespace is on the
+    # thread, then a run that pauses inside the child.
+    list(graph.stream(make_initial_state("first-photo"), config=config, stream_mode="updates"))
+    _trim_thread_to_latest_checkpoint(checkpointer, "paused-trim")
+    list(graph.stream(make_initial_state("second-photo"), config=config, stream_mode="updates"))
+    assert graph.get_state(config).interrupts, "setup: the second run should have paused"
+
+    for _ in range(3):
+        _trim_thread_to_latest_checkpoint(checkpointer, "paused-trim")
+
+    assert graph.get_state(config).interrupts, "the trim destroyed the pending question"
+
+    list(graph.stream(Command(resume=RESUME_CONTINUE), config=config, stream_mode="updates"))
+
+    snapshot = graph.get_state(config)
+    assert INVENTED_DRAFT in snapshot.values["final_output"]
+    assert snapshot.values["audio_file_path"]
 
 
 # --- The second consumer: text in, description out, no photo --------------

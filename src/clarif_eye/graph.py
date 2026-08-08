@@ -35,7 +35,13 @@ and neither is a leftover:
     this same mechanism, out of `analysis` (analysis_destination), for the
     same reason and in the same shape: `analysis` writes verification_hold,
     a separate pure function reads it to decide whether the run stops to
-    ask the user about a number it could not check.
+    ask the user about a number it could not check. THAT SECOND EDGE IS NO
+    LONGER DECLARED IN THIS GRAPH - issue #84 / P9.5 moved it, together
+    with the two nodes it joins, into the deep-path child graph (see
+    clarif_eye.deep_path.build_deep_path_graph, which wires it). The
+    mechanism and the reasoning are unchanged; only which graph declares
+    the edge moved. analysis_destination itself still lives in this
+    module, next to the node functions it routes between.
 
   - Command(goto=...) (returned by `entry`): a node that decides its OWN
     successor. There is no upstream node to compute a flag for it - `entry`
@@ -418,14 +424,19 @@ def analysis_destination(state):
     the shape a conditional edge expresses, the same shape dynamic_router
     already has out of `vision`.
 
-    IT IS ALSO WHAT KEEPS THE COMMON PATH FREE. Every completed node is a
-    full checkpoint write, and each one stores the WHOLE state including
-    image_data's base64 JPEG - measured at ~134KB per invoke with a 50KB
-    photo (see clarif_eye.ui._trim_thread_to_latest_checkpoint's comment).
-    Routing every deep-analysis run through an extra node just to have it
-    look at an almost-always-empty dict would buy that write on every
-    request, on a 512MB instance, for nothing. Branching here means the
-    asking node is entered ONLY on the runs that actually ask.
+    IT IS ALSO WHAT KEEPS THE COMMON PATH FREE, though the saving is
+    SMALLER THAN THIS COMMENT USED TO CLAIM and the correction is worth
+    stating rather than quietly editing out. It cited ~134KB per invoke,
+    the measured cost of a checkpoint carrying image_data's base64 JPEG
+    (see clarif_eye.ui._trim_thread_to_latest_checkpoint). That figure
+    belongs to the PARENT graph. This edge is inside the deep-path child
+    now (issue #84 / P9.5), whose schema has no image_data in it at all -
+    so what routing every run through the asking node would actually cost
+    is one more checkpoint write of the child's small text-only state, on
+    every deep-path request, on a 512MB instance. Still not worth paying to
+    have a node look at an almost-always-empty dict, and the branch also
+    keeps the node that can PAUSE a run off every path that has nothing to
+    ask about - which is the reason that does not depend on a number.
     """
     return "verify_numbers" if numbers_need_asking(state) else END
 
@@ -552,10 +563,32 @@ def make_deep_path_node(child):
         # hold) and asserted by the existing test fleet. They are the child's
         # OUTPUTS being translated, not shared channels: the child still owns
         # producing them, and the parent never writes into them.
+        #
+        # BRACKET ACCESS, NOT .get(), ON PURPOSE - LOUD BEATS SILENT. All three
+        # keys are written by the child on every path it can finish through
+        # (`research` writes scraper_data in every branch including its
+        # degradations; `analysis` writes verification_hold in every return,
+        # None when there is nothing held; `verify_numbers` rewrites both), so
+        # a missing one means the child's contract changed and this wrapper
+        # was not updated with it. A KeyError says that immediately; a .get()
+        # would quietly write None over a real value and nobody would find out
+        # until a user was told the wrong thing. It cannot reach Gradio as a
+        # traceback either - clarif_eye.ui._run_pipeline_events catches it and
+        # speaks a message, per this pipeline's never-raise contract.
+        #
+        # THE OTHER HALF OF THIS BOUNDARY CANNOT BE CHECKED FROM HERE, and
+        # that is why a test pins it instead. LangGraph SILENTLY DROPS an
+        # update key that the target schema does not declare - verified: a
+        # node returning {"not_in_schema": ...} raises nothing, and the key
+        # does not even appear in the stream chunk. So renaming any of these
+        # three in ClarifEyeState would make this write-back quietly stop
+        # updating that channel, with no error anywhere. See
+        # tests/test_deep_path_subgraph.py's boundary-overlap test, which
+        # names this function as the dependent.
         return {
             "final_output": result["final_output"],
-            "scraper_data": result.get("scraper_data"),
-            "verification_hold": result.get("verification_hold"),
+            "scraper_data": result["scraper_data"],
+            "verification_hold": result["verification_hold"],
         }
 
     return deep_path_node
@@ -760,6 +793,15 @@ _UNCONDITIONAL_SUCCESSOR = {
     # level (see clarif_eye.ui._narrate_stream) - and a node name is
     # unambiguous across the two graphs, so one table is one place to keep
     # correct rather than two that could disagree.
+    #
+    # THAT LAST CLAIM IS A REAL PRECONDITION, NOT AN OBSERVATION: this table
+    # and clarif_eye.ui's _NODE_PHRASE are both flat dicts keyed by BARE node
+    # names, so they are only correct while the parent's node names and the
+    # child's never collide. If they ever did, one graph's entry would answer
+    # for the other's node and the narration would announce the wrong step -
+    # silently, since a dict lookup cannot notice. Pinned by
+    # tests/test_deep_path_subgraph.py's disjointness test, which reads both
+    # COMPILED graphs' node sets rather than trusting these literals.
     "research": "analysis",
     # END, not TTS_NODE, and that is what stops "Turning it into speech"
     # being announced twice: `verify_numbers` is the last node of the CHILD,
