@@ -636,17 +636,19 @@ def test_the_text_only_route_never_caches_an_empty_model_reply():
     """A MODEL THAT ANSWERS WITH NOTHING IS A FAILURE, and must not become
     this document's stored answer.
 
-    The gap this closes: _SuccessWatchingClient used to count any completion
-    that RETURNED as a success, so a blank reply set succeeded=True.
+    The gap this closes: the route used to watch the CLIENT SEAM and count
+    any completion that RETURNED as a success, so a blank reply counted.
     run_analysis then degrades it to its "returned an empty response"
     sentence with nothing held back - which sailed through both admission
     checks and got cached. Driven proof before the fix: three calls, ONE
     brain call, all three served the failure sentence, and it stayed stuck
     until the entry aged out of the LRU.
 
-    The fix is at the same seam and uses the IDENTICAL structural test
-    analysis.py already applies to the reply - usable string content, never
-    prose matching.
+    The seam-watching client is gone (issue #93 / P9.12): the route now
+    reads the degradation flag the node itself set, which covers this case
+    and the one the sanitiser-emptied test below found. This test stays
+    because the SCENARIO must keep costing a second call, whatever mechanism
+    is behind the admission rule.
     """
     from clarif_eye.ui import describe_document_text
 
@@ -663,6 +665,53 @@ def test_the_text_only_route_never_caches_an_empty_model_reply():
 
     assert len(resources.client.calls) > calls_after_first, (
         "an empty model reply was cached and replayed as this document's answer"
+    )
+    assert first == second
+
+
+# A fenced code block with nothing inside it: a non-empty STRING that
+# clarif_eye.speech.to_spoken_text reduces to nothing at all. Assembled from
+# pieces rather than written out as one literal so the fence markers cannot
+# tangle with this file's own quoting.
+FENCED_EMPTY_REPLY = "```json" + chr(10) + "```"
+
+
+def test_the_text_only_route_never_caches_a_reply_that_sanitises_to_nothing():
+    """THE SECOND SHAPE OF "the model answered with nothing", and the one a
+    reply-content check cannot see.
+
+    A fenced block with nothing inside it (see FENCED_EMPTY_REPLY below) is
+    a non-empty string, so every "did the model
+    come back with usable content?" test passes it - including the one this
+    route used to run at the client seam. But clarif_eye.speech.to_spoken_text
+    strips fences and markup, and what is left is "", so run_analysis takes
+    its "returned an empty response" branch exactly as it does for "   ". The
+    failure sentence was then cached and served to every later caller.
+
+    Not a fixture curiosity: a brain model asked for prose that answers with
+    an empty fenced block is an ordinary way for a free-tier model to fail.
+
+    The fix reads the DEGRADATION FLAG the node itself set
+    (clarif_eye.state.ClarifEyeState.output_degraded, issue #93 / P9.12)
+    rather than guessing from the seam, so every branch run_analysis calls a
+    failure - this one included - is one this route declines to cache.
+    """
+    from clarif_eye.ui import describe_document_text
+
+    class FencedEmptyReplyClient(RecordingClient):
+        def complete(self, role, messages, **params):
+            self.calls.append((role, False, ""))
+            return CompletionResult(content=FENCED_EMPTY_REPLY, model="fake-brain-model:free")
+
+    resources = _text_route_resources(FencedEmptyReplyClient(HONEST_DRAFT))
+
+    first = describe_document_text(BILL_OCR, resources)
+    calls_after_first = len(resources.client.calls)
+    second = describe_document_text(BILL_OCR, resources)
+
+    assert len(resources.client.calls) > calls_after_first, (
+        "a reply that sanitises to nothing was cached and replayed as this "
+        "document's answer"
     )
     assert first == second
 

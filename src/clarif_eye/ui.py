@@ -1406,12 +1406,21 @@ class ThreadRegistry(_BoundedLRU):
 # see _run_pipeline_events' `paused` branch), and a follow-up on a paused
 # thread is refused before it can write anything at all.
 #
-# THE CALL SITES, all reached via _update_thread_state EXCEPT the last, and
-# NO LONGER all post-run (updated by issue #82 / P9.3 - this list said
-# "only after a run reaches its final outcome", which stopped being true):
+# THE CALL SITES. Most are reached via _update_thread_state, but NOT all -
+# and NOT all are post-run either (this list has been rewritten twice as
+# those two claims stopped being true: by issue #82 / P9.3, when it still
+# said "only after a run reaches its final outcome", and by issue #93 /
+# P9.12, when trimming stopped implying writing):
 #   - _run_pipeline_events, after a photo run reaches its final outcome.
-#     NOT reached when that run paused to ask a question.
+#     NOT reached when that run paused to ask a question. Trims WITHOUT
+#     writing when that run degraded - see the next bullet.
+#   - _record_turn's DEGRADED branch (issue #93 / P9.12), called DIRECTLY:
+#     a degraded run records no turn, but it still created checkpoints, so
+#     this thread still wants bounding. Reached from the photo and
+#     follow-up call sites above, which is why both of them can now trim
+#     with no state write behind it.
 #   - _run_followup_events, after a question run reaches its final outcome.
+#     Same degraded caveat as the photo path.
 #   - _run_pipeline_events' CACHE-HIT branch, which runs at the START of a
 #     request and trims before yielding. NOT a post-run call, and the one
 #     place a thread can genuinely still be PAUSED when a write lands -
@@ -1421,7 +1430,8 @@ class ThreadRegistry(_BoundedLRU):
 #     preserve.
 #   - _run_resume_events (issue #83 / P9.4), called DIRECTLY (not via
 #     _update_thread_state) on the retake path, which completes a run
-#     without recording a turn and so has no state write to trim behind.
+#     without recording a turn and so has no state write to trim behind -
+#     the same shape _record_turn's degraded branch above now has.
 #   - AND, since issue #84 / P9.5, one MORE thing has to be bounded here:
 #     dead SUBGRAPH NAMESPACES. The deep path is a child graph now
 #     (clarif_eye.deep_path) and LangGraph checkpoints it under its own
@@ -1902,6 +1912,14 @@ def _record_turn(graph, config, thread_id, messages, degraded):
     pairing them off would attach the wrong answer to it. The user did
     genuinely ask, but a turn that produced no answer is better left out
     whole than left half-written.
+
+    THE PRODUCT RULING THIS FORCES, stated so nobody has to rediscover it as
+    a bug: a follow-up asked after a photo run that DEGRADED degrades in
+    turn - it does not quietly answer about an earlier, good photo on the
+    same thread. That is deliberate. The thread's stored ocr/scene describe
+    the LATEST photo, and answering about an older one would mean
+    confidently describing something other than what the user is holding,
+    to someone who cannot see the difference.
 
     THE TRIM STILL RUNS on a skipped turn: a degraded run still created
     checkpoints, and bounding this thread's checkpoint history is
@@ -3012,60 +3030,6 @@ DESCRIBE_TEXT_API_NAME = "describe_document_text"
 TEXT_ONLY_SCENE = "a document supplied as text, with no photo"
 
 
-class _SuccessWatchingClient:
-    """Delegates to the real client and records whether any completion ever
-    came back with USABLE CONTENT.
-
-    "USABLE CONTENT", NOT "RETURNED WITHOUT RAISING", and the difference is
-    the whole point of this class. A model that answers with "" or "   " has
-    failed just as surely as one that raised - clarif_eye.analysis treats it
-    that way (see its `isinstance(reply, str) and reply.strip()` check) and
-    degrades to "The analysis model returned an empty response." with nothing
-    held back. An earlier version of this class counted that as a success, so
-    the route's cache admitted the failure sentence and served it as the
-    document's answer to every later caller until the entry aged out: driven
-    proof was three calls, ONE model call, the same failure sentence three
-    times. The check below is deliberately the IDENTICAL structural test
-    analysis.py makes, so the two cannot disagree about what an empty reply
-    is - and it is still structural, never a match against the message.
-
-    WHY THIS EXISTS: the cache must never store a failure (see
-    ImageResultCache's rule), and this route cannot otherwise tell one.
-    clarif_eye.analysis catches LadderExhaustedError/OpenRouterError
-    INTERNALLY and degrades to a plain-English message, so from out here a
-    "every model was busy" answer and a real description are both just a
-    non-empty string - and string-matching the difference is exactly what
-    this codebase refuses to do (D15: structural, never prose). Watching the
-    seam the failure actually passes through is the structural answer.
-
-    IT ALSO COVERS THE DEADLINE CASE for free, which is the honest bonus: a
-    run whose budget was already spent skips the model call entirely, so
-    nothing ever succeeds here, so its degraded-from-known answer is not
-    cached either. That is right - it is a description of what this app could
-    manage in the time it had, not the document's answer.
-    """
-
-    def __init__(self, client):
-        self._client = client
-        self.succeeded = False
-
-    def complete(self, role, messages, **params):
-        result = self._client.complete(role, messages, **params)
-        content = getattr(result, "content", None)
-        if isinstance(content, str) and content.strip():
-            self.succeeded = True
-        return result
-
-    def close(self):
-        # Never closes the wrapped client: it is the process-wide shared one
-        # (build_resources), owned by the caller, and closing it here would
-        # take the UI's connection pool down with this request. run_analysis
-        # only closes a client it constructed itself, so this is never called
-        # today - it exists so a future caller that does call it cannot do
-        # that damage by accident.
-        pass
-
-
 def describe_document_text(
     document_text, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUDGET_SECONDS
 ):
@@ -3139,14 +3103,10 @@ def describe_document_text(
     if cached is not None:
         return cached
 
-    # Wrapped so "did a model call actually succeed?" is answerable
-    # structurally after the run - see _SuccessWatchingClient for why that
-    # cannot be read off the result.
-    watched_client = _SuccessWatchingClient(resources.client)
     try:
         config = {
             "configurable": {
-                "client": watched_client,
+                "client": resources.client,
                 "searcher": resources.searcher,
                 "research_client": resources.research_client,
                 "deadline": time.monotonic() + pipeline_budget_seconds,
@@ -3160,8 +3120,8 @@ def describe_document_text(
             config=config,
         )
         # READ INSIDE THE PROTECTED REGION, deliberately. These are
-        # bracket-accesses, so a child that stopped writing either key would
-        # raise KeyError - and out here, past the excepts, that KeyError
+        # bracket-accesses, so a child that stopped writing any of these keys
+        # would raise KeyError - and out here, past the excepts, that KeyError
         # would escape a gr.api route as a 500. Loud is right (see
         # clarif_eye.graph.make_deep_path_node on why the wrapper reads the
         # same keys the same way), but loud in the test suite, not at an API
@@ -3169,6 +3129,7 @@ def describe_document_text(
         # every other unforeseen failure in this module.
         spoken = (result["final_output"] or "").strip()
         held_back = result["verification_hold"] is not None
+        degraded = bool(result["output_degraded"])
     except LadderExhaustedError as exc:
         return message_for_ladder_exhausted(exc)
     except OpenRouterError as exc:
@@ -3181,15 +3142,32 @@ def describe_document_text(
 
     # CACHED ONLY WHEN THE RUN GENUINELY PRODUCED THIS DOCUMENT'S ANSWER, the
     # same discipline the image cache follows:
-    #   - a model call came back with usable content, so a busy-ladder
-    #     message, an empty model reply, or a deadline-degraded read-back of
-    #     the input is left to be retried rather than served to the next
-    #     caller as this document's answer;
+    #   - `analysis` did not degrade, so a busy-ladder message, an empty
+    #     model reply, or a deadline-degraded read-back of the input is left
+    #     to be retried rather than served to the next caller as this
+    #     document's answer;
     #   - nothing was held back for being unverifiable. That outcome is this
     #     route's honest degradation (there is nobody here to ask - see
     #     above), not the description of the document, so a later caller gets
     #     a fresh attempt instead of a replayed refusal.
-    if watched_client.succeeded and not held_back:
+    #
+    # `degraded` COMES FROM THE NODE, NOT FROM THE CLIENT SEAM (issue #93 /
+    # P9.12), and this route used to do it the other way round: it wrapped
+    # the client and watched whether any completion came back with usable
+    # content. That wrapper was removed with this change because the flag
+    # replaces it exactly - but its lesson is worth keeping, since it was
+    # driven twice and failed both times at the same crack. Watching the
+    # seam answers "did the model reply?", which is not the question. A
+    # reply of "   " is non-empty at the transport and empty as an answer;
+    # a reply that is an empty fenced code block is non-empty even AFTER
+    # that check and still sanitises to nothing in
+    # clarif_eye.speech.to_spoken_text, so run_analysis degrades and the
+    # watcher, having seen a perfectly good completion, admitted the failure
+    # sentence to this cache and served it to every later caller. Only the
+    # node that produced final_output knows whether it is an answer, so only
+    # the node's own flag can be trusted here - see
+    # clarif_eye.state.ClarifEyeState.output_degraded.
+    if not degraded and not held_back:
         resources.document_cache.put(cache_key, spoken)
     return spoken
 
