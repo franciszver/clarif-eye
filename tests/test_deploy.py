@@ -100,3 +100,13 @@ def test_readme_mentions_the_render_cold_start():
 
     assert "15 minutes" in text
     assert "Render" in text
+
+
+# --- render.yaml documents the CI-triggered deploy hook -------------------
+
+
+def test_render_yaml_comment_documents_the_ci_deploy_hook():
+    text = (REPO_ROOT / "render.yaml").read_text(encoding="utf-8")
+
+    assert "deploy hook" in text.lower()
+    assert "Auto-Deploy" in text

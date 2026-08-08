@@ -8,6 +8,7 @@ confirms the README carries a CI badge linking to the workflow. No network
 call and no server launched here.
 """
 
+import re
 from pathlib import Path
 
 import yaml
@@ -65,7 +66,37 @@ def test_ci_workflow_runs_ruff():
 def test_ci_workflow_never_references_a_secret_or_api_key():
     text = WORKFLOW_PATH.read_text(encoding="utf-8")
     assert "OPENROUTER_API_KEY" not in text
-    assert "secrets." not in text
+    # The deploy job legitimately references secrets.RENDER_DEPLOY_HOOK (the
+    # hook URL itself is never in this file); no other secret is referenced.
+    secret_refs = re.findall(r"secrets\.(\w+)", text)
+    assert secret_refs == ["RENDER_DEPLOY_HOOK"]
+
+
+def test_ci_workflow_has_a_deploy_job_gated_to_main_pushes_after_test():
+    with open(WORKFLOW_PATH, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+
+    deploy = data["jobs"].get("deploy")
+    assert deploy, "ci.yml must declare a deploy job"
+
+    needs = deploy.get("needs")
+    assert needs == "test" or needs == ["test"]
+
+    condition = deploy.get("if", "")
+    assert "refs/heads/main" in condition
+    assert "github.event_name == 'push'" in condition
+
+    steps = deploy.get("steps", [])
+    assert steps, "deploy job must have at least one step"
+    deploy_step = steps[0]
+    run_text = deploy_step.get("run", "")
+    assert "curl" in run_text
+    assert "-fsS" in run_text
+    assert "--max-time" in run_text
+    assert "$RENDER_DEPLOY_HOOK" in run_text
+
+    env = deploy_step.get("env", {})
+    assert env.get("RENDER_DEPLOY_HOOK") == "${{ secrets.RENDER_DEPLOY_HOOK }}"
 
 
 def test_ci_workflow_has_no_continue_on_error():
