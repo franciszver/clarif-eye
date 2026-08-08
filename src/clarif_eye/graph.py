@@ -57,8 +57,10 @@ named and importable individually so later issues can replace them one at a
 time without restructuring the graph.
 
 Node visitation is observable via the compiled graph's own
-`graph.stream(state, config=config, stream_mode="updates")` (issue #80 /
-P9.1) - one dict per COMPLETED node, keyed by node name - rather than a
+`graph.stream(state, config=config, stream_mode="updates", subgraphs=True)`
+(issue #80 / P9.1, extended by #84 / P9.5) - one dict per COMPLETED node,
+keyed by node name, paired with the checkpoint namespace it came from, so
+the deep-path child's nodes are visible too - rather than a
 caller-supplied trace list threaded through config["configurable"]. That
 gives callers (and tests) real per-node progress instead of a debugging
 side-channel, and needs nothing extra recorded by the nodes themselves.

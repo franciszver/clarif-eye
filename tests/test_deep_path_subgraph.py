@@ -164,7 +164,11 @@ def test_child_node_events_are_visible_in_the_parent_stream():
     completion and the user hears nothing between "photo received" and
     "turning it into speech".
 
-    MUTATION TARGET: dropping subgraphs=True must turn this test RED.
+    This test opens the stream itself, so it pins what LangGraph EMITS. What
+    the app actually CONSUMES is pinned by the two byte-identity guards at
+    the bottom of this file - verified by mutation, not assumed: dropping
+    subgraphs=True from clarif_eye.ui._narrate_stream turns both of them red,
+    because the child's two announcements vanish from what the user hears.
     """
     graph = build_graph()
 

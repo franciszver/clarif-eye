@@ -1772,9 +1772,9 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
     WHILE the graph is still running - the whole point of streaming. Every
     graph injected here - the real one from build_graph(), and every test
     double that stands in for it - is expected to implement .stream(...,
-    stream_mode="updates"); there is no invoke()-only fallback, so an
-    incompatible double fails loudly (AttributeError) instead of silently
-    losing all narration.
+    stream_mode="updates", subgraphs=True); there is no invoke()-only
+    fallback, so an incompatible double fails loudly (AttributeError/
+    TypeError) instead of silently losing all narration.
 
     NEVER raises (except KeyboardInterrupt/SystemExit) - every failure mode
     yields a spoken-ready message instead, per the module docstring. The
