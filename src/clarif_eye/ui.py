@@ -124,6 +124,60 @@ PREFERENCE_CONFIRMATION_DETAILED = (
     "Understood. Descriptions will include more detail for the rest of "
     "this session."
 )
+# --- How many photos one submission may fan out to (issue #110 / P10.2) ----
+#
+# THE SAME KIND OF BOUND DOCUMENT_TEXT_CAP IS, for the same shared resource,
+# and it is here for the same reason: the fan-out spends model calls in
+# proportion to something a visitor controls, and nothing else stopped it.
+# One `Send` per photo means one whole vision chain per photo, plus a
+# research AND an analysis call for every photo the router sends down the
+# deep path - so a submission of fifty images is up to a hundred calls
+# against the SHARED daily allowance (see describe_document_text's own note
+# on that allowance), spent by one visitor in one request, with no login and
+# no per-visitor throttle in front of it. That is the quota-drain shape issue
+# #84 closed for the text route, reintroduced per submission by this feature.
+#
+# THE NUMBER: 4 - the photo control plus three extras. Chosen to sit
+# comfortably ABOVE what this feature's own purpose needs (the front, back
+# and both sides of a package or label is four, which is the case that
+# motivated describing several photos as one thing) and low enough that a
+# worst-case fan-out - every photo taking the deep path - costs about eight
+# calls rather than a hundred. Like every other cap in this codebase
+# (DOCUMENT_TEXT_CAP, analysis._SCRAPER_DATA_CAP, IMAGE_CACHE_MAX_ENTRIES,
+# MAX_LIVE_THREADS), it is a documented, deliberate guess rather than a
+# measured optimum.
+MAX_PHOTOS_PER_SUBMISSION = 4
+
+# REFUSES THE WHOLE SUBMISSION, and describing the first four instead would
+# be the wrong call for this app specifically. A sighted user would see which
+# photos were dropped; this app's user cannot, so a partial answer would be
+# indistinguishable from a complete one and they would be told about four
+# photos while believing they had asked about ten. Saying no is the honest
+# option, so this message has to carry everything needed to act on it without
+# looking at the screen: the limit, how many actually arrived, that NOTHING
+# was described, and what to do next.
+TOO_MANY_PHOTOS_TEMPLATE = (
+    "Only {limit} photos can be described at once, and {count} were "
+    "provided. Nothing was described. Please remove {excess} and try again."
+)
+
+
+def too_many_photos_message(count, limit=MAX_PHOTOS_PER_SUBMISSION):
+    """The spoken refusal for a submission of `count` photos against `limit`.
+
+    A function rather than a bare constant because the count is the half of
+    it the user cannot check for themselves - the photos they attached are a
+    list they cannot see, and "you sent ten" is how they find out the file
+    picker took more than they meant it to.
+    """
+    excess = count - limit
+    return TOO_MANY_PHOTOS_TEMPLATE.format(
+        limit=limit,
+        count=count,
+        excess="one photo" if excess == 1 else f"{excess} photos",
+    )
+
+
 # Issue #84 / P9.5: the text-only API route was called with nothing to
 # describe. Worded for an API caller (there is no button and no photo in
 # this route), which is why it does not reuse NO_QUESTION_MESSAGE.
@@ -243,7 +297,15 @@ ASK_BUTTON_ELEM_ID = "ask-button"
 # reader announces by its label, with no custom keyboard wiring to get wrong -
 # the same discipline every other control here follows.
 EXTRA_PHOTOS_ELEM_ID = "extra-photos-input"
-EXTRA_PHOTOS_LABEL = "More photos to describe in the same turn (optional)"
+# THE LIMIT IS IN THE LABEL, so it is heard when the control is reached
+# rather than only after a submission is refused - the accessible name is
+# the one piece of text a screen-reader user is guaranteed to get here.
+# Derived from MAX_PHOTOS_PER_SUBMISSION rather than written out, so the
+# number a user is told and the number enforced cannot drift apart.
+EXTRA_PHOTOS_LABEL = (
+    f"More photos to describe in the same turn (optional, up to "
+    f"{MAX_PHOTOS_PER_SUBMISSION - 1})"
+)
 RESUME_CONTINUE_BUTTON_ELEM_ID = "resume-continue-button"
 RESUME_RETAKE_BUTTON_ELEM_ID = "resume-retake-button"
 
@@ -2440,6 +2502,22 @@ def _run_pipeline_events(
 
     if resources.client is None:
         yield "outcome", _degraded_outcome(resources.client_error or CONFIG_ERROR_MESSAGE)
+        return
+
+    # THE CAP, CHECKED BEFORE ANYTHING IS ENCODED (issue #110 / P10.2 - see
+    # MAX_PHOTOS_PER_SUBMISSION for the shared-allowance reasoning). Counting
+    # is all this needs, so a fifty-image submission is refused without
+    # decoding, re-encoding or hashing ONE of them, let alone describing it.
+    # Placed after the two guards above rather than before them so a
+    # submission that is both over-cap and unconfigured still reports the
+    # configuration problem, which is the one an operator has to fix.
+    photo_count = 1 + len(extra_images or [])
+    if photo_count > MAX_PHOTOS_PER_SUBMISSION:
+        # Nothing is cached and no turn is recorded on this path, for the
+        # same reason no other early guard does either: the pipeline never
+        # ran, so there is no result to remember and nothing that could be
+        # replayed to the next visitor as a photo's answer.
+        yield "outcome", _degraded_outcome(too_many_photos_message(photo_count))
         return
 
     try:
