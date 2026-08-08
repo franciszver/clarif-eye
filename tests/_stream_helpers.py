@@ -24,10 +24,23 @@ def drain_stream_collecting_trace(graph, state, config):
     that returns a bare Command(goto=...) with no state update - the "entry"
     node does exactly this - streams as {"entry": None}, and dict.update(None)
     would raise. The node still counts as VISITED, so it stays in the trace.
+
+    SUBGRAPHS ARE INCLUDED (issue #84 / P9.5), with their namespace dropped
+    from the trace. The deep path is a child graph now
+    (clarif_eye.deep_path), so without `subgraphs=True` `research` and
+    `analysis` would vanish from every trace in this suite and the whole
+    deep path would read as one opaque "deep_path" step - which would hide
+    exactly the routing these tests exist to assert on. Streamed this way, a
+    deep run traces as entry, vision, research, analysis, deep_path, tts:
+    the child's nodes in the order they ran, then the parent's node that
+    contains them completing. This is the same stream shape
+    clarif_eye.ui._narrate_stream consumes in production.
     """
     result = dict(state)
     trace = []
-    for chunk in graph.stream(state, config=config, stream_mode="updates"):
+    for _namespace, chunk in graph.stream(
+        state, config=config, stream_mode="updates", subgraphs=True
+    ):
         for node_name, update in chunk.items():
             if update is not None:
                 result.update(update)

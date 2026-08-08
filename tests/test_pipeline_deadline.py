@@ -332,9 +332,9 @@ def test_research_node_checks_deadline_itself():
             "research_client": None,
         }
     }
-    state = make_initial_state("imgdata")
-    state["ocr_output"] = "some query text"
-    state["scene_context"] = "a scene"
+    # The CHILD graph's own state shape since issue #84 / P9.5 - see
+    # clarif_eye.deep_path.DeepPathState. Notably it has no image_data at all.
+    state = {"document_text": "some query text", "scene_description": "a scene"}
 
     result = research_node(state, config=config)
 
@@ -358,10 +358,11 @@ def test_fast_synth_node_checks_deadline_itself():
 def test_analysis_node_checks_deadline_itself():
     client = ExplosiveClient()
     config = {"configurable": {"deadline": time.monotonic() - 1.0, "client": client}}
-    state = make_initial_state("imgdata")
-    state["ocr_output"] = "account 12345"
-    state["scene_context"] = "a bill"
-    state["scraper_data"] = "some scrape"
+    state = {
+        "document_text": "account 12345",
+        "scene_description": "a bill",
+        "scraper_data": "some scrape",
+    }
 
     result = analysis_node(state, config=config)
 
@@ -447,10 +448,7 @@ def test_analysis_node_reads_scraper_data_cap_from_config():
 
     client = RecordingClient()
     config = {"configurable": {"client": client, "scraper_data_cap": 300}}
-    state = make_initial_state("imgdata")
-    state["ocr_output"] = "ocr text"
-    state["scene_context"] = "a scene"
-    state["scraper_data"] = scrape
+    state = {"document_text": "ocr text", "scene_description": "a scene", "scraper_data": scrape}
 
     analysis_node(state, config=config)
 

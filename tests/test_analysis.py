@@ -634,11 +634,18 @@ def test_no_client_constructed_when_scene_context_is_a_degradation_message(monke
 
 
 # --- analysis_node: client injection, graph-facing wrapper ------------------
+#
+# analysis_node is a node of the DEEP-PATH CHILD GRAPH since issue #84 / P9.5
+# (clarif_eye.deep_path), so the state it is handed speaks the child's
+# vocabulary: `document_text`/`scene_description` where it used to be
+# `ocr_output`/`scene_context`. Same values, renamed once at the graph
+# boundary by the mapping wrapper - see clarif_eye.deep_path's docstring for
+# why the rename is what makes own-schema mode real.
 
 
 def test_analysis_node_accepts_an_explicit_injected_client():
     client = FakeAnalysisClient(content="This is a bill for $104.95.")
-    state = {"ocr_output": "some text", "scene_context": "a scene", "scraper_data": ""}
+    state = {"document_text": "some text", "scene_description": "a scene", "scraper_data": ""}
 
     result = analysis_node(state, client=client)
 
@@ -649,7 +656,7 @@ def test_analysis_node_accepts_an_explicit_injected_client():
 
 def test_analysis_node_accepts_client_injected_via_config_configurable():
     client = FakeAnalysisClient(content="This is a bill for $104.95.")
-    state = {"ocr_output": "some text", "scene_context": "a scene", "scraper_data": ""}
+    state = {"document_text": "some text", "scene_description": "a scene", "scraper_data": ""}
 
     result = analysis_node(state, config={"configurable": {"client": client}})
 

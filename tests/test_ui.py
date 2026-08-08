@@ -81,6 +81,14 @@ class FakeGraph:
     the invocation, raising self.exc), and graph.next_node_after("tts", ...)
     is None (nothing follows tts), so this maps to no narration phrase and
     every existing staged-contract test keeps its exact yield sequence.
+
+    THE (namespace, chunk) SHAPE (issue #84 / P9.5): clarif_eye.ui's
+    _narrate_stream now opens the stream with subgraphs=True, because the
+    deep path is a child graph whose nodes would otherwise be invisible -
+    and LangGraph then yields PAIRS rather than bare chunks. This double
+    honours the same contract so it keeps standing in for a real graph
+    rather than for the shape one used to have. It has no subgraph of its
+    own, so the namespace it reports is always the parent's ().
     """
 
     def __init__(self, result=None, exc=None):
@@ -94,8 +102,9 @@ class FakeGraph:
             raise self.exc
         return self.result
 
-    def stream(self, state, config=None, stream_mode="updates"):
-        yield {"tts": self.invoke(state, config=config)}
+    def stream(self, state, config=None, stream_mode="updates", subgraphs=False):
+        chunk = {"tts": self.invoke(state, config=config)}
+        yield ((), chunk) if subgraphs else chunk
 
 
 class SequencedGraph:
@@ -113,8 +122,11 @@ class SequencedGraph:
         self.invocations.append({"state": state, "config": config})
         return {"final_output": self.outputs[idx], "audio_file_path": ""}
 
-    def stream(self, state, config=None, stream_mode="updates"):
-        yield {"tts": self.invoke(state, config=config)}
+    def stream(self, state, config=None, stream_mode="updates", subgraphs=False):
+        # See FakeGraph.stream in tests/test_ui.py for the (namespace, chunk)
+        # shape issue #84 / P9.5 introduced.
+        chunk = {"tts": self.invoke(state, config=config)}
+        yield ((), chunk) if subgraphs else chunk
 
 
 def _resources(graph, client="fake-client"):
@@ -470,8 +482,11 @@ class FileWritingGraph:
         self.audio_path.write_bytes(b"fake-mp3-bytes")
         return {"final_output": self.final_output, "audio_file_path": str(self.audio_path)}
 
-    def stream(self, state, config=None, stream_mode="updates"):
-        yield {"tts": self.invoke(state, config=config)}
+    def stream(self, state, config=None, stream_mode="updates", subgraphs=False):
+        # See FakeGraph.stream in tests/test_ui.py for the (namespace, chunk)
+        # shape issue #84 / P9.5 introduced.
+        chunk = {"tts": self.invoke(state, config=config)}
+        yield ((), chunk) if subgraphs else chunk
 
 
 class SequencedTtsGraph:
@@ -493,8 +508,11 @@ class SequencedTtsGraph:
         tts_module._last_result_set(tts_result)
         return {"final_output": final_output, "audio_file_path": audio_path}
 
-    def stream(self, state, config=None, stream_mode="updates"):
-        yield {"tts": self.invoke(state, config=config)}
+    def stream(self, state, config=None, stream_mode="updates", subgraphs=False):
+        # See FakeGraph.stream in tests/test_ui.py for the (namespace, chunk)
+        # shape issue #84 / P9.5 introduced.
+        chunk = {"tts": self.invoke(state, config=config)}
+        yield ((), chunk) if subgraphs else chunk
 
 
 def test_chain_exhausted_result_is_not_cached_a_retry_reruns_and_recovers(tmp_path):

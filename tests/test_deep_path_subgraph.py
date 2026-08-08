@@ -343,10 +343,13 @@ def test_the_text_only_consumer_is_an_api_route_and_not_in_the_ui_flow():
         route = next(
             fn for fn in demo.fns.values() if getattr(fn, "api_name", None) == DESCRIBE_TEXT_API_NAME
         )
-        # No components on either side: it is reachable over the API only,
-        # never as a control someone can tab onto in the main flow.
-        assert not route.inputs
-        assert not route.outputs
+        # It is reachable over the API only - never as a control someone has
+        # to tab past in the main flow. gr.api gives the endpoint synthetic
+        # `Api` placeholders derived from the function's type hints instead of
+        # real components, so "nothing was added to the page" is asserted as
+        # "every component on this route is one of those placeholders".
+        for component in list(route.inputs) + list(route.outputs):
+            assert type(component).__name__ == "Api", f"the API route rendered a real control: {component}"
         assert route.fn(BILL_OCR).strip()
     finally:
         demo.close()

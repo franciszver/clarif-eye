@@ -343,6 +343,10 @@ def test_injected_client_is_not_closed():
 
 
 # --- research_node: client/searcher injection, graph-facing wrapper --------
+#
+# research_node is a node of the DEEP-PATH CHILD GRAPH since issue #84 / P9.5
+# (clarif_eye.deep_path), so the state it is handed uses the child's own key
+# names - see the same note in tests/test_analysis.py.
 
 
 def test_research_node_accepts_explicit_injected_searcher_and_client():
@@ -351,7 +355,7 @@ def test_research_node_accepts_explicit_injected_searcher_and_client():
 
     client = make_client(handler)
     searcher = FakeSearcher(results=[{"href": "https://example.com/page"}])
-    state = {"ocr_output": "some product", "scene_context": "a scene"}
+    state = {"document_text": "some product", "scene_description": "a scene"}
 
     result = research_node(state, searcher=searcher, client=client)
 
@@ -364,7 +368,7 @@ def test_research_node_accepts_searcher_and_client_via_config_configurable():
 
     client = make_client(handler)
     searcher = FakeSearcher(results=[{"href": "https://example.com/page"}])
-    state = {"ocr_output": "some product", "scene_context": "a scene"}
+    state = {"document_text": "some product", "scene_description": "a scene"}
 
     result = research_node(
         state, config={"configurable": {"searcher": searcher, "research_client": client}}
@@ -376,7 +380,7 @@ def test_research_node_accepts_searcher_and_client_via_config_configurable():
 def test_research_node_degrades_gracefully_with_no_injected_seams_and_no_query():
     # No searcher/client injected AND no query derivable (empty state) -
     # must short-circuit before ever constructing a real DDGS()/httpx.Client().
-    state = {"ocr_output": "", "scene_context": ""}
+    state = {"document_text": "", "scene_description": ""}
 
     result = research_node(state)
 
@@ -429,7 +433,11 @@ def test_full_compiled_graph_runs_end_to_end_on_research_path_with_fakes():
 
     result, trace = drain_stream_collecting_trace(graph, state, config)
 
-    assert trace == ["entry", "vision", "research", "analysis", "tts"]
+    # "deep_path" is the parent's own node completing AFTER the two child
+    # nodes it contains (issue #84 / P9.5) - the trace helper streams with
+    # subgraphs=True so the child's nodes stay visible, then the node that
+    # holds them reports its own completion. Nothing about the route changed.
+    assert trace == ["entry", "vision", "research", "analysis", "deep_path", "tts"]
     assert result["scraper_data"] != ""
     assert "Background info" in result["scraper_data"]
     assert result["final_output"] != ""

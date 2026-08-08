@@ -68,8 +68,11 @@ class FakeGraph:
         self.invocations.append({"state": state, "config": config})
         return self.result
 
-    def stream(self, state, config=None, stream_mode="updates"):
-        yield {"tts": self.invoke(state, config=config)}
+    def stream(self, state, config=None, stream_mode="updates", subgraphs=False):
+        # See FakeGraph.stream in tests/test_ui.py for the (namespace, chunk)
+        # shape issue #84 / P9.5 introduced.
+        chunk = {"tts": self.invoke(state, config=config)}
+        yield ((), chunk) if subgraphs else chunk
 
 
 def _resources(graph, client="fake-client"):

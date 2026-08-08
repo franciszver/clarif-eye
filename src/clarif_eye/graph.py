@@ -1,14 +1,23 @@
 """Compiling LangGraph skeleton for Clarif-Eye.
 
-Wires: entry -> vision -> dynamic_router -> fast_synth OR (research ->
-analysis -> [verify_numbers]) -> tts -> END, with entry -> followup -> tts
-as the second way in (issue #82 / P9.3 - a typed question about a photo
-this thread already described). `verify_numbers` (issue #83 / P9.4) is in
-brackets because a second conditional edge decides whether it runs at all:
-it is entered ONLY when `analysis` could not trace a number in its draft
-back to the photographed text, and it is the one node that can PAUSE the
-run to ask the user about it - see its own section below for the narrow
-rule that governs when.
+Wires: entry -> vision -> dynamic_router -> fast_synth OR deep_path -> tts
+-> END, with entry -> followup -> tts as the second way in (issue #82 /
+P9.3 - a typed question about a photo this thread already described).
+
+`deep_path` (issue #84 / P9.5) is ONE NODE HERE AND A WHOLE GRAPH INSIDE:
+research -> analysis -> [verify_numbers], compiled separately with its own
+schema and mounted through a mapping wrapper. That child lives in
+clarif_eye.deep_path, which carries the reasoning for the split, the key
+renaming, and the empirically-verified nesting behaviour (config flowing
+in, child node events streaming out, an interrupt firing inside the child
+and reaching the top-level caller). The node FUNCTIONS the child runs -
+research_node, analysis_node, verify_numbers_node - are still defined here,
+next to the parent's own, because they are the same thin adapters they
+always were. `verify_numbers` is in brackets because a conditional edge
+decides whether it runs at all: it is entered ONLY when `analysis` could
+not trace a number in its draft back to the photographed text, and it is
+the one node that can PAUSE the run to ask the user about it - see its own
+section below for the narrow rule that governs when.
 
 TWO ROUTING MECHANISMS, EACH WHERE IT FITS (issue #82 / P9.3)
 ---------------------------------------------------------------
@@ -61,6 +70,7 @@ from langgraph.graph import END, StateGraph
 from langgraph.types import Command, interrupt
 
 from clarif_eye.analysis import run_analysis
+from clarif_eye.deep_path import build_deep_path_graph
 from clarif_eye.followup import run_followup
 from clarif_eye.research import run_research
 from clarif_eye.state import ClarifEyeState
@@ -239,6 +249,12 @@ def fast_synth_node(state, config=None, client=None):
 def research_node(state, config=None, searcher=None, client=None):
     """Research node (issue #10/P2.1): web-lookup for the document's subject on the deep path.
 
+    A NODE OF THE CHILD GRAPH since issue #84 / P9.5, so it reads the DEEP
+    PATH's own key names (`document_text`/`scene_description`, see
+    clarif_eye.deep_path.DeepPathState) rather than the parent's
+    `ocr_output`/`scene_context`. The function body is otherwise untouched:
+    the values are the same values, mapped once by deep_path_node below.
+
     The substantive logic (query derivation, search, bounded fetch,
     extraction, degradation) lives in clarif_eye.research.run_research so
     this stays a thin adapter, the same pattern the other nodes use.
@@ -262,8 +278,8 @@ def research_node(state, config=None, searcher=None, client=None):
     if client is None:
         client = configurable.get("research_client")
     return run_research(
-        state["ocr_output"],
-        state["scene_context"],
+        state["document_text"],
+        state["scene_description"],
         searcher=searcher,
         client=client,
         deadline_exceeded=_deadline_exceeded(config),
@@ -272,6 +288,9 @@ def research_node(state, config=None, searcher=None, client=None):
 
 def analysis_node(state, config=None, client=None):
     """Deep-analysis node (issue #8/P1.5): turns dense-document input into spoken text.
+
+    A NODE OF THE CHILD GRAPH since issue #84 / P9.5 - see research_node's
+    docstring for the key renaming that applies here identically.
 
     The substantive logic (prompt building, sanitisation, degradation)
     lives in clarif_eye.analysis.run_analysis so this stays a thin adapter,
@@ -292,8 +311,8 @@ def analysis_node(state, config=None, client=None):
     if client is None:
         client = configurable.get("client")
     return run_analysis(
-        state["ocr_output"],
-        state["scene_context"],
+        state["document_text"],
+        state["scene_description"],
         state["scraper_data"],
         client,
         scraper_data_cap=configurable.get("scraper_data_cap"),
@@ -377,7 +396,17 @@ def numbers_need_asking(state):
 
 def analysis_destination(state):
     """The node that runs after `analysis`: "verify_numbers" when there is
-    something to ask the user about, "tts" when there is not.
+    something to ask the user about, the END OF THE CHILD GRAPH when there
+    is not.
+
+    IT RETURNED "tts" UNTIL ISSUE #84 / P9.5, when `analysis` moved into the
+    deep-path child graph (clarif_eye.deep_path). `tts` is the parent's node
+    and the child cannot name it; the parent's own edge out of "deep_path"
+    leads there instead, so a clean run still ends in speech and the user
+    hears exactly the same thing. next_node_after translates this END back
+    to None for the narration, which is what keeps "Turning it into speech"
+    from being announced twice - once by the child finishing and again by
+    the parent's deep_path chunk arriving.
 
     A CONDITIONAL EDGE, not a straight line through the asking node, and
     that is a deliberate application of this module's own "TWO ROUTING
@@ -396,7 +425,7 @@ def analysis_destination(state):
     request, on a 512MB instance, for nothing. Branching here means the
     asking node is entered ONLY on the runs that actually ask.
     """
-    return "verify_numbers" if numbers_need_asking(state) else TTS_NODE
+    return "verify_numbers" if numbers_need_asking(state) else END
 
 
 def verify_numbers_node(state):
@@ -461,6 +490,73 @@ def verify_numbers_node(state):
             "verification_hold": None,
         }
     return {"final_output": RETAKE_CONFIRMATION, "verification_hold": None}
+
+
+# The name the deep path's child graph is mounted under in the parent. A
+# CONSTANT for the same reason TTS_NODE is: the string does not stay inside
+# this module. clarif_eye.ui maps it to a spoken phrase (_NODE_PHRASE), and
+# LangGraph builds every one of the child's checkpoint namespaces out of it
+# ("deep_path:<task id>" - see clarif_eye.ui._trim_thread_to_latest_checkpoint,
+# which has to recognise those namespaces to bound them).
+DEEP_PATH_NODE = "deep_path"
+
+
+def make_deep_path_node(child):
+    """Build the parent's `deep_path` node: the MAPPING WRAPPER that lets a
+    child graph with its own schema run inside this one (issue #84 / P9.5).
+
+    THIS FUNCTION IS THE OWN-SCHEMA MODE. A child whose keys are a subset of
+    the parent's, with the same names, needs nothing at all - `add_node(name,
+    child)` maps the channels itself (verified on langgraph 1.2.10). This
+    child deliberately renames its two inputs, so something has to translate,
+    and this is it: parent state in the parent's words on the way down,
+    child result in the parent's words on the way back up. See
+    clarif_eye.deep_path's module docstring for why the rename is there.
+
+    A CLOSURE OVER AN ALREADY-COMPILED CHILD, not a lazy build inside the
+    node: compiling on every request would be work done per photo for a
+    result that never differs, and a module-level singleton would compile at
+    import time, before this module has finished defining the node functions
+    the child graph is built from.
+
+    NO `config` PARAMETER, AND NO CONFIG PASSED TO THE CHILD. LangGraph
+    propagates the running config into a subgraph invoked from a node on its
+    own - EMPIRICALLY VERIFIED on 1.2.10: the child's nodes see the parent's
+    config["configurable"] (client, searcher, research_client,
+    scraper_data_cap, deadline, thread_id) untouched, which is what keeps the
+    whole-pipeline deadline working across the boundary. Passing the parent's
+    config down BY HAND would also hand over the parent's checkpoint
+    namespace, which is exactly what must NOT happen: the child gets its own.
+
+    RE-EXECUTED ON RESUME, and cheap by design. When the child pauses to ask
+    about an unverifiable number, LangGraph re-runs this whole node from its
+    first line once the answer arrives - so it does nothing but read two keys
+    and call the child, which itself resumes at its paused node rather than
+    from the start. The brain model call is not paid twice; see
+    clarif_eye.deep_path's docstring for the probes behind that.
+    """
+
+    def deep_path_node(state):
+        result = child.invoke(
+            {
+                "document_text": state["ocr_output"],
+                "scene_description": state["scene_context"],
+            }
+        )
+        # MAPPED BACK OUT, all three of them. `final_output` is the deliverable;
+        # `scraper_data` and `verification_hold` are mapped too so the parent's
+        # checkpoint says exactly what it said before this extraction - those
+        # keys are read by clarif_eye.ui (the implicit-retake write clears the
+        # hold) and asserted by the existing test fleet. They are the child's
+        # OUTPUTS being translated, not shared channels: the child still owns
+        # producing them, and the parent never writes into them.
+        return {
+            "final_output": result["final_output"],
+            "scraper_data": result.get("scraper_data"),
+            "verification_hold": result.get("verification_hold"),
+        }
+
+    return deep_path_node
 
 
 def followup_node(state, config=None, client=None):
@@ -543,7 +639,12 @@ def tts_node(state, config=None, provider=None, providers=None):
 
 
 def dynamic_router(state):
-    """Route on state["complexity_flag"]: True -> research, False -> fast_synth.
+    """Route on state["complexity_flag"]: True -> deep_path, False -> fast_synth.
+
+    IT NAMED "research" UNTIL ISSUE #84 / P9.5. research is now the first
+    node of the deep path's own child graph (clarif_eye.deep_path), which the
+    parent sees as the single node DEEP_PATH_NODE - so that is what this
+    router names. Nothing about the decision itself changed.
 
     complexity_flag must be an actual bool. TypedDict gives no runtime
     protection, so `if state["complexity_flag"]` would otherwise route on
@@ -562,7 +663,7 @@ def dynamic_router(state):
             "dynamic_router: state['complexity_flag'] must be bool, got "
             f"{type(flag).__name__} ({flag!r})"
         )
-    return "research" if flag else "fast_synth"
+    return DEEP_PATH_NODE if flag else "fast_synth"
 
 
 def build_graph(checkpointer=None):
@@ -585,12 +686,13 @@ def build_graph(checkpointer=None):
     builder.add_node("entry", entry_node)
     builder.add_node("vision", vision_node)
     builder.add_node("fast_synth", fast_synth_node)
-    builder.add_node("research", research_node)
-    builder.add_node("analysis", analysis_node)
-    # issue #83 / P9.4: sits between analysis and tts so the question is
-    # asked BEFORE anything is spoken, and so a resume never re-runs the
-    # brain call analysis just made - see verify_numbers_node's docstring.
-    builder.add_node("verify_numbers", verify_numbers_node)
+    # issue #84 / P9.5: research -> analysis -> [verify_numbers] are no
+    # longer this graph's own nodes. They are a compiled CHILD GRAPH with its
+    # own schema (clarif_eye.deep_path), mounted here as one node through the
+    # mapping wrapper make_deep_path_node builds. A fresh child per compiled
+    # parent, so two graphs built in one process (the app's, and a test's)
+    # never share one.
+    builder.add_node(DEEP_PATH_NODE, make_deep_path_node(build_deep_path_graph()))
     builder.add_node("followup", followup_node)
     builder.add_node(TTS_NODE, tts_node)
 
@@ -606,24 +708,14 @@ def build_graph(checkpointer=None):
     builder.add_conditional_edges(
         "vision",
         dynamic_router,
-        {"fast_synth": "fast_synth", "research": "research"},
+        {"fast_synth": "fast_synth", DEEP_PATH_NODE: DEEP_PATH_NODE},
     )
     builder.add_edge("fast_synth", TTS_NODE)
-    builder.add_edge("research", "analysis")
-    # Only the deep-analysis path verifies numbers at all (see
-    # clarif_eye.verification's module docstring), so only this path can
-    # route through the asking node - and only on the runs that have
-    # something to ask about. A conditional edge, for the reasons
-    # analysis_destination's docstring gives (the same "branch on a flag
-    # another node computed" shape as dynamic_router, and it keeps an extra
-    # checkpoint write off every clean run). fast_synth and followup go
-    # straight to tts, unchanged.
-    builder.add_conditional_edges(
-        "analysis",
-        analysis_destination,
-        {"verify_numbers": "verify_numbers", TTS_NODE: TTS_NODE},
-    )
-    builder.add_edge("verify_numbers", TTS_NODE)
+    # The whole deep path is one edge from here now. Its internal wiring -
+    # research -> analysis, and the conditional edge into the asking node -
+    # moved with it into clarif_eye.deep_path.build_deep_path_graph, which
+    # keeps its own comments for why each edge is the shape it is.
+    builder.add_edge(DEEP_PATH_NODE, TTS_NODE)
     # A follow-up answer is spoken exactly like a description is: same tts
     # node, same provider chain, same staged delivery in the UI.
     builder.add_edge("followup", TTS_NODE)
@@ -657,9 +749,21 @@ TTS_NODE = "tts"
 # like clarif_eye.ui's per-node progress narration (issue #80 / P9.1).
 _UNCONDITIONAL_SUCCESSOR = {
     "fast_synth": TTS_NODE,
-    "research": "analysis",
-    "verify_numbers": TTS_NODE,
+    DEEP_PATH_NODE: TTS_NODE,
     "followup": TTS_NODE,
+    # BOTH GRAPHS' TOPOLOGY, IN ONE TABLE (issue #84 / P9.5). The two names
+    # below belong to the CHILD graph (clarif_eye.deep_path), not this one.
+    # They are here because the narration that reads this table now sees
+    # child node events too - stream(subgraphs=True) surfaces them at the top
+    # level (see clarif_eye.ui._narrate_stream) - and a node name is
+    # unambiguous across the two graphs, so one table is one place to keep
+    # correct rather than two that could disagree.
+    "research": "analysis",
+    # END, not TTS_NODE, and that is what stops "Turning it into speech"
+    # being announced twice: `verify_numbers` is the last node of the CHILD,
+    # so nothing follows it there. The parent announces tts when its own
+    # `deep_path` chunk arrives a moment later.
+    "verify_numbers": END,
 }
 
 
@@ -697,7 +801,20 @@ def next_node_after(node_name, state):
     if node_name == "vision":
         return dynamic_router(state)
     if node_name == "analysis":
-        return analysis_destination(state)
+        return _successor_or_none(analysis_destination(state))
     if node_name == TTS_NODE:
         return None
-    return _UNCONDITIONAL_SUCCESSOR.get(node_name)
+    return _successor_or_none(_UNCONDITIONAL_SUCCESSOR.get(node_name))
+
+
+def _successor_or_none(successor):
+    """Translate LangGraph's END sentinel to None (issue #84 / P9.5).
+
+    Two of the names next_node_after resolves belong to the deep-path CHILD
+    graph and end AT ITS OWN END rather than at another node. Callers of
+    next_node_after already treat None as "there is nothing to announce for
+    this step", so folding END into None here means the narration needs no
+    idea that a second graph exists - and nothing has to know that END is
+    spelled "__end__".
+    """
+    return None if successor == END else successor
