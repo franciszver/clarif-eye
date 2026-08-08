@@ -2260,7 +2260,13 @@ def _handle_preference_command(verbosity, resources, session_id):
     merely written to the text box. clarif_eye.tts.run_tts already never
     raises (see its own docstring) and always returns {"audio_file_path":
     "" } on any failure, so this function inherits that same guarantee with
-    no try/except of its own needed.
+    no try/except of its own needed. The (audio_path, text) MAPPING itself
+    is _outcome_for, the SAME helper _run_pipeline_events/_run_followup_events
+    use for every other outcome - reused rather than hand-rolled, so a
+    confirmation spoken while the TTS provider chain happens to be
+    exhausted gets the same AUDIO_UNAVAILABLE_NOTE fallback wording every
+    other spoken response already gets, instead of a second, silently
+    different degrade path.
 
     set_verbosity (clarif_eye.preferences) is itself never-raising and a
     silent no-op when `resources.store` is None or `session_id` is falsy -
@@ -2279,7 +2285,7 @@ def _handle_preference_command(verbosity, resources, session_id):
     )
     spoken = _to_spoken_text(confirmation)
     audio_path = run_tts(spoken, providers=resources.tts_providers).get("audio_file_path") or ""
-    yield "outcome", (audio_path or None, spoken)
+    yield "outcome", _outcome_for(spoken, audio_path)
 
 
 def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id=None, session_id=None):
