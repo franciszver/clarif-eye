@@ -1549,6 +1549,27 @@ class ThreadRegistry(_BoundedLRU):
 #     namespace per run, which is the same unbounded growth this function
 #     was written to close, reopened one level down. _drop_dead_subgraph_
 #     namespaces below deletes them.
+# How LangGraph joins the segments of a nested checkpoint namespace, e.g.
+# "describe_one:<task id>|deep_path:<task id>". Named here rather than
+# reaching into langgraph's own constant so this module depends on the
+# STRING it has verified, not on a private name that could move.
+_NAMESPACE_SEP = "|"
+
+
+def _same_run_namespace(namespace, newest):
+    """True if `namespace` belongs to the same live run as `newest` - it IS
+    it, or it is an ancestor or a descendant of it (issue #110 / P10.2).
+
+    See _drop_dead_subgraph_namespaces for why an ancestor has to survive:
+    a pause two graphs deep needs every checkpoint on the path down to it.
+    """
+    if namespace == newest:
+        return True
+    return newest.startswith(namespace + _NAMESPACE_SEP) or namespace.startswith(
+        newest + _NAMESPACE_SEP
+    )
+
+
 def _drop_dead_subgraph_namespaces(checkpointer, thread_storage, thread_id):
     """Delete every non-root checkpoint namespace on this thread except the
     most recent one (issue #84 / P9.5).
@@ -1564,6 +1585,19 @@ def _drop_dead_subgraph_namespaces(checkpointer, thread_storage, thread_id):
     one namespace keeps every resumable pause resumable while still bounding
     the total at one dead namespace instead of one per run.
 
+    NESTED NAMESPACES ARE KEPT WITH THEIR ANCESTOR (issue #110 / P10.2).
+    Child graphs are two deep now - the per-photo graph is mounted at
+    "describe_one:<task id>" and the deep path inside it at
+    "describe_one:<task id>|deep_path:<task id>" - so a run paused in the
+    deep path needs BOTH of those checkpoints to resume from, not just the
+    newer one. Keeping only the single newest namespace made the pause
+    unresumable: the resume restarted the photo at `vision` and paid for
+    the whole pipeline again. Anything that is the newest namespace, an
+    ANCESTOR of it, or a DESCENDANT of it belongs to the same live run and
+    survives; everything else is a finished run's leftovers, including the
+    other branches of a multi-photo fan-out, which have nothing left to
+    resume.
+
     ORDERING: namespaces are compared by their newest checkpoint id, which
     LangGraph generates as a time-ordered UUID (v6) - the SAME assumption
     the per-namespace trim above already makes when it calls max() on
@@ -1576,7 +1610,7 @@ def _drop_dead_subgraph_namespaces(checkpointer, thread_storage, thread_id):
         return
     newest = max(child_namespaces, key=lambda ns: max(thread_storage[ns].keys()))
     for namespace in child_namespaces:
-        if namespace == newest:
+        if _same_run_namespace(namespace, newest):
             continue
         del thread_storage[namespace]
         for key in [k for k in checkpointer.writes if k[0] == thread_id and k[1] == namespace]:

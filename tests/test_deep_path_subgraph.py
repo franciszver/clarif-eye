@@ -28,6 +28,7 @@ from langgraph.types import Command
 from clarif_eye import tts as tts_module
 from clarif_eye.client import CompletionResult, LadderExhaustedError
 from clarif_eye.graph import (
+    DESCRIBE_ONE_NODE,
     INTERRUPT_CHUNK_KEY,
     RESUME_CONTINUE,
     UNVERIFIED_NUMBER_CAVEAT,
@@ -44,6 +45,7 @@ from clarif_eye.ui import (
     handle_submit_staged,
 )
 
+from tests.test_graph import DEEP_TRACE
 from tests._stream_helpers import drain_stream_collecting_trace
 from tests.test_ask_before_speaking import (
     BILL_OCR,
@@ -196,28 +198,51 @@ def test_parent_and_child_node_names_never_collide():
     this fails when a node is ADDED, not only when a table is edited.
     """
     from clarif_eye.deep_path import build_deep_path_graph
+    from clarif_eye.graph import build_photo_graph
 
-    parent_nodes = set(build_graph().nodes)
-    child_nodes = set(build_deep_path_graph().nodes)
+    # THREE graphs since issue #110 / P10.2: the parent, the per-photo graph
+    # the fan-out sends into, and the deep path inside that. All three of
+    # their node names reach the same two flat tables.
+    graphs = {
+        "parent": set(build_graph().nodes),
+        "photo": set(build_photo_graph().nodes),
+        "deep_path": set(build_deep_path_graph().nodes),
+    }
     # LangGraph's own synthetic entry node is in every compiled graph's node
     # set and is not a node either table ever sees.
-    shared = (parent_nodes & child_nodes) - {"__start__"}
+    for nodes in graphs.values():
+        nodes.discard("__start__")
 
-    assert not shared, (
-        f"parent and child graphs both have node(s) {sorted(shared)}. "
-        "clarif_eye.graph._UNCONDITIONAL_SUCCESSOR and clarif_eye.ui."
-        "_NODE_PHRASE are keyed by bare node name across both graphs, so a "
-        "shared name makes one graph's entry answer for the other's node."
-    )
+    names = sorted(graphs)
+    for left in range(len(names)):
+        for right in range(left + 1, len(names)):
+            shared = graphs[names[left]] & graphs[names[right]]
+            assert not shared, (
+                f"the {names[left]} and {names[right]} graphs both have node(s) "
+                f"{sorted(shared)}. clarif_eye.graph._UNCONDITIONAL_SUCCESSOR "
+                "and clarif_eye.ui._NODE_PHRASE are keyed by bare node name "
+                "across all three graphs, so a shared name makes one graph's "
+                "entry answer for another's node."
+            )
 
 
 def test_the_parent_registers_the_child_as_one_node():
-    graph = build_graph()
+    from clarif_eye.graph import build_photo_graph
 
-    assert "deep_path" in graph.nodes
-    # The three extracted nodes are the CHILD's now, not the parent's.
+    graph = build_graph()
+    photo_graph = build_photo_graph()
+
+    # `deep_path` mounts as ONE node, exactly as it always did - one level
+    # lower since issue #110 / P10.2, inside the per-photo graph the fan-out
+    # sends into. It is a stage of describing a PHOTO, not of finishing a
+    # turn, so it moved down with `vision` and `fast_synth`.
+    assert "deep_path" in photo_graph.nodes
+    assert "deep_path" not in graph.nodes
+    # The three extracted nodes are the deep-path CHILD's, not either of
+    # these graphs'.
     for extracted in ("research", "analysis", "verify_numbers"):
         assert extracted not in graph.nodes
+        assert extracted not in photo_graph.nodes
 
 
 def test_child_node_events_are_visible_in_the_parent_stream():
@@ -245,13 +270,25 @@ def test_child_node_events_are_visible_in_the_parent_stream():
         for node_name in chunk
     ]
 
-    child_events = [(ns, name) for ns, name in seen if ns]
-    assert [name for _ns, name in child_events] == ["research", "analysis"]
-    # Every child event is namespaced under the node the child is mounted at.
-    for namespace, _name in child_events:
-        assert namespace[0].startswith("deep_path:")
-    # The parent's own view still names the child ONCE, as a single node.
-    assert [name for ns, name in seen if not ns] == ["entry", "vision", "deep_path", "tts"]
+    # The deep path's own two nodes, namespaced under BOTH the node the
+    # per-photo graph is mounted at and the node the deep path is mounted at
+    # (issue #110 / P10.2 put one more graph between them). Their visibility
+    # from the top is what this test is about, and it survived the nesting.
+    deep_events = [(ns, name) for ns, name in seen if len(ns) == 2]
+    assert [name for _ns, name in deep_events] == ["research", "analysis"]
+    for namespace, _name in deep_events:
+        assert namespace[0].startswith("describe_one:")
+        assert namespace[1].startswith("deep_path:")
+    # The per-photo graph's own nodes sit one level up.
+    photo_events = [(ns, name) for ns, name in seen if len(ns) == 1]
+    assert [name for _ns, name in photo_events] == ["vision", "deep_path"]
+    # The parent's own view names the whole photo as ONE node, then joins.
+    assert [name for ns, name in seen if not ns] == [
+        "entry",
+        "describe_one",
+        "compose",
+        "tts",
+    ]
 
 
 def test_the_deadline_reaches_the_child_s_nodes():
@@ -294,7 +331,7 @@ def test_the_deadline_reaches_the_child_s_nodes():
 
     # The run genuinely went THROUGH the child - without this the rest is
     # vacuous.
-    assert trace == ["entry", "vision", "research", "analysis", "deep_path", "tts"]
+    assert trace == DEEP_TRACE
     # vision made its call and nothing else did: the child's `analysis` node
     # read the deadline off the config it inherited and skipped the brain.
     assert client.calls == ["eyes"], (
@@ -325,7 +362,10 @@ def test_interrupt_from_inside_the_child_reaches_the_top_level_caller():
     snapshot = graph.get_state(config)
     # The PARENT reports the pause at the node the child is mounted at, and
     # carries the child's own interrupt payload up unchanged.
-    assert snapshot.next == ("deep_path",)
+    # The parent reports the pause at the node the PER-PHOTO graph is mounted
+    # at (issue #110 / P10.2 - `deep_path` is one level further down now),
+    # and still carries the deep path's own payload up unchanged.
+    assert snapshot.next == (DESCRIBE_ONE_NODE,)
     assert snapshot.interrupts
     payload = snapshot.interrupts[0].value
     assert payload["reason"] == "unverified_numbers"
@@ -386,16 +426,35 @@ def test_the_wrapper_maps_the_child_s_own_keys_back_onto_the_parent():
 
     list(graph.stream(make_initial_state("base64photo"), config=config, stream_mode="updates"))
 
-    values = graph.get_state(config).values
-    # research ran and reported its outcome, and the PARENT can see it. "" is
-    # research's own "ran, found nothing" value (the fetch above refuses to
-    # touch the network) - what matters is that it is not None, which is
-    # make_initial_state's "research never ran" sentinel and what the parent
-    # would be stuck at if the mapping were dropped.
-    assert values["scraper_data"] == "", (
-        "the wrapper stopped mapping scraper_data back onto the parent"
+    # ASSERTED ON THE STREAMED `deep_path` CHUNK since issue #110 / P10.2,
+    # not on the top-level graph's get_state. The wrapper maps these keys
+    # onto the graph that MOUNTS it, which is the per-photo graph now, and
+    # the per-photo graph does not carry them up to the turn: scraper_data
+    # and verification_hold are properties of describing ONE photo, and a
+    # three-photo turn has three of each with no single answer to write into
+    # one key. The claim this test exists for is unchanged and still
+    # mutation-detectable - delete either line from make_deep_path_node's
+    # return and this reds.
+    chunk = next(
+        update
+        for _namespace, streamed in graph.stream(
+            make_initial_state("base64photo"),
+            config=config,
+            stream_mode="updates",
+            subgraphs=True,
+        )
+        for name, update in streamed.items()
+        if name == "deep_path"
     )
-    assert values["verification_hold"] is None
+    # research ran and reported its outcome. "" is research's own "ran, found
+    # nothing" value (the fetch above refuses to touch the network) - what
+    # matters is that it is not None, which is the "research never ran"
+    # sentinel the mounting graph would be stuck at if the mapping were
+    # dropped.
+    assert chunk["scraper_data"] == "", (
+        "the wrapper stopped mapping scraper_data back onto the graph that mounts it"
+    )
+    assert chunk["verification_hold"] is None
 
 
 def test_the_parent_holds_nothing_pending_after_either_way_out_of_the_question():
@@ -480,7 +539,12 @@ def test_trimming_drops_the_child_namespaces_of_finished_runs():
 
     namespaces = list(checkpointer.storage["growing"])
     child_namespaces = [ns for ns in namespaces if ns]
-    assert len(child_namespaces) <= 1, f"dead child namespaces piled up: {namespaces}"
+    # ONE RUN'S worth survives, not one NAMESPACE: child graphs nest two deep
+    # since issue #110 / P10.2 ("describe_one:<id>" and
+    # "describe_one:<id>|deep_path:<id>"), and both belong to the same run.
+    # What must not grow is the number of RUNS represented.
+    runs = {ns.split("|")[0] for ns in child_namespaces}
+    assert len(runs) <= 1, f"dead child namespaces piled up: {namespaces}"
 
 
 def test_trimming_keeps_the_namespace_a_paused_run_needs_to_resume():

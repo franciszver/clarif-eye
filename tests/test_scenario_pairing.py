@@ -58,6 +58,10 @@ SCENARIOS = [
             # it can be resumed against a brand-new SqliteSaver on the same
             # file.
             "tests/test_durable_checkpointing.py",
+            # Issue #110 / P10.2: drives build_graph with one fake client
+            # serving several photos' branches at once, to prove the Send
+            # fan-out keeps each photo's text in its own branch.
+            "tests/test_send_fanout.py",
         ],
         "scenario_paths": [
             "scripts/live_smoke.py",

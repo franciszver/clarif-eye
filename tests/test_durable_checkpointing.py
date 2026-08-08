@@ -15,7 +15,7 @@ and what they avoid touching (no model or network call).
 import sqlite3
 
 from clarif_eye.client import CompletionResult
-from clarif_eye.graph import DEEP_PATH_NODE, RESUME_CONTINUE, build_graph, make_checkpointer
+from clarif_eye.graph import DESCRIBE_ONE_NODE, RESUME_CONTINUE, build_graph, make_checkpointer
 from clarif_eye.state import make_initial_state
 from clarif_eye.ui import _trim_thread_to_latest_checkpoint
 
@@ -67,7 +67,9 @@ def test_pause_survives_a_brand_new_sqlitesaver_on_the_same_file(tmp_path):
         assert "__interrupt__" in keys, f"run did not pause: {keys}"
 
         snapshot = first_graph.get_state(config)
-        assert snapshot.next == (DEEP_PATH_NODE,)
+        # The pause is reported at the node the PER-PHOTO graph is mounted
+        # at since issue #110 / P10.2 - `deep_path` is one level further down.
+        assert snapshot.next == (DESCRIBE_ONE_NODE,)
         assert snapshot.interrupts, "no pending interrupt was checkpointed"
     finally:
         conn.close()

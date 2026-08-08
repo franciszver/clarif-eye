@@ -24,6 +24,7 @@ from clarif_eye.client import CompletionResult
 from clarif_eye.research import _derive_query, run_research
 from clarif_eye.state import make_initial_state
 
+from tests.test_graph import DEEP_TRACE
 from tests._stream_helpers import drain_stream_collecting_trace
 
 
@@ -437,7 +438,7 @@ def test_full_compiled_graph_runs_end_to_end_on_research_path_with_fakes():
     # nodes it contains (issue #84 / P9.5) - the trace helper streams with
     # subgraphs=True so the child's nodes stay visible, then the node that
     # holds them reports its own completion. Nothing about the route changed.
-    assert trace == ["entry", "vision", "research", "analysis", "deep_path", "tts"]
+    assert trace == DEEP_TRACE
     assert result["scraper_data"] != ""
     assert "Background info" in result["scraper_data"]
     assert result["final_output"] != ""

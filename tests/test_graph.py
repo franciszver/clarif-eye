@@ -18,7 +18,9 @@ from langgraph.graph import END
 
 from clarif_eye.graph import (
     _UNCONDITIONAL_SUCCESSOR,
+    COMPOSE_NODE,
     DEEP_PATH_NODE,
+    DESCRIBE_ONE_NODE,
     TTS_NODE,
     VERIFY_ANSWER_NODE,
     build_graph,
@@ -38,6 +40,37 @@ from tests._stream_helpers import drain_stream_collecting_trace
 # word-count fallback (see clarif_eye.router), not the digit/currency/keyword
 # signals.
 LONG_OCR_TEXT = " ".join(["x"] * 200)
+
+# The two whole-run traces, named once because five tests across three files
+# assert on them (issue #110 / P10.2 moved every photo-describing node down
+# into a child graph, and a literal in each place was five literals to keep
+# in step).
+#
+# HOW TO READ THEM: `vision`, `fast_synth`, `deep_path`, `research` and
+# `analysis` are CHILD graph nodes now - `vision`/`fast_synth`/`deep_path`
+# belong to the per-photo graph (clarif_eye.graph.build_photo_graph),
+# `research`/`analysis` to the deep path inside it
+# (clarif_eye.deep_path) - and the trace helper streams with subgraphs=True
+# so they stay visible with their namespaces dropped. `describe_one` is the
+# parent's own node completing once ONE photo's whole pipeline is done, so a
+# three-photo submission has three of them; `compose` is the join that runs
+# once per turn, and `tts` speaks the joined script once.
+FAST_TRACE = ["entry", "vision", "fast_synth", "describe_one", "compose", "tts"]
+# The same run seen WITHOUT subgraphs=True: the parent's own nodes only, with
+# a whole photo arriving as one `describe_one` completion. Every photo run
+# looks like this from up here, fast path or deep, one photo or several -
+# only the number of `describe_one` entries changes.
+PARENT_TRACE = ["entry", "describe_one", "compose", "tts"]
+DEEP_TRACE = [
+    "entry",
+    "vision",
+    "research",
+    "analysis",
+    "deep_path",
+    "describe_one",
+    "compose",
+    "tts",
+]
 
 
 class FakeVisionClient:
@@ -116,6 +149,11 @@ def test_make_initial_state_has_every_key_with_correct_types():
         "verification_hold",
         # issue #93 / P9.12 - see ClarifEyeState.output_degraded.
         "output_degraded",
+        # issue #110 / P10.2 - the submission (one entry per photo) and the
+        # accumulating per-photo results the fan-out joins on. See
+        # ClarifEyeState.photos / .photo_results.
+        "photos",
+        "photo_results",
     }
     assert set(state.keys()) == expected_keys
 
@@ -134,6 +172,11 @@ def test_state_typeddict_has_exactly_the_expected_keys():
         "verification_hold",
         # issue #93 / P9.12 - see ClarifEyeState.output_degraded.
         "output_degraded",
+        # issue #110 / P10.2 - the submission (one entry per photo) and the
+        # accumulating per-photo results the fan-out joins on. See
+        # ClarifEyeState.photos / .photo_results.
+        "photos",
+        "photo_results",
     }
 
 
@@ -203,7 +246,7 @@ def test_full_graph_routes_using_node_owned_complexity_flag_not_caller_value():
     result, trace = run(graph, state, client=client)
 
     assert result["complexity_flag"] is True
-    assert trace == ["entry", "vision", "research", "analysis", "deep_path", "tts"]
+    assert trace == DEEP_TRACE
     assert "fast_synth" not in trace
 
 
@@ -223,9 +266,33 @@ def test_entry_node_routes_with_a_command_not_a_returned_state_update():
 
     from clarif_eye.graph import entry_node
 
-    photo_run = entry_node({"question": None})
+    # A PHOTO RUN'S goto IS A LIST OF Send OBJECTS since issue #110 / P10.2 -
+    # one per submitted photo, targeting the per-photo child graph's wrapper
+    # node. A submission of one is a fan-out of one, which is the whole
+    # claim: the single-photo case is the degenerate multi-photo case, not a
+    # separate branch. The assertion is still on the Command OBJECT, so
+    # replacing the mechanism with a conditional edge would fail here.
+    from langgraph.types import Send
+
+    photo_run = entry_node({"question": None, "image_data": "base64imagedata"})
     assert isinstance(photo_run, Command)
-    assert photo_run.goto == "vision"
+    assert [send.node for send in photo_run.goto] == [DESCRIBE_ONE_NODE]
+    assert all(isinstance(send, Send) for send in photo_run.goto)
+    assert photo_run.goto[0].arg["image_data"] == "base64imagedata"
+    assert photo_run.goto[0].arg["index"] == 0
+
+    three_photos = entry_node(
+        {
+            "question": None,
+            "photos": [
+                {"image_data": "one", "cached": None},
+                {"image_data": "two", "cached": None},
+                {"image_data": "three", "cached": None},
+            ],
+        }
+    )
+    assert [send.arg["index"] for send in three_photos.goto] == [0, 1, 2]
+    assert [send.arg["image_data"] for send in three_photos.goto] == ["one", "two", "three"]
 
     question_run = entry_node({"question": "what is the expiry date?"})
     assert isinstance(question_run, Command)
@@ -237,10 +304,13 @@ def test_entry_node_treats_a_blank_question_as_a_photo_run():
     # routing one to `followup` would ask a model to answer nothing.
     from clarif_eye.graph import entry_destination
 
-    assert entry_destination({"question": "   "}) == "vision"
+    # DESCRIBE_ONE_NODE, not "vision", since issue #110 / P10.2: `vision` is
+    # the first node of the per-photo child graph now, and the parent's
+    # destination is the wrapper the fan-out targets.
+    assert entry_destination({"question": "   "}) == DESCRIBE_ONE_NODE
     # A never-checkpointed thread's state has no `question` key at all -
     # absent must behave like None, not raise.
-    assert entry_destination({}) == "vision"
+    assert entry_destination({}) == DESCRIBE_ONE_NODE
 
 
 def test_entry_destination_raises_a_named_type_error_on_a_non_string_question():
@@ -344,7 +414,7 @@ def test_fast_path_visits_vision_fast_synth_tts_only():
 
     _, trace = run(graph, state, client=client)
 
-    assert trace == ["entry", "vision", "fast_synth", "tts"]
+    assert trace == FAST_TRACE
     assert "research" not in trace
     assert "analysis" not in trace
 
@@ -362,10 +432,12 @@ def test_research_path_visits_vision_research_analysis_tts_only():
 
     _, trace = run(graph, state, client=client)
 
-    # research and analysis are the CHILD graph's nodes (issue #84 / P9.5);
-    # the trace helper streams with subgraphs=True so they stay visible, and
-    # "deep_path" is the parent's own node completing once they are done.
-    assert trace == ["entry", "vision", "research", "analysis", "deep_path", "tts"]
+    # research and analysis are the DEEP PATH child graph's nodes (issue #84
+    # / P9.5), and vision/deep_path are the PER-PHOTO child graph's (issue
+    # #110 / P10.2); the trace helper streams with subgraphs=True so they all
+    # stay visible. "describe_one" is the parent's own node completing once
+    # that photo's whole pipeline is done, and "compose" is the join.
+    assert trace == DEEP_TRACE
     assert "fast_synth" not in trace
 
 
@@ -390,8 +462,22 @@ def test_tts_node_constant_names_a_node_the_compiled_graph_actually_has():
     # other path's declared successor is this same constant, so a rename
     # cannot leave half the topology pointing at a stale string.
     assert next_node_after(TTS_NODE, {}) is None
-    assert _UNCONDITIONAL_SUCCESSOR["fast_synth"] == TTS_NODE
-    assert _UNCONDITIONAL_SUCCESSOR[DEEP_PATH_NODE] == TTS_NODE
+    # `compose` is the only node that names tts on the photo path since issue
+    # #110 / P10.2: `fast_synth` and `deep_path` are the last nodes of the
+    # PER-PHOTO child graph now, and a child cannot name the parent's tts -
+    # the same rule `verify_numbers` already followed. That is also what
+    # keeps "Turning it into speech" announced once per TURN rather than
+    # once per photo.
+    assert _UNCONDITIONAL_SUCCESSOR[COMPOSE_NODE] == TTS_NODE
+    assert next_node_after(COMPOSE_NODE, {}) == TTS_NODE
+    assert _UNCONDITIONAL_SUCCESSOR["fast_synth"] == END
+    assert _UNCONDITIONAL_SUCCESSOR[DEEP_PATH_NODE] == END
+    assert next_node_after("fast_synth", {}) is None
+    assert next_node_after(DEEP_PATH_NODE, {}) is None
+    # And the fan-out's own edge: a branch finishing leads to the join, which
+    # has no phrase - the per-photo progress count is announced by
+    # clarif_eye.ui._narrate_stream counting completions instead.
+    assert _UNCONDITIONAL_SUCCESSOR[DESCRIBE_ONE_NODE] == COMPOSE_NODE
     # `followup` left this table in issue #92 / P9.11: its edge is CONDITIONAL
     # now (followup_destination), because an answer holding an unverifiable
     # number goes to the parent's own asking node first. With nothing held it

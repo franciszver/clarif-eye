@@ -15,6 +15,7 @@ from clarif_eye.state import make_initial_state
 from clarif_eye import vision
 from clarif_eye.vision import _parse_reply, is_degraded_scene, run_vision
 
+from tests.test_graph import DEEP_TRACE
 from tests._stream_helpers import drain_stream_collecting_trace
 
 # 200 words, no data-density signals: trips only the router's long-document
@@ -623,8 +624,13 @@ def test_full_compiled_graph_runs_end_to_end_with_fake_client_research_path():
         graph, state, config={"configurable": {"client": client, "tts_provider": _FakeTtsProvider()}}
     )
 
-    assert result["complexity_flag"] is True
-    assert trace == ["entry", "vision", "research", "analysis", "deep_path", "tts"]
+    # "deep_path" in the trace, not result["complexity_flag"], since issue
+    # #110 / P10.2: the complexity flag is a PER-PHOTO routing signal written
+    # inside the per-photo child graph, and a turn made of several photos has
+    # no single value for it - so the parent's state no longer carries one.
+    # What this line has always been about is that the DEEP PATH ran, and
+    # that is what it now says.
+    assert trace == DEEP_TRACE
     assert result["final_output"] != ""
     assert result["audio_file_path"] != ""
 

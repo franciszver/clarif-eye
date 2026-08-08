@@ -198,16 +198,19 @@ def test_checkpoint_ids_are_time_ordered_across_namespaces():
     _invoke(graph, "ns-ordering-image-two", thread_id, ocr=long_ocr)
     namespaces = _child_namespaces()
 
-    assert len(namespaces) == 2, f"expected two child namespaces, got {namespaces}"
+    # TWO PER RUN since issue #110 / P10.2: child graphs nest two deep now
+    # ("describe_one:<id>" and "describe_one:<id>|deep_path:<id>"). What the
+    # ordering assumption is about is unchanged - which RUN max() picks.
+    assert len(namespaces) == 4, f"expected two runs' child namespaces, got {namespaces}"
 
-    # RECENCY, ESTABLISHED WITHOUT LOOKING AT AN ID: the newer namespace is
-    # simply the one that was not there after the first run. Comparing that
-    # against what max() picks is what makes this a proof of the ordering
+    # RECENCY, ESTABLISHED WITHOUT LOOKING AT AN ID: the newer namespaces are
+    # simply the ones that were not there after the first run. Comparing what
+    # max() picks against that set is what makes this a proof of the ordering
     # assumption rather than a restatement of it.
-    by_recency = (namespaces - after_first).pop()
+    by_recency = namespaces - after_first
     by_id = max(namespaces, key=lambda ns: max(saver.storage[thread_id][ns]))
 
-    assert by_id == by_recency, (
+    assert by_id in by_recency, (
         "checkpoint ids are no longer time-ordered across namespaces - "
         "clarif_eye.ui._drop_dead_subgraph_namespaces would delete the wrong "
         "namespace, possibly one holding a paused run."
