@@ -2663,7 +2663,20 @@ TEXT_ONLY_SCENE = "a document supplied as text, with no photo"
 
 class _SuccessWatchingClient:
     """Delegates to the real client and records whether any completion ever
-    came back successfully.
+    came back with USABLE CONTENT.
+
+    "USABLE CONTENT", NOT "RETURNED WITHOUT RAISING", and the difference is
+    the whole point of this class. A model that answers with "" or "   " has
+    failed just as surely as one that raised - clarif_eye.analysis treats it
+    that way (see its `isinstance(reply, str) and reply.strip()` check) and
+    degrades to "The analysis model returned an empty response." with nothing
+    held back. An earlier version of this class counted that as a success, so
+    the route's cache admitted the failure sentence and served it as the
+    document's answer to every later caller until the entry aged out: driven
+    proof was three calls, ONE model call, the same failure sentence three
+    times. The check below is deliberately the IDENTICAL structural test
+    analysis.py makes, so the two cannot disagree about what an empty reply
+    is - and it is still structural, never a match against the message.
 
     WHY THIS EXISTS: the cache must never store a failure (see
     ImageResultCache's rule), and this route cannot otherwise tell one.
@@ -2687,7 +2700,9 @@ class _SuccessWatchingClient:
 
     def complete(self, role, messages, **params):
         result = self._client.complete(role, messages, **params)
-        self.succeeded = True
+        content = getattr(result, "content", None)
+        if isinstance(content, str) and content.strip():
+            self.succeeded = True
         return result
 
     def close(self):
@@ -2735,9 +2750,25 @@ def describe_document_text(
     clarif_eye.client), so every call here is a model call the photo pipeline
     cannot make later that day - and every uncached call is an outbound web
     search and page fetch too. That is why this route is CAPPED
-    (DOCUMENT_TEXT_CAP) and CACHED (DocumentTextCache) rather than left open:
-    with neither, a caller in a retry loop could spend the day's allowance
-    and the UI would simply stop answering for everyone.
+    (DOCUMENT_TEXT_CAP) and CACHED (DocumentTextCache) rather than left open.
+
+    WHAT THE CACHE DOES AND DOES NOT DEFEND AGAINST, stated plainly because
+    "it's cached" invites more confidence than it has earned:
+      - It stops SEQUENTIAL repeats. The same document asked for again, after
+        the first answer exists, costs nothing.
+      - It does NOT stop CONCURRENT ones. There is no single-flight: twelve
+        identical requests arriving together all miss, all run, and all spend
+        a model call, because the entry is only written once a run finishes.
+        Deliberate, and the same shape ImageResultCache has always had -
+        in-flight de-duplication means a lock or a futures map held across a
+        request that can take a minute, which is real machinery to get right
+        (and to not deadlock) for a demo app whose realistic worst case is a
+        handful of visitors.
+      - It has NO TTL, also like ImageResultCache: the first successful answer
+        for a given document is pinned until it is evicted by LRU pressure or
+        the process restarts. Fine here - the same text has the same
+        description - but it does mean a better model shipping tomorrow does
+        not re-answer today's cached documents.
 
     NO IMAGE CACHE (it is keyed on image content and there is no image), and
     NO THREAD (nothing to remember between calls - a follow-up question is a
@@ -2777,6 +2808,16 @@ def describe_document_text(
             },
             config=config,
         )
+        # READ INSIDE THE PROTECTED REGION, deliberately. These are
+        # bracket-accesses, so a child that stopped writing either key would
+        # raise KeyError - and out here, past the excepts, that KeyError
+        # would escape a gr.api route as a 500. Loud is right (see
+        # clarif_eye.graph.make_deep_path_node on why the wrapper reads the
+        # same keys the same way), but loud in the test suite, not at an API
+        # caller: inside the try it degrades to UNEXPECTED_ERROR_MESSAGE like
+        # every other unforeseen failure in this module.
+        spoken = (result["final_output"] or "").strip()
+        held_back = result["verification_hold"] is not None
     except LadderExhaustedError as exc:
         return message_for_ladder_exhausted(exc)
     except OpenRouterError as exc:
@@ -2784,20 +2825,20 @@ def describe_document_text(
     except Exception:
         return UNEXPECTED_ERROR_MESSAGE
 
-    spoken = (result["final_output"] or "").strip()
     if not spoken:
         return UNEXPECTED_ERROR_MESSAGE
 
     # CACHED ONLY WHEN THE RUN GENUINELY PRODUCED THIS DOCUMENT'S ANSWER, the
     # same discipline the image cache follows:
-    #   - a model call actually succeeded, so a busy-ladder message or a
-    #     deadline-degraded read-back of the input is left to be retried
-    #     rather than served to the next caller as this document's answer;
+    #   - a model call came back with usable content, so a busy-ladder
+    #     message, an empty model reply, or a deadline-degraded read-back of
+    #     the input is left to be retried rather than served to the next
+    #     caller as this document's answer;
     #   - nothing was held back for being unverifiable. That outcome is this
     #     route's honest degradation (there is nobody here to ask - see
     #     above), not the description of the document, so a later caller gets
     #     a fresh attempt instead of a replayed refusal.
-    if watched_client.succeeded and result["verification_hold"] is None:
+    if watched_client.succeeded and not held_back:
         resources.document_cache.put(cache_key, spoken)
     return spoken
 

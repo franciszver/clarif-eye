@@ -26,7 +26,7 @@ from langgraph.graph import StateGraph
 from langgraph.types import Command
 
 from clarif_eye import tts as tts_module
-from clarif_eye.client import LadderExhaustedError
+from clarif_eye.client import CompletionResult, LadderExhaustedError
 from clarif_eye.graph import (
     INTERRUPT_CHUNK_KEY,
     RESUME_CONTINUE,
@@ -627,6 +627,65 @@ def test_the_text_only_route_never_replays_a_failure_as_an_answer():
     describe_document_text(BILL_OCR, resources)
 
     assert len(resources.client.calls) > calls_after_first, "a failure was cached and replayed"
+
+
+def test_the_text_only_route_never_caches_an_empty_model_reply():
+    """A MODEL THAT ANSWERS WITH NOTHING IS A FAILURE, and must not become
+    this document's stored answer.
+
+    The gap this closes: _SuccessWatchingClient used to count any completion
+    that RETURNED as a success, so a blank reply set succeeded=True.
+    run_analysis then degrades it to its "returned an empty response"
+    sentence with nothing held back - which sailed through both admission
+    checks and got cached. Driven proof before the fix: three calls, ONE
+    brain call, all three served the failure sentence, and it stayed stuck
+    until the entry aged out of the LRU.
+
+    The fix is at the same seam and uses the IDENTICAL structural test
+    analysis.py already applies to the reply - usable string content, never
+    prose matching.
+    """
+    from clarif_eye.ui import describe_document_text
+
+    class BlankReplyClient(RecordingClient):
+        def complete(self, role, messages, **params):
+            self.calls.append((role, False, ""))
+            return CompletionResult(content="   ", model="fake-brain-model:free")
+
+    resources = _text_route_resources(BlankReplyClient(HONEST_DRAFT))
+
+    first = describe_document_text(BILL_OCR, resources)
+    calls_after_first = len(resources.client.calls)
+    second = describe_document_text(BILL_OCR, resources)
+
+    assert len(resources.client.calls) > calls_after_first, (
+        "an empty model reply was cached and replayed as this document's answer"
+    )
+    assert first == second
+
+
+def test_the_text_only_route_does_not_cache_an_unverifiable_answer():
+    """The other half of the admission rule, pinned rather than assumed.
+
+    When a number in the draft cannot be traced back to the document text,
+    this route returns the safe "could not be verified" script - its honest
+    degradation, since there is no UI here to ask the question through. That
+    is not the document's description, so the next caller must get a fresh
+    attempt at it rather than a replayed refusal.
+    """
+    from clarif_eye.ui import describe_document_text
+
+    resources = _text_route_resources(RecordingClient(INVENTED_DRAFT))
+
+    first = describe_document_text(BILL_OCR, resources)
+    calls_after_first = len(resources.client.calls)
+    describe_document_text(BILL_OCR, resources)
+
+    assert "could not be verified" in first
+    assert "999.99" not in first
+    assert len(resources.client.calls) > calls_after_first, (
+        "an unverifiable outcome was cached and replayed"
+    )
 
 
 def test_the_text_only_route_caps_what_it_sends_to_the_model():
