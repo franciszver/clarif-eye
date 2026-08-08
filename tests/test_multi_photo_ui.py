@@ -231,12 +231,18 @@ def test_a_multi_photo_turn_is_never_cached_as_one_result():
 def test_one_unreadable_photo_degrades_the_whole_turn_and_says_which_one():
     resources = _resources(SubjectClient(failing_subject="bread"))
 
-    status, _audio, text = _stage(resources, APPLES, [BREAD, CHEESE])[-1]
+    status, audio, text = _stage(resources, APPLES, [BREAD, CHEESE])[-1]
 
-    assert status == STATUS_DEGRADED
-    assert "second photo" in text
-    # The photos that DID work are still described.
+    assert "The second photo could not be described." in text
+    # The photos that DID work are still described. Throwing away two good
+    # descriptions because a third photo failed would be worse than useless.
     assert "apples" in text and "cheese" in text
+    # NOT STATUS_DEGRADED, and that is issue #93 / P9.12's established
+    # semantics rather than a gap: the run COMPLETED and produced real spoken
+    # audio, so the status describes how the run ended, not whether the
+    # answer is honest. What marks the turn as degraded travels in state and
+    # is proved by the memory test below.
+    assert audio and status != STATUS_DEGRADED
 
 
 def test_a_degraded_multi_photo_turn_is_not_remembered():

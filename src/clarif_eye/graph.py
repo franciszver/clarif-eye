@@ -1203,9 +1203,9 @@ def _failure_sentence(positions):
     """The one sentence that tells a listener which photos did not work."""
     names = [f"the {_ordinal(position)}" for position in positions]
     if len(names) == 1:
-        return f"{names[0]} photo could not be described."
+        return f"The {_ordinal(positions[0])} photo could not be described."
     joined = ", ".join(names[:-1]) + f" and {names[-1]}"
-    return f"{joined} photos could not be described."
+    return f"{joined.capitalize()} photos could not be described."
 
 
 def compose_node(state):

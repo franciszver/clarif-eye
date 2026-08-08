@@ -62,6 +62,10 @@ SCENARIOS = [
             # serving several photos' branches at once, to prove the Send
             # fan-out keeps each photo's text in its own branch.
             "tests/test_send_fanout.py",
+            # Issue #110 / P10.2: the same fan-out driven through the app's
+            # staged handler, with a fake client and a fake TTS provider, to
+            # pin what the user is told and what the caches do.
+            "tests/test_multi_photo_ui.py",
         ],
         "scenario_paths": [
             "scripts/live_smoke.py",

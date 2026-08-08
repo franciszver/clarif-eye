@@ -63,6 +63,7 @@ from clarif_eye.deep_path import build_deep_path_graph
 from clarif_eye.graph import (
     DEEP_PATH_NODE,
     DEFAULT_PIPELINE_BUDGET_SECONDS,
+    DESCRIBE_ONE_NODE,
     INTERRUPT_CHUNK_KEY,
     INTERRUPT_REASON_ANSWER,
     RESUME_CONTINUE,
@@ -74,7 +75,7 @@ from clarif_eye.graph import (
 )
 from clarif_eye.preferences import detect_preference_command, set_verbosity, VERBOSITY_SHORT
 from clarif_eye.speech import to_spoken_text as _to_spoken_text
-from clarif_eye.state import make_initial_state
+from clarif_eye.state import make_initial_state_for_photos
 from clarif_eye.tts import DEFAULT_PROVIDER_CHAIN, is_chain_exhausted, run_tts
 
 # Spoken-ready messages, as named constants rather than inline literals -
@@ -224,6 +225,25 @@ ASK_BUTTON_ELEM_ID = "ask-button"
 # moment they become visible - no custom keyboard wiring, nothing to get
 # wrong. They carry elem_ids for the same reason every other control here
 # does: so the accessibility tests find them structurally, by id.
+# Issue #110 / P10.2: the OPTIONAL extra photos for one turn.
+#
+# A SECOND, SEPARATE INPUT rather than a change to the gr.Image above, and
+# that choice is the whole a11y argument. The primary task - point the camera
+# at one thing and hear what it says - keeps its exact control, its exact
+# label, its exact position in the tab order, and its webcam source. Turning
+# that component into a multi-file one would have moved the primary task onto
+# a file list for everyone, to serve the rarer case; leaving it alone means a
+# user who never wants this feature meets ONE extra tab stop, clearly named as
+# optional, and nothing else about their experience moves.
+#
+# gr.File, not a second gr.Image: several photos have to arrive in ONE
+# submission for them to be one turn, and gr.File(file_count="multiple") is
+# the only stock Gradio input that accepts a set of images at once. It is an
+# ordinary labelled file input, so it is an ordinary tab stop that a screen
+# reader announces by its label, with no custom keyboard wiring to get wrong -
+# the same discipline every other control here follows.
+EXTRA_PHOTOS_ELEM_ID = "extra-photos-input"
+EXTRA_PHOTOS_LABEL = "More photos to describe in the same turn (optional)"
 RESUME_CONTINUE_BUTTON_ELEM_ID = "resume-continue-button"
 RESUME_RETAKE_BUTTON_ELEM_ID = "resume-retake-button"
 
@@ -645,6 +665,41 @@ STATUS_WORKING = (
 # model call over already-stored text, with no vision call and no web
 # lookup, so the "up to about 30 seconds" warning a photo needs would
 # overstate it.
+# The multi-photo form of STATUS_WORKING (issue #110 / P10.2). SAYS HOW MANY,
+# because that is the one thing a listener cannot check for themselves: the
+# photos they added are a list they cannot see, and hearing "3 photos
+# received" is how they find out that the fourth one did not attach.
+#
+# NO SECOND-COUNT PROMISE, deliberately, where STATUS_WORKING gives one. The
+# branches run in the same superstep so a turn is not simply N times a single
+# photo, and no measurement of a multi-photo turn's real duration exists yet -
+# so it says the honest comparative thing instead of a number that would be
+# invented. Replace it with a figure when there is one to quote.
+STATUS_WORKING_MULTIPLE_TEMPLATE = (
+    "{count} photos received. Describing them all now; this takes longer "
+    "than a single photo."
+)
+
+
+def working_status_for(count):
+    """The opening announcement for a submission of `count` photos.
+
+    ONE PHOTO RETURNS STATUS_WORKING UNCHANGED, byte for byte. The
+    single-photo path is the primary experience and its wording is pinned by
+    tests/test_accessibility.py; this function exists to add a case, not to
+    reword the one that was already there.
+    """
+    if count <= 1:
+        return STATUS_WORKING
+    return STATUS_WORKING_MULTIPLE_TEMPLATE.format(count=count)
+
+
+# Per-photo progress, announced ONLY for a multi-photo turn (issue #110 /
+# P10.2). See _narrate_stream for the timing-honesty argument: this is keyed
+# off completion chunks that have genuinely arrived, so it says how many
+# photos are DONE and never which one is running.
+STATUS_PHOTO_PROGRESS_TEMPLATE = "{done} of {total} photos described."
+
 STATUS_ASKING = "Question received. Working out the answer now."
 # SHORT ON PURPOSE (issue #47 / P5.3): when audio will play, the audio
 # itself is the completion signal - a long spoken status is redundant with
@@ -1949,6 +2004,44 @@ def _encode_image(image):
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def _encode_submission(image, extra_images):
+    """Every photo in this submission, base64-encoded, in submission order
+    (issue #110 / P10.2).
+
+    `image` is the primary gr.Image's PIL object - the single-photo path,
+    unchanged. `extra_images` is whatever the optional multi-file input
+    handed over: file PATHS (gr.File's `type="filepath"`), objects carrying
+    a `.name`, or PIL images, because a component's exact payload shape is
+    not something this function should be brittle about. None or an empty
+    list means "one photo", which is the common case and the whole reason
+    this returns a list rather than the caller branching on it.
+
+    Raises on anything unreadable, exactly as _encode_image does, so
+    _run_pipeline_events keeps turning that into UNREADABLE_IMAGE_MESSAGE.
+    """
+    photos = [_encode_image(image)]
+    for extra in extra_images or []:
+        photos.append(_encode_image(_as_image(extra)))
+    return photos
+
+
+def _as_image(item):
+    """Coerce one entry of the multi-photo input into something
+    _encode_image can read.
+
+    A PIL image already can be (it has .save); anything else is treated as a
+    path to open, including the objects Gradio hands back that carry the
+    real path on `.name`. PIL is imported lazily here rather than at module
+    import: gradio brings it in already, and this module is imported by
+    tests that never touch a real image file.
+    """
+    if hasattr(item, "save"):
+        return item
+    from PIL import Image
+
+    return Image.open(getattr(item, "name", item))
+
+
 def _degraded_outcome(text):
     """The "outcome" payload for a guard/early-failure exit that never
     attempted TTS (no image, no client, an exception escaping the graph,
@@ -2184,6 +2277,7 @@ def _narrate_stream(graph, state, config, result):
     resumed run). This function does not care which - it only drives and
     narrates.
     """
+    photos_described = 0
     for namespace, chunk in graph.stream(
         state, config=config, stream_mode="updates", subgraphs=True
     ):
@@ -2217,6 +2311,37 @@ def _narrate_stream(graph, state, config, result):
                 continue
             if update is not None:
                 result.update(update)
+            # PER-PHOTO PROGRESS (issue #110 / P10.2), and the ONE narration
+            # in this app that is not derived from next_node_after.
+            #
+            # HONEST TIMING, which is the only reason it exists at all: a
+            # `describe_one` chunk means that photo has genuinely FINISHED -
+            # it is a completion, the same kind of fact every other phrase
+            # here is built on. So the count comes from how many results
+            # have actually accumulated, never from an assumption about
+            # which branch is running. It deliberately does NOT say "photo 2
+            # of 3", the wording the issue sketched: branches finish in
+            # whatever order they finish in, so the second COMPLETION is not
+            # necessarily the second PHOTO, and naming one would be a guess
+            # dressed as a fact. "2 of 3 photos described" is what is known.
+            #
+            # SILENT FOR A SINGLE PHOTO: nothing is worth counting, and the
+            # primary path's spoken sequence must stay exactly as it was.
+            #
+            # COUNTED LOCALLY, not read back off `result`: this loop merges
+            # chunks with dict.update, which REPLACES a key rather than
+            # running its reducer, so `result["photo_results"]` holds only
+            # the branch that finished most recently and would report "1 of
+            # 3" three times. The reducer's accumulation is the graph's
+            # business; the count of completions this loop has actually seen
+            # is this loop's.
+            if node_name == DESCRIBE_ONE_NODE:
+                photos_described += 1
+                total = len(result.get("photos") or [])
+                if total > 1:
+                    yield "status", STATUS_PHOTO_PROGRESS_TEMPLATE.format(
+                        done=photos_described, total=total
+                    )
             # next_node_after is the single source of truth for this
             # graph's topology (clarif_eye.graph, right next to
             # build_graph()'s edges) - this module only supplies the
@@ -2229,7 +2354,10 @@ def _narrate_stream(graph, state, config, result):
                 yield "status", phrase
 
 
-def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=None, session_id=None):
+def _run_pipeline_events(
+    image, resources, pipeline_budget_seconds, thread_id=None, session_id=None,
+    extra_images=None,
+):
     """Generator: the ONE place that knows how to run a photo through the
     pipeline - guards, the image cache, graph execution, and the
     exception/outcome mapping.
@@ -2315,7 +2443,7 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
         return
 
     try:
-        image_data = _encode_image(image)
+        submission = _encode_submission(image, extra_images)
     except Exception:
         yield "outcome", _degraded_outcome(UNREADABLE_IMAGE_MESSAGE)
         return
@@ -2326,8 +2454,25 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
     # hit yields no "status" events at all - see this module's top-level
     # "hits bypass the graph" docstring note - so handle_submit_staged
     # stages a hit exactly like it did before streaming existed.
-    cache_key = _image_content_key(image_data)
-    cached = resources.image_cache.get(cache_key)
+    #
+    # TWO DIFFERENT CACHE QUESTIONS (issue #110 / P10.2), asked in this
+    # order, and the difference is the audio:
+    #   (a) "is this WHOLE SUBMISSION already answered, audio and all?" -
+    #       the branch just below, which bypasses the graph entirely. Only
+    #       ever answerable for a submission of ONE photo, because what is
+    #       stored is one photo's audio and one photo's script. A
+    #       three-photo turn's audio is a recording of all three read
+    #       together, and no per-photo entry holds it.
+    #   (b) "is THIS PHOTO's description already known?" - the pre-pass
+    #       after it, which fills each photo's Send payload. A hit there
+    #       skips that photo's model calls and still appears in the combined
+    #       narration, but the turn still runs: it needs the join and the
+    #       one tts call.
+    # Both are asked unconditionally, with no branch on how many photos
+    # there are: for one photo (a) subsumes (b) - the same entry answers
+    # both - so the pre-pass simply finds nothing left to do.
+    cache_key = _image_content_key(submission[0])
+    cached = resources.image_cache.get(cache_key) if len(submission) == 1 else None
     if cached is not None:
         cached_audio_path, cached_text, cached_ocr, cached_scene = cached
         # A cached audio path could have been deleted since it was stored
@@ -2435,8 +2580,32 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
             return
         resources.image_cache.discard(cache_key)
 
+    # Question (b) above: the per-photo pre-pass. It lives HERE, in the app,
+    # and not inside the fan-out's own node, so the graph never learns that
+    # a cache exists - a hit rides into the branch as ordinary data on its
+    # Send payload (see clarif_eye.graph.make_describe_one_node). A stale
+    # audio path is irrelevant to this question: the combined script is
+    # spoken fresh by the one tts call at the end, so only the TEXT a hit
+    # carries is used.
+    photos = []
+    for photo_data in submission:
+        entry = {"image_data": photo_data, "cached": None}
+        hit = resources.image_cache.get(_image_content_key(photo_data))
+        if hit is not None:
+            _hit_audio, hit_text, hit_ocr, hit_scene = hit
+            entry["cached"] = {
+                "final_output": hit_text,
+                "ocr_output": hit_ocr,
+                "scene_context": hit_scene,
+                # Only successful, non-degraded results are ever admitted to
+                # this cache (see the put site below), so a hit is a real
+                # description by construction.
+                "output_degraded": False,
+            }
+        photos.append(entry)
+
     try:
-        state = make_initial_state(image_data)
+        state = make_initial_state_for_photos(photos)
         configurable = {
             "client": resources.client,
             "tts_providers": resources.tts_providers,
@@ -2550,7 +2719,18 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
     # through the cache entry. The cost is a repeat of a failed photo paying
     # its quota again, which is the right trade: the failure may well have
     # been transient, and replaying it forever cannot be.
-    if audio_path and not degraded:
+    #
+    # NOR IS A MULTI-PHOTO TURN, in any form (issue #110 / P10.2), and this
+    # is a rule about what the cache can honestly hold rather than a
+    # limitation worked around. Its entries are per-photo and admission
+    # requires audio (`audio_path and ...` below). A turn of several photos
+    # produces exactly ONE recording - all the photos read together - so
+    # there is no per-photo audio to store, and storing the combined result
+    # under any one photo's key would replay three photos' script the next
+    # time that one photo was submitted alone. The cost is that a repeated
+    # multi-photo submission pays for its tts again; the per-photo pre-pass
+    # above still spares it every model call it can.
+    if audio_path and not degraded and len(submission) == 1:
         resources.image_cache.put(
             cache_key,
             (audio_path, outcome[1], result.get("ocr_output") or "", result.get("scene_context") or ""),
@@ -3238,7 +3418,7 @@ def handle_resume_staged(
 
 def handle_submit_staged(
     image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUDGET_SECONDS, thread_id=None,
-    pause_signal=None, session_id=None,
+    pause_signal=None, session_id=None, extra_images=None,
 ):
     """Generator version of handle_submit that also drives the live-region
     status text (issue #15 / P5.1 scope item 3).
@@ -3294,8 +3474,11 @@ def handle_submit_staged(
     than one thread to demonstrate it with).
     """
     yield from _stage_events(
-        STATUS_WORKING,
-        _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=thread_id, session_id=session_id),
+        working_status_for(1 + len(extra_images or [])),
+        _run_pipeline_events(
+            image, resources, pipeline_budget_seconds, thread_id=thread_id,
+            session_id=session_id, extra_images=extra_images,
+        ),
         pause_signal=pause_signal,
     )
 
@@ -3549,10 +3732,11 @@ def build_interface(resources):
     # `visible` key), which is exactly "leave them as they are". _submit can
     # safely hide, because submitting a photo RESOLVES any pending question
     # (an implicit retake - see _run_pipeline_events' cache-hit branch).
-    def _submit(image, thread_id, session_id):
+    def _submit(image, extra_images, thread_id, session_id):
         pause_signal = _PauseSignal()
         for status, audio, text in handle_submit_staged(
-            image, resources, thread_id=thread_id, pause_signal=pause_signal, session_id=session_id
+            image, resources, thread_id=thread_id, pause_signal=pause_signal,
+            session_id=session_id, extra_images=extra_images,
         ):
             visible = gr.update(visible=pause_signal.paused)
             yield status, audio, text, visible, visible
@@ -3631,6 +3815,18 @@ def build_interface(resources):
                     # default thinking it "looks more natural" - it makes
                     # captured text unreadable.
                     webcam_options=gr.WebcamOptions(mirror=False),
+                )
+                # Issue #110 / P10.2 - see EXTRA_PHOTOS_ELEM_ID for why this
+                # is a second input rather than a change to the one above.
+                # PLACED BETWEEN the photo and the submit button, because
+                # that is the order the actions happen in: choose the photo,
+                # optionally add more, then describe them.
+                extra_photos_input = gr.File(
+                    label=EXTRA_PHOTOS_LABEL,
+                    file_count="multiple",
+                    file_types=["image"],
+                    type="filepath",
+                    elem_id=EXTRA_PHOTOS_ELEM_ID,
                 )
                 submit_button = gr.Button("Describe this photo", variant="primary")
                 status_output = gr.Textbox(
@@ -3744,7 +3940,7 @@ def build_interface(resources):
 
         submit_event = submit_button.click(
             fn=_submit,
-            inputs=[image_input, thread_state, session_id_state],
+            inputs=[image_input, extra_photos_input, thread_state, session_id_state],
             outputs=result_and_controls,
         )
         # Runs client-side only after the handler above has produced its
