@@ -38,6 +38,7 @@ from clarif_eye import tts as tts_module
 from clarif_eye.analysis import run_analysis
 from clarif_eye.client import CompletionResult
 from clarif_eye.graph import (
+    DEEP_PATH_NODE,
     INTERRUPT_CHUNK_KEY,
     RESUME_CONTINUE,
     RESUME_RETAKE,
@@ -257,7 +258,12 @@ def test_unverifiable_number_pauses_the_run_and_carries_the_questioned_text():
     assert "tts" not in keys, "a paused run must not reach speech"
 
     snapshot = graph.get_state(config)
-    assert snapshot.next == ("verify_numbers",)
+    # The PARENT names the node the deep-path child is mounted at, not the
+    # child's own paused node (issue #84 / P9.5): the pause is inside the
+    # child, and from up here the whole deep path is one node. The pending
+    # interrupt itself still travels up unchanged, which is what
+    # clarif_eye.ui._has_pending_interrupt reads.
+    assert snapshot.next == (DEEP_PATH_NODE,)
     assert snapshot.interrupts, "graph state shows no pending interrupt"
 
     payload = snapshot.interrupts[0].value
@@ -318,8 +324,10 @@ def test_resume_retake_ends_clean_and_leaves_the_thread_ready_for_a_new_photo():
         graph, make_initial_state("second-photo"), fresh_config
     )
     # Straight past the asking node: this photo's numbers all check out,
-    # so the conditional edge out of `analysis` never enters it.
-    assert trace == ["entry", "vision", "research", "analysis", "tts"]
+    # so the conditional edge out of `analysis` never enters it. research and
+    # analysis are the child graph's nodes (issue #84 / P9.5) and "deep_path"
+    # is the parent's own node completing once they are done.
+    assert trace == ["entry", "vision", "research", "analysis", "deep_path", "tts"]
     assert "$104.95" in result["final_output"]
 
 
@@ -335,15 +343,32 @@ def test_verified_numbers_never_interrupt():
     client = RecordingClient(HONEST_DRAFT)
     config["configurable"].update(_run_config(client, "clean-thread")["configurable"])
 
-    chunks = list(
-        graph.stream(make_initial_state("base64photo"), config=config, stream_mode="updates")
-    )
+    # subgraphs=True so the deep path's own nodes stay visible (issue #84 /
+    # P9.5) - without it "the asking node was never entered" could not be
+    # asserted from up here at all, since the whole child would arrive as one
+    # opaque "deep_path" chunk.
+    #
+    # NOTE FOR A FUTURE EDITOR: this consumer does NOT de-duplicate a
+    # namespaced "__interrupt__" the way clarif_eye.ui._narrate_stream does,
+    # and does not need to - this run is the CLEAN one and must never pause,
+    # which is the assertion below. A loop shaped like this one driving a
+    # PAUSING run would see the interrupt key TWICE: once from the child's
+    # namespace, once re-emitted at the parent level.
+    chunks = [
+        chunk
+        for _namespace, chunk in graph.stream(
+            make_initial_state("base64photo"),
+            config=config,
+            stream_mode="updates",
+            subgraphs=True,
+        )
+    ]
 
     keys = [key for chunk in chunks for key in chunk]
     assert INTERRUPT_CHUNK_KEY not in keys, f"a clean run must never pause: {keys}"
     # The asking node is not merely silent on a clean run - it is never
     # ENTERED, so a clean run costs no extra checkpoint for it either.
-    assert keys == ["entry", "vision", "research", "analysis", "tts"]
+    assert keys == ["entry", "vision", "research", "analysis", "deep_path", "tts"]
 
     snapshot = graph.get_state(config)
     assert not snapshot.interrupts
@@ -658,9 +683,10 @@ def test_a_follow_up_typed_while_a_question_is_pending_is_refused():
     assert RESUME_CONTINUE_LABEL in text
     assert RESUME_RETAKE_LABEL in text
 
-    # THE PAUSE SURVIVED: still pending, still resumable.
+    # THE PAUSE SURVIVED: still pending, still resumable. Reported at the
+    # node the deep-path child is mounted at - see issue #84 / P9.5.
     snapshot = _state_of(resources, "ask-while-paused")
-    assert snapshot.next == ("verify_numbers",)
+    assert snapshot.next == (DEEP_PATH_NODE,)
     assert snapshot.interrupts
 
     # And it cost nothing: no graph run, so no model call.

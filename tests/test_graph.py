@@ -14,8 +14,11 @@ list threaded through config["configurable"].
 import pytest
 
 from clarif_eye.client import CompletionResult
+from langgraph.graph import END
+
 from clarif_eye.graph import (
     _UNCONDITIONAL_SUCCESSOR,
+    DEEP_PATH_NODE,
     TTS_NODE,
     build_graph,
     dynamic_router,
@@ -148,7 +151,11 @@ def test_make_initial_state_rejects_blank_image_data():
 
 
 def test_dynamic_router_routes_to_research_when_flag_true():
-    assert dynamic_router({"complexity_flag": True}) == "research"
+    # "deep_path" since issue #84 / P9.5: research is the first node of the
+    # deep path's own child graph now, and the parent sees the whole path as
+    # one node. The routing DECISION is unchanged - only the name of what it
+    # points at.
+    assert dynamic_router({"complexity_flag": True}) == DEEP_PATH_NODE
 
 
 def test_dynamic_router_routes_to_fast_synth_when_flag_false():
@@ -191,7 +198,7 @@ def test_full_graph_routes_using_node_owned_complexity_flag_not_caller_value():
     result, trace = run(graph, state, client=client)
 
     assert result["complexity_flag"] is True
-    assert trace == ["entry", "vision", "research", "analysis", "tts"]
+    assert trace == ["entry", "vision", "research", "analysis", "deep_path", "tts"]
     assert "fast_synth" not in trace
 
 
@@ -350,7 +357,10 @@ def test_research_path_visits_vision_research_analysis_tts_only():
 
     _, trace = run(graph, state, client=client)
 
-    assert trace == ["entry", "vision", "research", "analysis", "tts"]
+    # research and analysis are the CHILD graph's nodes (issue #84 / P9.5);
+    # the trace helper streams with subgraphs=True so they stay visible, and
+    # "deep_path" is the parent's own node completing once they are done.
+    assert trace == ["entry", "vision", "research", "analysis", "deep_path", "tts"]
     assert "fast_synth" not in trace
 
 
@@ -377,4 +387,10 @@ def test_tts_node_constant_names_a_node_the_compiled_graph_actually_has():
     assert next_node_after(TTS_NODE, {}) is None
     assert _UNCONDITIONAL_SUCCESSOR["fast_synth"] == TTS_NODE
     assert _UNCONDITIONAL_SUCCESSOR["followup"] == TTS_NODE
-    assert _UNCONDITIONAL_SUCCESSOR["verify_numbers"] == TTS_NODE
+    assert _UNCONDITIONAL_SUCCESSOR[DEEP_PATH_NODE] == TTS_NODE
+    # verify_numbers points at END, not at tts, since issue #84 / P9.5: it is
+    # the last node of the CHILD graph, which cannot name the parent's tts.
+    # That is also what keeps "Turning it into speech" from being announced
+    # twice on a resume - see clarif_eye.graph._UNCONDITIONAL_SUCCESSOR.
+    assert _UNCONDITIONAL_SUCCESSOR["verify_numbers"] == END
+    assert next_node_after("verify_numbers", {}) is None

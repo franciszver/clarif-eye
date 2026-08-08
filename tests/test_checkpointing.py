@@ -162,6 +162,58 @@ def test_in_memory_saver_internal_shape_matches_trim_helpers_assumptions():
     assert all(len(k) == 3 for k in saver.writes)
 
 
+# --- Cross-namespace ordering pin for _drop_dead_subgraph_namespaces -------
+#
+# _drop_dead_subgraph_namespaces (clarif_eye.ui) decides which subgraph
+# namespace is the LIVE one by comparing namespaces on their newest
+# checkpoint id and keeping the greatest - i.e. it assumes checkpoint ids are
+# time-ordered GLOBALLY, across namespaces, not merely within one. That is a
+# strictly stronger assumption than the per-namespace max() the trim above
+# already makes (and than InMemorySaver.get_tuple makes itself), and it is
+# load-bearing in the worst possible way: if a langgraph upgrade made ids
+# random rather than time-ordered (v4 rather than v6 UUIDs, say), this
+# function would delete the WRONG namespace - possibly the one holding a
+# PAUSED run's checkpoint - and the user's unanswered safety question would
+# become unresumable. Silently: the deletion cannot fail, it would simply
+# take the wrong thing.
+def test_checkpoint_ids_are_time_ordered_across_namespaces():
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    saver = InMemorySaver()
+    graph = build_graph(checkpointer=saver)
+    thread_id = "ns-ordering-thread"
+
+    # Two DEEP-PATH runs on ONE thread: each mounts the child under its own
+    # `deep_path:<task id>` namespace, so this produces exactly the situation
+    # the function has to judge - two child namespaces, one older. Long OCR
+    # text is what trips the router onto the deep path at all (the same
+    # long-document fixture the rest of the suite uses).
+    long_ocr = " ".join(["alpha"] * 200)
+
+    def _child_namespaces():
+        return {ns for ns in saver.storage[thread_id] if ns}
+
+    _invoke(graph, "ns-ordering-image-one", thread_id, ocr=long_ocr)
+    after_first = _child_namespaces()
+    _invoke(graph, "ns-ordering-image-two", thread_id, ocr=long_ocr)
+    namespaces = _child_namespaces()
+
+    assert len(namespaces) == 2, f"expected two child namespaces, got {namespaces}"
+
+    # RECENCY, ESTABLISHED WITHOUT LOOKING AT AN ID: the newer namespace is
+    # simply the one that was not there after the first run. Comparing that
+    # against what max() picks is what makes this a proof of the ordering
+    # assumption rather than a restatement of it.
+    by_recency = (namespaces - after_first).pop()
+    by_id = max(namespaces, key=lambda ns: max(saver.storage[thread_id][ns]))
+
+    assert by_id == by_recency, (
+        "checkpoint ids are no longer time-ordered across namespaces - "
+        "clarif_eye.ui._drop_dead_subgraph_namespaces would delete the wrong "
+        "namespace, possibly one holding a paused run."
+    )
+
+
 # --- Measured defect: unbounded per-thread checkpoint growth --------------
 #
 # MEASURED (issue #81's simplify-gate report): InMemorySaver.put() writes

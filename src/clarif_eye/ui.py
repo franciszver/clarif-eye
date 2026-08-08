@@ -58,7 +58,9 @@ from clarif_eye.failure_messages import (
     message_for_ladder_exhausted,
     message_for_terminal_error,
 )
+from clarif_eye.deep_path import build_deep_path_graph
 from clarif_eye.graph import (
+    DEEP_PATH_NODE,
     DEFAULT_PIPELINE_BUDGET_SECONDS,
     INTERRUPT_CHUNK_KEY,
     RESUME_CONTINUE,
@@ -98,6 +100,13 @@ AUDIO_UNAVAILABLE_NOTE = (
 NO_QUESTION_MESSAGE = (
     "No question was typed. Please type a question about the photo, then "
     "activate the ask button."
+)
+# Issue #84 / P9.5: the text-only API route was called with nothing to
+# describe. Worded for an API caller (there is no button and no photo in
+# this route), which is why it does not reuse NO_QUESTION_MESSAGE.
+NO_DOCUMENT_TEXT_MESSAGE = (
+    "No document text was provided. Send the text of the document to "
+    "describe."
 )
 # The two answers to "a number could not be checked" (issue #83 / P9.4).
 # These are BUTTON LABELS, but they are declared here with the other spoken
@@ -192,8 +201,11 @@ UPLOADED_PHOTO_ALT = "The photo you submitted"
 # flow, and the LangGraph implementation, since this is a demo application.
 # Content below is checked against the source it describes, not against the
 # issue's own wording or the (older, no longer accurate) architecture doc:
-#   - graph.py: build_graph() registers exactly 7 nodes (entry, vision,
-#     fast_synth, research, analysis, followup, tts). "router" is NOT one of
+#   - graph.py: build_graph() registers exactly 6 nodes (entry, vision,
+#     fast_synth, deep_path, followup, tts). `deep_path` is a whole COMPILED
+#     CHILD GRAPH mounted as one node (issue #84 / P9.5, see
+#     clarif_eye.deep_path): research, analysis and verify_numbers are its
+#     nodes now, not the parent's. "router" is NOT one of
 #     them - dynamic_router is the function evaluated by a conditional edge
 #     out of "vision"; it is plain Python (state["complexity_flag"] in/out,
 #     no client, no network - see router.py's module docstring "computed
@@ -296,8 +308,8 @@ LangChain in this codebase). The graph state is a 10-key `TypedDict`:
 `scraper_data`, `final_output`, `audio_file_path`, `messages`, `question`,
 `verification_hold`.
 
-Eight nodes are registered: `entry`, `vision`, `fast_synth`, `research`,
-`analysis`, `verify_numbers`, `followup`, and `tts`. Every run starts at
+Six nodes are registered: `entry`, `vision`, `fast_synth`, `deep_path`,
+`followup`, and `tts`. Every run starts at
 `entry`, which does
 no work of its own: it looks at whether this run carries a photo or a typed
 question and sends the run to `vision` or to `followup` accordingly, by
@@ -305,15 +317,28 @@ returning a `Command` naming the next node.
 
 On the photo route, the step after `vision` is chosen by a conditional edge
 evaluated against `complexity_flag`: `False` goes to `fast_synth` then
-straight to `tts`; `True` goes to `research`, then `analysis`, then `tts`.
+straight to `tts`; `True` goes to `deep_path`, then `tts`.
 
-`verify_numbers` is the one step that can PAUSE the whole run, and a second
-conditional edge decides whether it runs at all. When `analysis` writes a
+`deep_path` is not an ordinary step. It is a second, separately compiled
+graph - `research`, then `analysis`, then optionally `verify_numbers` -
+mounted inside the first one as a single node. It keeps its own state, with
+its own names for things, and a small piece of code translates between the
+two at the boundary. Two things follow from that, and both are deliberate:
+the photo itself never enters it (it works from the text already read, so
+the closer-look steps have no copy of your picture at all), and the same
+graph can be used on its own by something that has no photo to begin with -
+there is an API endpoint that describes a document from its text alone.
+
+`verify_numbers` is the one step that can PAUSE the whole run, and a
+conditional edge inside `deep_path` decides whether it runs at all. When `analysis` writes a
 number it cannot trace back to the photographed text, it records that fact
 in the state, and the edge out of `analysis` sends the run to
-`verify_numbers` instead of straight to `tts`. That node raises a LangGraph
+`verify_numbers` instead of straight to the end of that inner graph. That
+node raises a LangGraph
 interrupt carrying the drafted script and the numbers that failed, and the
-run stops there - before speech - until you answer. On every run where the
+run stops there - before speech - until you answer. The question is asked
+from inside the inner graph and travels out to the app around it, and your
+answer travels back in to the exact step that asked. On every run where the
 numbers check out, the step is skipped entirely. Your answer resumes the same conversation thread exactly where it
 stopped. It sits after `analysis` rather than inside it on purpose:
 resuming re-runs the paused step from its start, so putting the question
@@ -619,12 +644,28 @@ STATUS_RESUMING = "Thank you. Finishing up now."
 #     node (see clarif_eye.graph.analysis_destination), so nothing is
 #     announced for it there either - `analysis` completing still leads to
 #     "Turning it into speech", exactly as it did before this issue.
+#   - "research" (issue #84 / P9.5): it HAS an announcement, but not under
+#     its own name any more. It is the deep path's first node, and since the
+#     deep path became a child graph the router names DEEP_PATH_NODE, not
+#     "research" - so the "Looking it up." entry moved to that key. Nothing
+#     ever names "research" as a successor now, and a phrase here would be
+#     dead wording nobody could hear.
 # The TIMING-HONESTY comment above still holds exactly as written: every
 # phrase here is announced for the node that is ABOUT to run, at the moment
 # its predecessor's completion chunk arrives.
 _NODE_PHRASE = {
-    "research": STATUS_NODE_RESEARCH,
+    # The whole deep path (issue #84 / P9.5), announced when `vision`
+    # completes and the router names it. The phrase is the LOOKUP one
+    # because the lookup is what the deep path does first - `research` is
+    # the child graph's entry node - and this announcement lands at the
+    # exact moment "Looking it up." used to, when `research` was a node of
+    # the parent graph and the router named it directly. What the user hears
+    # is unchanged; only which name the graph reports has moved.
+    DEEP_PATH_NODE: STATUS_NODE_RESEARCH,
     "fast_synth": STATUS_NODE_WRITING,
+    # A CHILD graph's node (clarif_eye.deep_path), reached through
+    # stream(subgraphs=True) - see _narrate_stream. Announced when the
+    # child's `research` node completes, exactly as before.
     "analysis": STATUS_NODE_WRITING,
     "followup": STATUS_NODE_ANSWERING,
     TTS_NODE: STATUS_NODE_TTS,
@@ -1092,6 +1133,86 @@ class ImageResultCache(_BoundedLRU):
         self._discard(key)
 
 
+# How much document text the text-only API route will ever send to the model.
+#
+# WHY A CAP AT ALL: everywhere else in this app, the text handed to the deep
+# path is whatever a vision pass read off ONE photograph - bounded by
+# physics. That route takes text straight from a caller, so nothing bounds
+# it. Probed before this constant existed: a 2,361,688-character body went to
+# the brain model in full. That is a quota hazard on a rate-limited free tier
+# (see describe_document_text on the shared allowance), and a correctness one
+# too - a model that truncates rather than errors would silently answer about
+# the first fraction of the document while sounding exactly as confident, the
+# "partial reproduction dressed as success" failure analysis.py's own cap
+# comment describes.
+#
+# THE NUMBER: 20,000 characters, roughly 3,000 words. Chosen to sit
+# comfortably ABOVE what this route's own purpose can produce and well below
+# where prompt size becomes the problem: a densely printed A4 page holds
+# ~3,000-5,000 characters, so this is several pages' worth of an unusually
+# text-heavy document. Like every other cap in this codebase
+# (analysis._SCRAPER_DATA_CAP, IMAGE_CACHE_MAX_ENTRIES, MAX_LIVE_THREADS), it
+# is a documented, deliberate guess rather than a measured optimum.
+DOCUMENT_TEXT_CAP = 20_000
+
+# How many distinct documents the text route remembers at once. Matched to
+# IMAGE_CACHE_MAX_ENTRIES for the same reason that one is 20 - a double-digit
+# number of live entries suits a small free-tier demo - and because two
+# caches of wildly different sizes would be harder to reason about together
+# than two of the same order.
+DOCUMENT_CACHE_MAX_ENTRIES = 20
+
+
+def _cap_document_text(document_text, cap=DOCUMENT_TEXT_CAP):
+    """Truncate `document_text` to `cap` characters at a word boundary,
+    leaving a visible marker.
+
+    THE SAME SHAPE AS analysis._cap_scraper_data, deliberately, and for the
+    same reason that one gives: a silent cut mid-word - or, worse,
+    mid-number - reads as real evidence, so the truncation is made visible in
+    the prompt body instead. Not imported from that module: it is a private
+    helper there, it is worded for scraped web context ("[context
+    truncated]"), and this text is the document itself rather than supporting
+    material - the two say different things to the model and should be able
+    to keep doing so.
+    """
+    if len(document_text) <= cap:
+        return document_text
+    truncated = document_text[:cap].rsplit(" ", 1)[0]
+    return f"{truncated} [document truncated]"
+
+
+class DocumentTextCache(_BoundedLRU):
+    """Tiny in-memory LRU cache from document-text hash -> the spoken-ready
+    description, bounded to DOCUMENT_CACHE_MAX_ENTRIES entries.
+
+    THE SAME RULES AS ImageResultCache, because it exists for the same reason
+    and spends the same allowance: only real, successful outcomes are ever
+    stored (see describe_document_text), a failure is never replayed to the
+    next caller as if it were that document's answer, and nothing is ever
+    written to disk. It is SIMPLER than that one because this route produces
+    less: there is no audio path to go stale, and no thread whose stored
+    ocr/scene could drift out of step with what the caller was told, so the
+    entry is just the text.
+    """
+
+    def __init__(self, max_entries=DOCUMENT_CACHE_MAX_ENTRIES):
+        super().__init__(max_entries)
+
+    def get(self, key):
+        return self._get(key)
+
+    def put(self, key, value):
+        self._touch(key, value)
+
+
+def _document_text_key(document_text):
+    """Hash of the CAPPED text, so two bodies that differ only past the cap -
+    i.e. two requests this route would answer identically - share one entry
+    instead of each paying for the same model call."""
+    return hashlib.sha256(document_text.encode("utf-8")).hexdigest()
+
+
 # --- Thread registry (issue #81 / P9.2) -------------------------------------
 #
 # A LangGraph checkpointer keeps every checkpointed thread's state in memory
@@ -1252,9 +1373,57 @@ class ThreadRegistry(_BoundedLRU):
 #   - _run_resume_events (issue #83 / P9.4), called DIRECTLY (not via
 #     _update_thread_state) on the retake path, which completes a run
 #     without recording a turn and so has no state write to trim behind.
+#   - AND, since issue #84 / P9.5, one MORE thing has to be bounded here:
+#     dead SUBGRAPH NAMESPACES. The deep path is a child graph now
+#     (clarif_eye.deep_path) and LangGraph checkpoints it under its own
+#     namespace on the same thread - "deep_path:<task id>", with a FRESH
+#     task id per run (measured: three deep runs on one thread left three
+#     namespaces). Keeping the newest checkpoint PER NAMESPACE, which is all
+#     this function used to do, therefore stopped bounding anything: a
+#     thread that runs the deep path repeatedly accumulates one dead
+#     namespace per run, which is the same unbounded growth this function
+#     was written to close, reopened one level down. _drop_dead_subgraph_
+#     namespaces below deletes them.
+def _drop_dead_subgraph_namespaces(checkpointer, thread_storage, thread_id):
+    """Delete every non-root checkpoint namespace on this thread except the
+    most recent one (issue #84 / P9.5).
+
+    THE ROOT NAMESPACE ("") IS NEVER TOUCHED here - it is the parent graph's
+    own history, and its trimming is the caller's job.
+
+    WHY THE MOST RECENT ONE IS KEPT rather than all of them dropped: a run
+    that is PAUSED inside the child still needs its child checkpoint to
+    resume from, and this function is reachable while a thread is paused
+    (see the RESOLVE-THEN-WRITE block above - the cache-hit branch trims
+    mid-pause). A pause always lives in the newest run, so keeping exactly
+    one namespace keeps every resumable pause resumable while still bounding
+    the total at one dead namespace instead of one per run.
+
+    ORDERING: namespaces are compared by their newest checkpoint id, which
+    LangGraph generates as a time-ordered UUID (v6) - the SAME assumption
+    the per-namespace trim above already makes when it calls max() on
+    checkpoint ids, and the same one InMemorySaver.get_tuple makes itself,
+    now applied across namespaces rather than within one. Verified: ids from
+    two different namespaces on one thread sort in creation order.
+    """
+    child_namespaces = [ns for ns in thread_storage if ns]
+    if len(child_namespaces) < 2:
+        return
+    newest = max(child_namespaces, key=lambda ns: max(thread_storage[ns].keys()))
+    for namespace in child_namespaces:
+        if namespace == newest:
+            continue
+        del thread_storage[namespace]
+        for key in [k for k in checkpointer.writes if k[0] == thread_id and k[1] == namespace]:
+            del checkpointer.writes[key]
+        for key in [k for k in checkpointer.blobs if k[0] == thread_id and k[1] == namespace]:
+            del checkpointer.blobs[key]
+
+
 def _trim_thread_to_latest_checkpoint(checkpointer, thread_id):
     """Delete every checkpoint/write/blob for `thread_id` except what its
-    newest checkpoint (per checkpoint_ns) still references.
+    newest checkpoint (per checkpoint_ns) still references, then drop every
+    dead subgraph namespace (see _drop_dead_subgraph_namespaces).
 
     No-op if `checkpointer` is None (an uncheckpointed graph - see
     build_graph's `checkpointer` param) or if `thread_id` has no stored
@@ -1296,6 +1465,8 @@ def _trim_thread_to_latest_checkpoint(checkpointer, thread_id):
                 _t, _ns, channel, version = blob_key
                 if live_versions.get(channel) != version:
                     del checkpointer.blobs[blob_key]
+
+        _drop_dead_subgraph_namespaces(checkpointer, thread_storage, thread_id)
     except Exception:
         # Housekeeping only - see docstring. Never swallows
         # KeyboardInterrupt/SystemExit (BaseException, not Exception), the
@@ -1365,6 +1536,12 @@ class AppResources:
     searcher: object
     research_client: object
     image_cache: object = field(default_factory=ImageResultCache)
+    # The text-only API route's own cache (issue #84 / P9.5). A SEPARATE
+    # cache, not a second use of image_cache: that one is keyed on image
+    # content and its entries carry an audio path plus the ocr/scene a thread
+    # needs, none of which exist here. Defaulted like image_cache so every
+    # test that builds an AppResources directly keeps working untouched.
+    document_cache: object = field(default_factory=DocumentTextCache)
     # None by default (issue #81 / P9.2): every existing test that builds
     # an AppResources directly (test_ui.py's FakeGraph-based tests) never
     # sets these, so they keep running an uncheckpointed graph with no
@@ -1603,6 +1780,22 @@ def _narrate_stream(graph, state, config, result):
     run, which for this app would mean losing an answer that was already
     half-computed.
 
+    NESTED STREAMING (issue #84 / P9.5): the stream is opened with
+    `subgraphs=True`, so each item is a (namespace, chunk) PAIR rather than
+    a bare chunk. That is what makes the deep path's own nodes - `research`
+    and `analysis`, now inside a child graph (clarif_eye.deep_path) -
+    visible from up here at all. Without it, the whole deep path arrives as
+    one opaque `deep_path` completion and a blind user hears nothing between
+    "photo received" and "turning it into speech": a ~30-second silence
+    where three announcements used to be.
+
+    The namespace is () for the parent's own nodes and
+    ("deep_path:<task id>",) for the child's. Node updates are narrated the
+    SAME WAY whichever it is - a node name is unambiguous across the two
+    graphs, and clarif_eye.graph.next_node_after knows both graphs'
+    topology, which is what keeps the spoken sequence byte-identical to what
+    it was before the extraction.
+
     THE THIRD EVENT KIND (issue #83 / P9.4): a chunk keyed
     INTERRUPT_CHUNK_KEY means the run PAUSED to ask the user something -
     clarif_eye.graph.verify_numbers_node is the only thing in this graph
@@ -1620,9 +1813,33 @@ def _narrate_stream(graph, state, config, result):
     resumed run). This function does not care which - it only drives and
     narrates.
     """
-    for chunk in graph.stream(state, config=config, stream_mode="updates"):
+    for namespace, chunk in graph.stream(
+        state, config=config, stream_mode="updates", subgraphs=True
+    ):
         for node_name, update in chunk.items():
             if node_name == INTERRUPT_CHUNK_KEY:
+                # A pause raised INSIDE the child arrives TWICE - once
+                # namespaced to the child, then again at the parent level
+                # with the identical payload (verified empirically on
+                # langgraph 1.2.10). Skipping the namespaced copy makes this
+                # generator emit exactly ONE ("interrupt", ...) event, and
+                # makes this branch behave identically whether the pause came
+                # from a child node or a parent one.
+                #
+                # WHAT THIS IS AND IS NOT RESPONSIBLE FOR, stated because an
+                # earlier version of this comment took credit it had not
+                # earned: it is NOT what stops the user hearing the question
+                # twice. _stage_events collects the question into a local and
+                # yields it once AFTER the loop, so the spoken output would
+                # be single even without this guard. What this guard actually
+                # protects is every OTHER consumer of this generator - it is
+                # shared by the photo, follow-up and resume paths, and
+                # _run_pipeline_events counts an interrupt event to decide a
+                # run paused. A duplicate is not visibly wrong today, which is
+                # exactly why it needs a test rather than an assumption: see
+                # tests/test_deep_path_subgraph.py's one-event test.
+                if namespace:
+                    continue
                 interrupts = update or ()
                 payload = interrupts[0].value if interrupts else {}
                 yield "interrupt", _interrupt_question(payload)
@@ -1654,9 +1871,9 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
     WHILE the graph is still running - the whole point of streaming. Every
     graph injected here - the real one from build_graph(), and every test
     double that stands in for it - is expected to implement .stream(...,
-    stream_mode="updates"); there is no invoke()-only fallback, so an
-    incompatible double fails loudly (AttributeError) instead of silently
-    losing all narration.
+    stream_mode="updates", subgraphs=True); there is no invoke()-only
+    fallback, so an incompatible double fails loudly (AttributeError/
+    TypeError) instead of silently losing all narration.
 
     NEVER raises (except KeyboardInterrupt/SystemExit) - every failure mode
     yields a spoken-ready message instead, per the module docstring. The
@@ -2410,6 +2627,222 @@ def handle_submit_staged(
     )
 
 
+# --- The second consumer of the deep path (issue #84 / P9.5) ---------------
+#
+# WHY THIS EXISTS AT ALL: extracting the deep path into a child graph only
+# earns its keep if something other than the photo pipeline can actually use
+# it. This is that something - text in, spoken-ready description out, no
+# photo and no vision call anywhere in it. It is also the honest proof that
+# the child's schema is its own: this caller has never seen a camera, and it
+# still speaks the child's vocabulary without a translation layer of its own.
+#
+# AN API ROUTE, NOT A CONTROL ON THE PAGE. The main UI is built around one
+# task - point a camera at something and hear what it says - and every
+# control added to it is one more thing a screen-reader user has to tab past
+# to get to that task. A second text box for a different job would cost them
+# on every visit to pay for a capability aimed at programs, not people. So it
+# is registered with gr.api (see build_interface), which adds a callable
+# endpoint and NO components at all.
+#
+# TEXT OUT, NOT AUDIO, and that is a deliberate narrowing rather than an
+# oversight. This app speaks, so returning text needs justifying: an API
+# caller has no browser to autoplay into, no aria-live region, and no way to
+# use the staged (status, audio, text) contract the UI is built on - it would
+# get back a path to an mp3 in this server's temp directory, which is
+# useless to it and which tts.py's own pruning may delete out from under it.
+# The description IS the deliverable here; anything that wants it spoken can
+# speak it.
+DESCRIBE_TEXT_API_NAME = "describe_document_text"
+
+# What the deep path is told about "the scene" when there is no photo. The
+# child graph needs a scene description (clarif_eye.analysis refuses to call
+# the model on a blank one), and the truthful answer for this route is that
+# there is no scene - so it says exactly that rather than inventing one.
+TEXT_ONLY_SCENE = "a document supplied as text, with no photo"
+
+
+class _SuccessWatchingClient:
+    """Delegates to the real client and records whether any completion ever
+    came back with USABLE CONTENT.
+
+    "USABLE CONTENT", NOT "RETURNED WITHOUT RAISING", and the difference is
+    the whole point of this class. A model that answers with "" or "   " has
+    failed just as surely as one that raised - clarif_eye.analysis treats it
+    that way (see its `isinstance(reply, str) and reply.strip()` check) and
+    degrades to "The analysis model returned an empty response." with nothing
+    held back. An earlier version of this class counted that as a success, so
+    the route's cache admitted the failure sentence and served it as the
+    document's answer to every later caller until the entry aged out: driven
+    proof was three calls, ONE model call, the same failure sentence three
+    times. The check below is deliberately the IDENTICAL structural test
+    analysis.py makes, so the two cannot disagree about what an empty reply
+    is - and it is still structural, never a match against the message.
+
+    WHY THIS EXISTS: the cache must never store a failure (see
+    ImageResultCache's rule), and this route cannot otherwise tell one.
+    clarif_eye.analysis catches LadderExhaustedError/OpenRouterError
+    INTERNALLY and degrades to a plain-English message, so from out here a
+    "every model was busy" answer and a real description are both just a
+    non-empty string - and string-matching the difference is exactly what
+    this codebase refuses to do (D15: structural, never prose). Watching the
+    seam the failure actually passes through is the structural answer.
+
+    IT ALSO COVERS THE DEADLINE CASE for free, which is the honest bonus: a
+    run whose budget was already spent skips the model call entirely, so
+    nothing ever succeeds here, so its degraded-from-known answer is not
+    cached either. That is right - it is a description of what this app could
+    manage in the time it had, not the document's answer.
+    """
+
+    def __init__(self, client):
+        self._client = client
+        self.succeeded = False
+
+    def complete(self, role, messages, **params):
+        result = self._client.complete(role, messages, **params)
+        content = getattr(result, "content", None)
+        if isinstance(content, str) and content.strip():
+            self.succeeded = True
+        return result
+
+    def close(self):
+        # Never closes the wrapped client: it is the process-wide shared one
+        # (build_resources), owned by the caller, and closing it here would
+        # take the UI's connection pool down with this request. run_analysis
+        # only closes a client it constructed itself, so this is never called
+        # today - it exists so a future caller that does call it cannot do
+        # that damage by accident.
+        pass
+
+
+def describe_document_text(
+    document_text, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUDGET_SECONDS
+):
+    """Describe a document from its TEXT alone, by invoking the deep-path
+    child graph directly (issue #84 / P9.5). Returns the spoken-ready
+    description as a string.
+
+    NEVER RAISES (except KeyboardInterrupt/SystemExit) - same contract as
+    every other entry point in this module. An API route that returns a 500
+    is worse than one that returns a sentence saying what went wrong.
+
+    THE CHILD IS COMPILED WITHOUT A CHECKPOINTER, and that decides what
+    happens when the deep path wants to ask a question. This route has no UI:
+    nobody is there to be asked about a number that could not be checked, and
+    there is no thread to resume on. VERIFIED empirically on langgraph
+    1.2.10: `interrupt()` in an uncheckpointed graph does NOT raise - invoke()
+    returns the state the run had reached, plus an "__interrupt__" key nobody
+    here has to look at. `analysis` has already written the safe "could not be
+    verified" script into final_output by then (see
+    clarif_eye.analysis.run_analysis, which has always done that so a graph
+    without the asking node degrades cleanly), so this route returns that:
+    the honest, verified-safe answer, with the unverifiable number left out.
+    Structural, not exception-driven - nothing here catches a pause to detect
+    it.
+
+    A FRESH CHILD PER CALL. Compiling is pure Python graph construction with
+    no network and no model, this route is not a hot path, and a
+    process-lifetime singleton would buy a lifecycle question (who builds it,
+    when, and with what) for nothing measurable.
+
+    IT SPENDS THE SAME DAILY ALLOWANCE THE UI DOES. There is one shared
+    OpenRouter account behind this app and one free-tier quota (see
+    clarif_eye.client), so every call here is a model call the photo pipeline
+    cannot make later that day - and every uncached call is an outbound web
+    search and page fetch too. That is why this route is CAPPED
+    (DOCUMENT_TEXT_CAP) and CACHED (DocumentTextCache) rather than left open.
+
+    WHAT THE CACHE DOES AND DOES NOT DEFEND AGAINST, stated plainly because
+    "it's cached" invites more confidence than it has earned:
+      - It stops SEQUENTIAL repeats. The same document asked for again, after
+        the first answer exists, costs nothing.
+      - It does NOT stop CONCURRENT ones. There is no single-flight: twelve
+        identical requests arriving together all miss, all run, and all spend
+        a model call, because the entry is only written once a run finishes.
+        Deliberate, and the same shape ImageResultCache has always had -
+        in-flight de-duplication means a lock or a futures map held across a
+        request that can take a minute, which is real machinery to get right
+        (and to not deadlock) for a demo app whose realistic worst case is a
+        handful of visitors.
+      - It has NO TTL, also like ImageResultCache: the first successful answer
+        for a given document is pinned until it is evicted by LRU pressure or
+        the process restarts. Fine here - the same text has the same
+        description - but it does mean a better model shipping tomorrow does
+        not re-answer today's cached documents.
+
+    NO IMAGE CACHE (it is keyed on image content and there is no image), and
+    NO THREAD (nothing to remember between calls - a follow-up question is a
+    UI feature and belongs to a session, which an API caller does not have).
+    """
+    if not isinstance(document_text, str) or not document_text.strip():
+        return NO_DOCUMENT_TEXT_MESSAGE
+    if resources.client is None:
+        return resources.client_error or CONFIG_ERROR_MESSAGE
+
+    # CAPPED BEFORE ANYTHING ELSE, including before the cache key is taken,
+    # so two bodies differing only past the cap share one entry - see
+    # _document_text_key.
+    capped = _cap_document_text(document_text.strip())
+    cache_key = _document_text_key(capped)
+    cached = resources.document_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    # Wrapped so "did a model call actually succeed?" is answerable
+    # structurally after the run - see _SuccessWatchingClient for why that
+    # cannot be read off the result.
+    watched_client = _SuccessWatchingClient(resources.client)
+    try:
+        config = {
+            "configurable": {
+                "client": watched_client,
+                "searcher": resources.searcher,
+                "research_client": resources.research_client,
+                "deadline": time.monotonic() + pipeline_budget_seconds,
+            }
+        }
+        result = build_deep_path_graph().invoke(
+            {
+                "document_text": capped,
+                "scene_description": TEXT_ONLY_SCENE,
+            },
+            config=config,
+        )
+        # READ INSIDE THE PROTECTED REGION, deliberately. These are
+        # bracket-accesses, so a child that stopped writing either key would
+        # raise KeyError - and out here, past the excepts, that KeyError
+        # would escape a gr.api route as a 500. Loud is right (see
+        # clarif_eye.graph.make_deep_path_node on why the wrapper reads the
+        # same keys the same way), but loud in the test suite, not at an API
+        # caller: inside the try it degrades to UNEXPECTED_ERROR_MESSAGE like
+        # every other unforeseen failure in this module.
+        spoken = (result["final_output"] or "").strip()
+        held_back = result["verification_hold"] is not None
+    except LadderExhaustedError as exc:
+        return message_for_ladder_exhausted(exc)
+    except OpenRouterError as exc:
+        return message_for_terminal_error(exc)
+    except Exception:
+        return UNEXPECTED_ERROR_MESSAGE
+
+    if not spoken:
+        return UNEXPECTED_ERROR_MESSAGE
+
+    # CACHED ONLY WHEN THE RUN GENUINELY PRODUCED THIS DOCUMENT'S ANSWER, the
+    # same discipline the image cache follows:
+    #   - a model call came back with usable content, so a busy-ladder
+    #     message, an empty model reply, or a deadline-degraded read-back of
+    #     the input is left to be retried rather than served to the next
+    #     caller as this document's answer;
+    #   - nothing was held back for being unverifiable. That outcome is this
+    #     route's honest degradation (there is nobody here to ask - see
+    #     above), not the description of the document, so a later caller gets
+    #     a fresh attempt instead of a replayed refusal.
+    if watched_client.succeeded and not held_back:
+        resources.document_cache.put(cache_key, spoken)
+    return spoken
+
+
 def build_interface(resources):
     """Build the Clarif-Eye gr.Blocks UI, wired to `resources`.
 
@@ -2471,6 +2904,15 @@ def build_interface(resources):
 
     def _ask(question, thread_id):
         yield from handle_ask_staged(question, resources, thread_id=thread_id)
+
+    # Issue #84 / P9.5. Fully type-hinted because gr.api derives the
+    # endpoint's typing from the signature rather than from components -
+    # there are no components here, which is the point (see
+    # DESCRIBE_TEXT_API_NAME's comment for why this is not a box on the
+    # page).
+    def _describe_document_text(document_text: str) -> str:
+        """Describe a document from its text alone, with no photo."""
+        return describe_document_text(document_text, resources)
 
     with gr.Blocks(title="Clarif-Eye") as demo:
         thread_state = gr.State(value=lambda: str(uuid.uuid4()))
@@ -2580,6 +3022,11 @@ def build_interface(resources):
         # comment for the exemption that keeps ARIA_LIVE_HEAD's #48 pass
         # from silencing it.
         gr.HTML(PIPELINE_DIAGRAM_HTML, elem_id=DIAGRAM_ELEM_ID)
+
+        # The text-only consumer (issue #84 / P9.5): a callable endpoint with
+        # no components, so it changes nothing about what is on the page, in
+        # the tab order, or in the reading order.
+        gr.api(_describe_document_text, api_name=DESCRIBE_TEXT_API_NAME)
 
         result_outputs = [status_output, audio_output, text_output]
         # The two resume buttons are outputs of the photo and resume

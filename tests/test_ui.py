@@ -38,6 +38,8 @@ from clarif_eye.ui import (
     handle_submit_staged,
 )
 
+from tests._stream_helpers import SingleChunkStreamMixin
+
 
 class FakeImage:
     """Stand-in for a PIL Image good enough for base64 encoding.
@@ -71,7 +73,7 @@ class BrokenImage:
         raise OSError("cannot identify image data")
 
 
-class FakeGraph:
+class FakeGraph(SingleChunkStreamMixin):
     """Records the config it was invoked with and returns a canned result.
 
     stream() (issue #80 / P9.1) yields exactly one chunk, keyed "tts" -
@@ -81,6 +83,14 @@ class FakeGraph:
     the invocation, raising self.exc), and graph.next_node_after("tts", ...)
     is None (nothing follows tts), so this maps to no narration phrase and
     every existing staged-contract test keeps its exact yield sequence.
+
+    THE (namespace, chunk) SHAPE (issue #84 / P9.5): clarif_eye.ui's
+    _narrate_stream now opens the stream with subgraphs=True, because the
+    deep path is a child graph whose nodes would otherwise be invisible -
+    and LangGraph then yields PAIRS rather than bare chunks. This double
+    honours the same contract so it keeps standing in for a real graph
+    rather than for the shape one used to have. It has no subgraph of its
+    own, so the namespace it reports is always the parent's ().
     """
 
     def __init__(self, result=None, exc=None):
@@ -94,11 +104,8 @@ class FakeGraph:
             raise self.exc
         return self.result
 
-    def stream(self, state, config=None, stream_mode="updates"):
-        yield {"tts": self.invoke(state, config=config)}
 
-
-class SequencedGraph:
+class SequencedGraph(SingleChunkStreamMixin):
     """Like FakeGraph, but returns a DIFFERENT final_output on each
     invocation - lets cache tests (issue #75) assert that two different
     images produce genuinely different results, not just different call
@@ -113,8 +120,6 @@ class SequencedGraph:
         self.invocations.append({"state": state, "config": config})
         return {"final_output": self.outputs[idx], "audio_file_path": ""}
 
-    def stream(self, state, config=None, stream_mode="updates"):
-        yield {"tts": self.invoke(state, config=config)}
 
 
 def _resources(graph, client="fake-client"):
@@ -454,7 +459,7 @@ def test_failed_result_is_not_cached_a_retry_makes_a_second_call(exc):
     assert len(graph.invocations) == 2
 
 
-class FileWritingGraph:
+class FileWritingGraph(SingleChunkStreamMixin):
     """FakeGraph that actually writes bytes to `audio_path` on each
     invoke() call, standing in for the real pipeline actually producing a
     fresh mp3 - lets a test tell "the cache lied about a path" apart from
@@ -470,11 +475,9 @@ class FileWritingGraph:
         self.audio_path.write_bytes(b"fake-mp3-bytes")
         return {"final_output": self.final_output, "audio_file_path": str(self.audio_path)}
 
-    def stream(self, state, config=None, stream_mode="updates"):
-        yield {"tts": self.invoke(state, config=config)}
 
 
-class SequencedTtsGraph:
+class SequencedTtsGraph(SingleChunkStreamMixin):
     """Like SequencedGraph, but also plants tts_module's last-result state
     on each invoke() call - simulating a real run_tts() call happening
     inside the graph - so is_chain_exhausted() reflects THIS call's TTS
@@ -493,8 +496,6 @@ class SequencedTtsGraph:
         tts_module._last_result_set(tts_result)
         return {"final_output": final_output, "audio_file_path": audio_path}
 
-    def stream(self, state, config=None, stream_mode="updates"):
-        yield {"tts": self.invoke(state, config=config)}
 
 
 def test_chain_exhausted_result_is_not_cached_a_retry_reruns_and_recovers(tmp_path):
