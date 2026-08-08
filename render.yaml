@@ -3,6 +3,11 @@
 # instead of only in a dashboard. OPENROUTER_API_KEY is declared here but
 # not given a value: sync: false means Render prompts for it once, in the
 # dashboard, and never reads its value from this file.
+#
+# Deploys are triggered by the CI workflow (.github/workflows/ci.yml),
+# which calls Render's private deploy hook after the test job passes on
+# main. The dashboard's Auto-Deploy setting is not the mechanism in use —
+# this repo has no delivery webhooks configured, so it never fired anyway.
 services:
   - type: web
     name: clarif-eye

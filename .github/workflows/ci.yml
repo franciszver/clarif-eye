@@ -37,3 +37,19 @@ jobs:
 
       - name: Scan full history for leaked credentials
         run: python scripts/scan_history.py
+
+  # Render's GitHub app connection has no delivery webhooks configured for
+  # this repository, so its dashboard auto-deploy never fires on a commit —
+  # only the very first deploy ever happened this way. Instead, CI calls
+  # Render's private deploy hook itself once the test job has passed. This
+  # also means every deploy is strictly gated on a green test run, which
+  # auto-deploy-on-commit never guaranteed.
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render deploy
+        env:
+          RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: curl -fsS --max-time 30 -X POST "$RENDER_DEPLOY_HOOK"
