@@ -181,19 +181,27 @@ def _run_config(client, thread_id="interrupt-thread"):
     }
 
 
-def _resources(client, thread_id_unused=None):
+def _resources(client, thread_id_unused=None, store=None):
     """A REAL checkpointed graph plus a REAL ThreadRegistry - the pairing
     invariant clarif_eye.ui.AppResources documents. `searcher` is a fake so
-    the research path never opens a socket."""
+    the research path never opens a socket.
+
+    `store` (issue #86 / P9.7 deep-review MAJOR fix) is OPTIONAL and
+    defaults to None, same as every other AppResources field here - only
+    the pause/preference-collision test below needs a real
+    langgraph.store.memory.InMemoryStore to assert nothing was written to
+    it.
+    """
     checkpointer = InMemorySaver()
     return AppResources(
-        graph=build_graph(checkpointer=checkpointer),
+        graph=build_graph(checkpointer=checkpointer, store=store),
         client=client,
         client_error=None,
         tts_providers=[_FakeTtsProvider()],
         searcher=FakeSearcher(),
         research_client=None,
         thread_registry=ThreadRegistry(checkpointer),
+        store=store,
     )
 
 
@@ -605,8 +613,17 @@ def test_the_audio_delay_contract_is_the_shared_one():
 # has to have a decided answer, because the failure mode of getting one
 # wrong is either speaking an unverified number to someone who declined it,
 # or silently throwing the question away and leaving two buttons on screen
-# wired to nothing. The three collisions are: typing a follow-up,
-# submitting a photo that is already cached, and submitting a fresh photo.
+# wired to nothing. The four collisions are: typing a follow-up, submitting
+# a photo that is already cached, submitting a fresh photo, and - issue #86 /
+# P9.7 deep-review MAJOR fix - typing a PREFERENCE-SETTING command
+# ("shorter descriptions please") into the same follow-up box. That fourth
+# one is not a new category of collision, just a new way to type a follow-up
+# while paused: the decided rule is the SAME one the first collision already
+# has (refuse with QUESTION_PENDING_MESSAGE, store nothing, leave the pause
+# exactly as it was) - see
+# test_a_preference_command_typed_while_a_question_is_pending_is_refused
+# below, and clarif_eye.ui._run_followup_events, where the pending-interrupt
+# check now runs BEFORE detect_preference_command is ever consulted.
 
 
 class ScriptedClient:
@@ -696,6 +713,64 @@ def test_a_follow_up_typed_while_a_question_is_pending_is_refused():
     resumed = _staged(
         handle_resume_staged(RESUME_CONTINUE, resources, thread_id="ask-while-paused")
     )
+    assert UNVERIFIED_NUMBER_CAVEAT in resumed[-1][2]
+
+
+def test_a_preference_command_typed_while_a_question_is_pending_is_refused():
+    """The fourth pause-lifecycle collision (issue #86 / P9.7 deep-review
+    MAJOR fix): a PREFERENCE-SETTING command typed into the follow-up box
+    while a safety question is pending must get the SAME refusal an
+    ordinary follow-up gets - not be silently accepted.
+
+    Before this was fixed, clarif_eye.ui._run_followup_events dispatched
+    detect_preference_command BEFORE the pending-interrupt check, so
+    "shorter descriptions please" was recognised, stored, and confirmed
+    with zero mention of the waiting question - the pause stayed intact
+    (nothing about resolving it), but the user only ever heard the
+    verbosity confirmation, never QUESTION_PENDING_MESSAGE. The decided
+    rule, consistent with the other three pause-lifecycle collisions above:
+    while a question is pending, the ONLY accepted actions are the two
+    choice buttons or a new photo - a preference command is refused exactly
+    like any other follow-up, and the preference is NOT stored.
+    """
+    from langgraph.store.memory import InMemoryStore
+
+    from clarif_eye import preferences
+
+    store = InMemoryStore()
+    resources = _resources(RecordingClient(INVENTED_DRAFT), store=store)
+    thread_id = "pref-while-paused"
+    session_id = "pref-while-paused-session"
+    list(handle_submit_staged(FakeImage(), resources, thread_id=thread_id, session_id=session_id))
+    calls_before = len(resources.client.calls)
+
+    updates = _staged(
+        handle_ask_staged(
+            "shorter descriptions please", resources, thread_id=thread_id, session_id=session_id
+        )
+    )
+
+    _status, audio, text = updates[-1]
+    assert audio is None
+    assert text == QUESTION_PENDING_MESSAGE
+    assert RESUME_CONTINUE_LABEL in text
+    assert RESUME_RETAKE_LABEL in text
+
+    # THE PREFERENCE MUST NOT HAVE BEEN STORED - the whole point of this fix.
+    assert preferences.get_verbosity(store, session_id) is None
+    assert store.search(()) == []
+
+    # THE PAUSE SURVIVED: still pending, still resumable - same assertion
+    # shape as the ordinary-follow-up collision above.
+    snapshot = _state_of(resources, thread_id)
+    assert snapshot.next == (DEEP_PATH_NODE,)
+    assert snapshot.interrupts
+
+    # And it cost nothing: no graph run, so no model call.
+    assert len(resources.client.calls) == calls_before
+
+    # The user can still answer the ORIGINAL question afterwards.
+    resumed = _staged(handle_resume_staged(RESUME_CONTINUE, resources, thread_id=thread_id))
     assert UNVERIFIED_NUMBER_CAVEAT in resumed[-1][2]
 
 
