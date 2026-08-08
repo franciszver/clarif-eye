@@ -24,10 +24,14 @@ from clarif_eye.client import CompletionResult, LadderExhaustedError
 from clarif_eye.graph import build_graph
 from clarif_eye.ui import (
     AppResources,
+    MAX_PHOTOS_PER_SUBMISSION,
     STATUS_DEGRADED,
     STATUS_WORKING,
     ThreadRegistry,
+    _encode_image,
+    _image_content_key,
     handle_submit_staged,
+    too_many_photos_message,
     working_status_for,
 )
 
@@ -40,10 +44,13 @@ APPLES = FakeImage(content=b"\xff\xd8\xff\xe0apples")
 BREAD = FakeImage(content=b"\xff\xd8\xff\xe0bread")
 CHEESE = FakeImage(content=b"\xff\xd8\xff\xe0cheese")
 
+OLIVES = FakeImage(content=b"\xff\xd8\xff\xe0olives")
+
 SUBJECTS = {
     "apples": "a fruit bowl",
     "bread": "a bakery shelf",
     "cheese": "a deli counter",
+    "olives": "a market stall",
 }
 
 
@@ -243,6 +250,69 @@ def test_one_unreadable_photo_degrades_the_whole_turn_and_says_which_one():
     # answer is honest. What marks the turn as degraded travels in state and
     # is proved by the memory test below.
     assert audio and status != STATUS_DEGRADED
+
+
+# --- The cap on how many photos one submission may fan out to -------------
+#
+# THE QUOTA HAZARD, stated plainly because it is the reason this exists: the
+# fan-out starts one whole vision chain per photo, plus a research and an
+# analysis call for every photo the router sends down the deep path. Nothing
+# bounded the count, so ONE visitor attaching fifty images spent up to a
+# hundred calls against a shared daily allowance in a single request - the
+# same shape issue #84 closed for the text route with DOCUMENT_TEXT_CAP,
+# reintroduced per submission by this feature.
+
+
+def test_a_submission_over_the_cap_spends_nothing_and_says_so():
+    client = SubjectClient()
+    resources = _resources(client)
+    over_cap = [BREAD, CHEESE, OLIVES, APPLES, BREAD]
+    count = 1 + len(over_cap)
+    assert count > MAX_PHOTOS_PER_SUBMISSION, "setup: this must exceed the cap"
+
+    yields = _stage(resources, APPLES, extra_images=over_cap, thread_id="over-cap")
+
+    # NOT ONE MODEL CALL. This is the whole point - the guard has to fire
+    # before any photo is encoded, let alone described.
+    assert client.calls == []
+
+    _status, audio, text = yields[-1]
+    assert audio is None
+    # The message is actionable for someone who cannot see how many photos
+    # they attached: it says the limit, how many arrived, and - the part that
+    # makes it honest - that NOTHING was described.
+    assert text == too_many_photos_message(count)
+    assert str(MAX_PHOTOS_PER_SUBMISSION) in text
+    assert str(count) in text
+    assert "Nothing was described" in text
+
+    # Nothing entered the cache, so a rejected submission cannot be replayed
+    # to the next visitor as any photo's answer.
+    for image in [APPLES, BREAD, CHEESE, OLIVES]:
+        key = _image_content_key(_encode_image(image))
+        assert resources.image_cache.get(key) is None
+
+    # And nothing was remembered: a refused turn leaves no trace, the same
+    # skip-not-mark semantics a degraded turn gets (issue #93 / P9.12).
+    snapshot = resources.graph.get_state({"configurable": {"thread_id": "over-cap"}})
+    assert snapshot.values.get("messages", []) == []
+
+
+def test_a_submission_at_the_cap_is_described_normally():
+    """The boundary is INCLUSIVE - the cap is how many are allowed, not how
+    many are too many. A test that only drove the over-cap case would pass
+    against an off-by-one that refused the largest legitimate submission."""
+    client = SubjectClient()
+    resources = _resources(client)
+    at_cap = [BREAD, CHEESE, OLIVES][: MAX_PHOTOS_PER_SUBMISSION - 1]
+
+    _status, audio, text = _stage(
+        resources, APPLES, extra_images=at_cap, thread_id="at-cap"
+    )[-1]
+
+    assert audio, "a submission at the cap must still be described"
+    assert len(client.subjects_read()) == MAX_PHOTOS_PER_SUBMISSION
+    assert "apples" in text and "olives" in text
 
 
 def test_a_degraded_multi_photo_turn_is_not_remembered():
