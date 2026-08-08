@@ -788,6 +788,10 @@ def test_the_text_only_consumer_is_an_api_route_and_not_in_the_ui_flow():
 # --- The deployment kill switch (issue #108) -------------------------------
 
 
+def _must_not_build_deep_path():
+    raise AssertionError("the deep-path child graph must not be built when the route is disabled")
+
+
 def test_describe_document_text_returns_the_disabled_message_and_does_no_work(monkeypatch):
     """Set to "disabled", the route must return the fixed message WITHOUT
     invoking the deep-path child graph, touching the document cache, or
@@ -796,11 +800,7 @@ def test_describe_document_text_returns_the_disabled_message_and_does_no_work(mo
     import clarif_eye.ui as ui
 
     monkeypatch.setenv("CLARIFEYE_TEXT_ROUTE", "disabled")
-
-    def _raise_if_called():
-        raise AssertionError("the deep-path child graph must not be built when the route is disabled")
-
-    monkeypatch.setattr(ui, "build_deep_path_graph", _raise_if_called)
+    monkeypatch.setattr(ui, "build_deep_path_graph", _must_not_build_deep_path)
 
     resources = _resources(RecordingClient(HONEST_DRAFT))
 
@@ -817,13 +817,7 @@ def test_describe_document_text_disabled_route_does_not_pollute_the_cache_on_rep
     import clarif_eye.ui as ui
 
     monkeypatch.setenv("CLARIFEYE_TEXT_ROUTE", "disabled")
-    monkeypatch.setattr(
-        ui,
-        "build_deep_path_graph",
-        lambda: (_ for _ in ()).throw(
-            AssertionError("the deep-path child graph must not be built when the route is disabled")
-        ),
-    )
+    monkeypatch.setattr(ui, "build_deep_path_graph", _must_not_build_deep_path)
 
     resources = _resources(RecordingClient(HONEST_DRAFT))
 
