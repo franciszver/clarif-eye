@@ -191,15 +191,40 @@ ASK_BUTTON_ELEM_ID = "ask-button"
 RESUME_CONTINUE_BUTTON_ELEM_ID = "resume-continue-button"
 RESUME_RETAKE_BUTTON_ELEM_ID = "resume-retake-button"
 
+# --- Two tabs: product and explanation (issue #87 / P9.8) ------------------
+#
+# Owner request, directly: "two tabs on top, one tab for the product, and
+# one tab on the explanation". Everything used to sit on one long page;
+# splitting it keeps the product view uncluttered and gives the
+# demo/explainer content (Phase 9's LangGraph write-up + diagram) room to
+# grow without pushing the photo/description controls further down the
+# page every time a sentence is added below them.
+#
+# LABELS ARE PLAIN LANGUAGE ON PURPOSE, not "Product"/"Explanation" (jargon
+# that means nothing to the person using this): "Describe a photo" says
+# what the tab DOES, "How it works" says what the tab explains. Gradio
+# renders each gr.Tab's `label` as the accessible name of its tab button
+# (verified by building a throwaway Tabs/Tab interface and inspecting the
+# component tree - see tests/test_accessibility.py's P9.8 section for how),
+# so these strings are both the visible tab text and the name a screen
+# reader announces - no separate aria-label needed.
+PRODUCT_TAB_ELEM_ID = "product-tab"
+PRODUCT_TAB_LABEL = "Describe a photo"
+EXPLANATION_TAB_ELEM_ID = "explanation-tab"
+EXPLANATION_TAB_LABEL = "How it works"
+
 # Accessible name given to the user's own uploaded/captured photo preview
 # (issue #48 / P5.4 - see ARIA_LIVE_HEAD's image-labelling comment below).
 UPLOADED_PHOTO_ALT = "The photo you submitted"
 
 # --- "How this works" section (issue #49 / P4.3) ---------------------------
 #
-# Owner request: a section near the bottom explaining the pipeline, the data
-# flow, and the LangGraph implementation, since this is a demo application.
-# Content below is checked against the source it describes, not against the
+# Owner request: a section explaining the pipeline, the data flow, and the
+# LangGraph implementation, since this is a demo application. UPDATED for
+# issue #87 / P9.8: this content now lives on its own explanation tab
+# (EXPLANATION_TAB_LABEL) rather than at the bottom of a single long page -
+# see build_interface() below. Content below is checked against the source
+# it describes, not against the
 # issue's own wording or the (older, no longer accurate) architecture doc:
 #   - graph.py: build_graph() registers exactly 6 nodes (entry, vision,
 #     fast_synth, deep_path, followup, tts). `deep_path` is a whole COMPILED
@@ -249,10 +274,14 @@ UPLOADED_PHOTO_ALT = "The photo you submitted"
 # - no img/svg markup is ever added here). Always visible, no collapsible
 # toggle: simpler, and it avoids needing to get aria-expanded/keyboard-toggle
 # wiring right for a chunk of content that costs a screen-reader/keyboard
-# user nothing extra to skip past by navigating to the next heading. Placed
-# after the result textbox in build_interface() below, so it never delays
-# someone using the tool and never sits between the live region and the
-# result it announces.
+# user nothing extra to skip past by navigating to the next heading. UPDATED
+# for issue #87 / P9.8: this content lives on its own explanation tab now,
+# not stacked after the result textbox on the same page - a stronger version
+# of the same goal the old placement served. It cannot merely be scrolled
+# past while using the tool, it is on a DIFFERENT TAB entirely, so it can
+# never delay someone submitting a photo and can never sit between the live
+# region and the result it announces, since the product tab's layout is
+# unaffected by anything here.
 #
 # THE DIAGRAM (issue #56 / P4.4): the owner later asked for a graphic. P4.3
 # deliberately shipped text-only because #48 had JUST been fixed and an
@@ -2918,110 +2947,138 @@ def build_interface(resources):
         thread_state = gr.State(value=lambda: str(uuid.uuid4()))
         gr.Markdown(
             "# Clarif-Eye\n"
-            "Clarif-Eye describes a photo aloud for visually impaired users. "
-            "Take or upload a photo below. This can take up to about 30 "
-            "seconds, especially for photos with dense text."
+            "Clarif-Eye describes a photo aloud for visually impaired users."
         )
-        image_input = gr.Image(
-            label="Photo to describe",
-            sources=["upload", "webcam"],
-            type="pil",
-            # issue #48 / P5.4: lets ARIA_LIVE_HEAD's image-labelling shim
-            # find the uploaded-photo preview structurally (it's the <img>
-            # inside this container), instead of any icon glyph elsewhere
-            # on the page.
-            elem_id=IMAGE_INPUT_ELEM_ID,
-            # issue #59 / P4.5: Gradio mirrors the webcam by default
-            # (WebcamOptions.mirror=True), which suits selfies. This app
-            # has no selfie case - users photograph bills, labels, and
-            # signs so the vision model can read the text, and a blind
-            # user is not looking at the preview to notice a mirrored
-            # frame. Mirroring reversed that text before the model ever
-            # saw it. Do not restore the default thinking it "looks more
-            # natural" - it makes captured text unreadable.
-            webcam_options=gr.WebcamOptions(mirror=False),
-        )
-        submit_button = gr.Button("Describe this photo", variant="primary")
-        status_output = gr.Textbox(
-            value=STATUS_IDLE,
-            label="Status",
-            interactive=False,
-            elem_id=STATUS_ELEM_ID,
-            elem_classes=STATUS_ELEM_CLASSES,
-        )
-        # autoplay=True (issue #47 / P5.3): Gradio only assigns the <audio>
-        # element a source at all when autoplay is on - with it off, no
-        # src is ever set and playback can never start by any means (see
-        # AUDIO_PLAY_DELAY_MS's comment for how that was diagnosed). The
-        # gap between the completion announcement and audio starting is
-        # created instead by handle_submit_staged withholding the audio
-        # path for one extra yield, not by JS here.
-        audio_output = gr.Audio(label="Spoken description", autoplay=True, elem_id=AUDIO_ELEM_ID)
-        text_output = gr.Textbox(label="Description (text)", lines=6, elem_id=RESULT_ELEM_ID)
+        # Issue #87 / P9.8: two tabs, product and explanation (owner
+        # request, verbatim - see PRODUCT_TAB_LABEL/EXPLANATION_TAB_LABEL's
+        # module comment). gr.Tabs renders a keyboard-reachable tablist of
+        # buttons, each named by its gr.Tab's `label` - both tabs carry an
+        # elem_id too, for the same reason every other control here does:
+        # so tests and the accessibility audit can find them structurally.
+        with gr.Tabs():
+            with gr.Tab(PRODUCT_TAB_LABEL, elem_id=PRODUCT_TAB_ELEM_ID):
+                gr.Markdown(
+                    "Take or upload a photo below. This can take up to "
+                    "about 30 seconds, especially for photos with dense "
+                    "text."
+                )
+                image_input = gr.Image(
+                    label="Photo to describe",
+                    sources=["upload", "webcam"],
+                    type="pil",
+                    # issue #48 / P5.4: lets ARIA_LIVE_HEAD's image-labelling
+                    # shim find the uploaded-photo preview structurally (it's
+                    # the <img> inside this container), instead of any icon
+                    # glyph elsewhere on the page.
+                    elem_id=IMAGE_INPUT_ELEM_ID,
+                    # issue #59 / P4.5: Gradio mirrors the webcam by default
+                    # (WebcamOptions.mirror=True), which suits selfies. This
+                    # app has no selfie case - users photograph bills,
+                    # labels, and signs so the vision model can read the
+                    # text, and a blind user is not looking at the preview
+                    # to notice a mirrored frame. Mirroring reversed that
+                    # text before the model ever saw it. Do not restore the
+                    # default thinking it "looks more natural" - it makes
+                    # captured text unreadable.
+                    webcam_options=gr.WebcamOptions(mirror=False),
+                )
+                submit_button = gr.Button("Describe this photo", variant="primary")
+                status_output = gr.Textbox(
+                    value=STATUS_IDLE,
+                    label="Status",
+                    interactive=False,
+                    elem_id=STATUS_ELEM_ID,
+                    elem_classes=STATUS_ELEM_CLASSES,
+                )
+                # autoplay=True (issue #47 / P5.3): Gradio only assigns the
+                # <audio> element a source at all when autoplay is on - with
+                # it off, no src is ever set and playback can never start by
+                # any means (see AUDIO_PLAY_DELAY_MS's comment for how that
+                # was diagnosed). The gap between the completion announcement
+                # and audio starting is created instead by
+                # handle_submit_staged withholding the audio path for one
+                # extra yield, not by JS here.
+                audio_output = gr.Audio(
+                    label="Spoken description", autoplay=True, elem_id=AUDIO_ELEM_ID
+                )
+                text_output = gr.Textbox(
+                    label="Description (text)", lines=6, elem_id=RESULT_ELEM_ID
+                )
 
-        # --- Answering the unverifiable-number question (issue #83 / P9.4)
-        #
-        # PLACED IMMEDIATELY AFTER the result text, which is where the
-        # question itself appears and where FOCUS_RESULT_JS has just put
-        # focus - so the two answers are the very next thing a keyboard or
-        # screen-reader user reaches by tabbing forward from the question
-        # they were just read. Ordinary gr.Buttons: real labels, real tab
-        # stops, Enter and Space activate them, nothing custom to get wrong.
-        #
-        # visible=False initially, and every handler that touches them sets
-        # visibility explicitly (see _submit/_resume above) - so they exist
-        # in the tab order only while there is genuinely a question waiting.
-        with gr.Row():
-            resume_continue_button = gr.Button(
-                RESUME_CONTINUE_LABEL, elem_id=RESUME_CONTINUE_BUTTON_ELEM_ID, visible=False
-            )
-            resume_retake_button = gr.Button(
-                RESUME_RETAKE_LABEL, elem_id=RESUME_RETAKE_BUTTON_ELEM_ID, visible=False
-            )
+                # --- Answering the unverifiable-number question (issue #83
+                # / P9.4)
+                #
+                # PLACED IMMEDIATELY AFTER the result text, which is where
+                # the question itself appears and where FOCUS_RESULT_JS has
+                # just put focus - so the two answers are the very next
+                # thing a keyboard or screen-reader user reaches by tabbing
+                # forward from the question they were just read. Ordinary
+                # gr.Buttons: real labels, real tab stops, Enter and Space
+                # activate them, nothing custom to get wrong.
+                #
+                # visible=False initially, and every handler that touches
+                # them sets visibility explicitly (see _submit/_resume
+                # above) - so they exist in the tab order only while there
+                # is genuinely a question waiting.
+                with gr.Row():
+                    resume_continue_button = gr.Button(
+                        RESUME_CONTINUE_LABEL,
+                        elem_id=RESUME_CONTINUE_BUTTON_ELEM_ID,
+                        visible=False,
+                    )
+                    resume_retake_button = gr.Button(
+                        RESUME_RETAKE_LABEL,
+                        elem_id=RESUME_RETAKE_BUTTON_ELEM_ID,
+                        visible=False,
+                    )
 
-        # --- Follow-up question (issue #82 / P9.3) -----------------------
-        #
-        # PLACED AFTER the description output and BEFORE "How this works":
-        # asking about the photo is a FOLLOW-ON action, so it belongs after
-        # the thing it follows on from. Putting it above the result would
-        # sit an input the user cannot use yet between the live region and
-        # the answer it announces - the exact mistake #49's placement
-        # comment already argues against for the how-it-works section.
-        #
-        # IT MUST NOT STEAL FOCUS, and nothing here makes it: it is an
-        # ordinary Textbox with `autofocus` left at its default (off), and
-        # FOCUS_RESULT_JS keeps targeting `#{RESULT_ELEM_ID} textarea` and
-        # nothing else, so after either run focus still lands on the answer
-        # rather than on this box.
-        #
-        # KEYBOARD-REACHABLE, BY DEFAULT AND BY A SECOND ROUTE: this Textbox
-        # is interactive (not the disabled-textarea case ARIA_LIVE_HEAD has
-        # to repair for the read-only description output), so it is an
-        # ordinary tab stop with a real label. `.submit` fires on Enter
-        # inside the box, so a keyboard user never has to tab onward to the
-        # button - both events are wired to the SAME handler below.
-        question_input = gr.Textbox(
-            label="Question about the photo",
-            placeholder="For example: what is the expiry date?",
-            lines=1,
-            elem_id=QUESTION_INPUT_ELEM_ID,
-        )
-        ask_button = gr.Button("Ask about this photo", elem_id=ASK_BUTTON_ELEM_ID)
+                # --- Follow-up question (issue #82 / P9.3) ---------------
+                #
+                # PLACED AFTER the description output: asking about the
+                # photo is a FOLLOW-ON action, so it belongs after the thing
+                # it follows on from. Putting it above the result would sit
+                # an input the user cannot use yet between the live region
+                # and the answer it announces.
+                #
+                # IT MUST NOT STEAL FOCUS, and nothing here makes it: it is
+                # an ordinary Textbox with `autofocus` left at its default
+                # (off), and FOCUS_RESULT_JS keeps targeting
+                # `#{RESULT_ELEM_ID} textarea` and nothing else, so after
+                # either run focus still lands on the answer rather than on
+                # this box.
+                #
+                # KEYBOARD-REACHABLE, BY DEFAULT AND BY A SECOND ROUTE: this
+                # Textbox is interactive (not the disabled-textarea case
+                # ARIA_LIVE_HEAD has to repair for the read-only description
+                # output), so it is an ordinary tab stop with a real label.
+                # `.submit` fires on Enter inside the box, so a keyboard
+                # user never has to tab onward to the button - both events
+                # are wired to the SAME handler below.
+                question_input = gr.Textbox(
+                    label="Question about the photo",
+                    placeholder="For example: what is the expiry date?",
+                    lines=1,
+                    elem_id=QUESTION_INPUT_ELEM_ID,
+                )
+                ask_button = gr.Button("Ask about this photo", elem_id=ASK_BUTTON_ELEM_ID)
 
-        # issue #49 / P4.3: placed AFTER the result area (never before it),
-        # so it never delays someone who came to use the tool and never
-        # sits between the live region and the result it announces. See
-        # HOW_IT_WORKS_MARKDOWN's module-level docstring for content
-        # sourcing; the ordered list here stays text-only and is the
-        # accessible source of truth for a screen-reader user.
-        gr.Markdown(HOW_IT_WORKS_MARKDOWN, elem_id=HOW_IT_WORKS_ELEM_ID)
-        # issue #56 / P4.4: a sighted-friendly diagram alongside (never
-        # instead of) the list above. gr.HTML, not gr.Markdown, because the
-        # diagram is raw inline SVG with its own role/aria-label/
-        # aria-describedby wiring - see PIPELINE_DIAGRAM_SVG's module
-        # comment for the exemption that keeps ARIA_LIVE_HEAD's #48 pass
-        # from silencing it.
-        gr.HTML(PIPELINE_DIAGRAM_HTML, elem_id=DIAGRAM_ELEM_ID)
+            # --- Explanation tab (issue #87 / P9.8) -----------------------
+            #
+            # HOW_IT_WORKS_MARKDOWN and PIPELINE_DIAGRAM_HTML moved here,
+            # off the product tab, so the product flow stays uncluttered and
+            # this content has room to grow. See HOW_IT_WORKS_MARKDOWN's and
+            # PIPELINE_DIAGRAM_SVG's own module comments for content
+            # sourcing and the #48 image-labelling exemption
+            # (DIAGRAM_ELEM_ID) - both survive unchanged, just relocated.
+            with gr.Tab(EXPLANATION_TAB_LABEL, elem_id=EXPLANATION_TAB_ELEM_ID):
+                gr.Markdown(HOW_IT_WORKS_MARKDOWN, elem_id=HOW_IT_WORKS_ELEM_ID)
+                # issue #56 / P4.4: a sighted-friendly diagram alongside
+                # (never instead of) the list above. gr.HTML, not
+                # gr.Markdown, because the diagram is raw inline SVG with
+                # its own role/aria-label/aria-describedby wiring - see
+                # PIPELINE_DIAGRAM_SVG's module comment for the exemption
+                # that keeps ARIA_LIVE_HEAD's #48 pass from silencing it.
+                gr.HTML(PIPELINE_DIAGRAM_HTML, elem_id=DIAGRAM_ELEM_ID)
 
         # The text-only consumer (issue #84 / P9.5): a callable endpoint with
         # no components, so it changes nothing about what is on the page, in
