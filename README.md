@@ -7,14 +7,47 @@ It runs on a free hosting tier, so if it has been idle the first request
 can take about 60 seconds to wake it up; see [Deployment](#deployment) for
 why.
 
-Clarif-Eye turns a photo into a spoken description, for people who cannot
-see the photo they are describing. Point a camera at a bill, a label, or a
-document, and the app reads the text, describes the scene, and speaks the
-result back to you. On documents with dense numbers, such as an itemized
-bill, it does extra work to check that every amount it plans to say aloud
-actually traces back to the photographed text before speaking it.
+Clarif-Eye is a working demonstration of what [LangGraph](https://github.com/langchain-ai/langgraph)
+can do, built as a real, usable application rather than a toy example.
+The vehicle is an accessible vision assistant: point a camera at a bill,
+a label, or a document, and the app reads the text, describes the scene,
+and speaks the result back to you. On documents with dense numbers, such
+as an itemized bill, it does extra work to check that every amount it
+plans to say aloud actually traces back to the photographed text before
+speaking it. Both halves are true at once: the app genuinely helps
+someone who cannot see the photo they are describing, and the code
+underneath exercises most of what LangGraph offers, in ways a reader can
+verify rather than take on faith.
 
-## A demo, honestly described
+## LangGraph capabilities this repo demonstrates
+
+Every row below names the file and the symbol that implements it, and a
+test (`tests/test_readme_capabilities.py`) imports every one of them, so
+this table cannot silently drift out of date with the code.
+
+| Capability | What it looks like here | Demonstrated by |
+|---|---|---|
+| `StateGraph` with conditional edges | A static branch on a flag one node already computed: `vision` sets a complexity flag, `dynamic_router` reads it to choose the fast path or the deep path. | `clarif_eye.graph.build_graph`, `clarif_eye.graph.dynamic_router` |
+| `Command(goto=...)` routing | A node that decides its own successor instead of handing off to a separate router function. The entry node reads the run's own input (a photo or a typed question) and routes itself. | `clarif_eye.graph.entry_node` |
+| Streaming with per-node narration | The compiled graph is driven with `stream_mode="updates"`, so each completed node's name is available as it finishes, not only the final result. That drives the app's spoken progress updates. | `clarif_eye.ui._narrate_stream` |
+| Checkpointing and threads | Conversation state persists across turns on a `thread_id`, so a follow-up question can be answered from what an earlier photo already read. | `clarif_eye.graph.build_graph`, `clarif_eye.ui.build_resources`, `clarif_eye.ui.ThreadRegistry` |
+| Reducers | The conversation history key accumulates across runs instead of being overwritten by each new one, and is capped so a long-lived thread's checkpoint does not grow without bound. | `clarif_eye.state.ClarifEyeState`, `clarif_eye.state._keep_last_n_messages` |
+| `update_state` at the conversation boundary | A completed turn is written onto the thread once, from outside any node, rather than inside the node that happened to run last. | `clarif_eye.ui._record_turn` |
+| Human-in-the-loop interrupt and `Command(resume=...)` | When a number in a drafted script cannot be traced back to the photographed text, the run pauses and asks the user whether to hear it anyway or take a new photo, instead of guessing. | `clarif_eye.graph.verify_numbers_node` |
+| Subgraphs with their own schema | The deep-analysis path is a separate compiled graph with its own state, mounted in the main graph through a small wrapper. Its checkpoints hold no photo, because its schema has no field for one. A pause raised inside it still reaches the caller of the main graph. | `clarif_eye.deep_path.build_deep_path_graph`, `clarif_eye.graph.make_deep_path_node` |
+| Cross-thread `Store` | A spoken-verbosity preference set on one conversation thread is readable from a different thread in the same browser session, which a per-thread checkpoint cannot do on its own. | `clarif_eye.preferences.set_verbosity`, `clarif_eye.preferences.get_verbosity` |
+
+## Node policies: evaluated, not adopted
+
+LangGraph also ships built-in per-node policies for retries, timeouts,
+caching, and error handling. Each one was tested against this app's
+existing, hand-rolled equivalent, with a runnable script and its recorded
+output, before deciding whether to switch. The verdict in every case was
+to keep the hand-rolled version, for reasons specific to how this app
+runs today. See [docs/NODE-POLICIES.md](docs/NODE-POLICIES.md) for the
+comparison and `scripts/experiment_*.py` for the scripts themselves.
+
+## The product, honestly described
 
 This is a portfolio demo, not a product. It runs entirely on free-tier
 models from [OpenRouter](https://openrouter.ai/), which keeps the running
@@ -71,12 +104,12 @@ suite), see [CONTRIBUTING.md](CONTRIBUTING.md).
    thing the app ever stops to ask you about.
 7. The final script is converted to speech.
 
-The pipeline is built with [LangGraph](https://github.com/langchain-ai/langgraph)'s
-`StateGraph`. Every model call goes through one of two roles, "eyes" (reads
-the photo) and "brain" (writes the closer-look description), each an
-ordered ladder of free models tried in turn if an earlier one fails. If
-speech synthesis fails, the app still shows the description as text rather
-than failing silently.
+The pipeline is built with LangGraph's `StateGraph`, wired the way the
+table above describes. Every model call goes through one of two roles,
+"eyes" (reads the photo) and "brain" (writes the closer-look description),
+each an ordered ladder of free models tried in turn if an earlier one
+fails. If speech synthesis fails, the app still shows the description as
+text rather than failing silently.
 
 The in-app "How this works" panel (visible once the app is running)
 carries the same explanation, kept in sync with the code by a test. For
