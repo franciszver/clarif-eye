@@ -69,6 +69,7 @@ from clarif_eye.graph import (
     RESUME_RETAKE,
     TTS_NODE,
     build_graph,
+    make_checkpointer,
     next_node_after,
 )
 from clarif_eye.preferences import detect_preference_command, set_verbosity, VERBOSITY_SHORT
@@ -1595,8 +1596,34 @@ def _trim_thread_to_latest_checkpoint(checkpointer, thread_id):
     housekeeping, not something a photo's own outcome should ever depend
     on - a trim that failed for any reason should leave the (larger, but
     still correct) untrimmed history in place rather than take down a run.
+
+    ALSO A NO-OP FOR ANY CHECKPOINTER THAT IS NOT AN InMemorySaver (issue
+    #109 / P10.1) - the ONE chokepoint this whole trim/drop pair is guarded
+    at, since _drop_dead_subgraph_namespaces above is only ever reached from
+    here. This function and its helper reach into InMemorySaver's
+    undocumented internals (`storage`, `writes`, `blobs` - see the module
+    comment above), which a SqliteSaver simply does not expose; calling
+    `.storage.get(...)` on one would raise AttributeError, caught by the
+    bare `except Exception` below and silently swallowed rather than fixing
+    anything. The isinstance check turns that into an honest, obvious no-op.
+
+    THE ASYMMETRY THIS ACCEPTS, stated rather than left implicit: an
+    InMemorySaver's growth is RAM the process holds for as long as it runs -
+    the ~134KB/invoke measured in issue #81 (see the module comment above),
+    which is what this trim exists to bound. A SqliteSaver's growth is DISK,
+    on whatever volume CLARIFEYE_CHECKPOINT_DB points at - a materially
+    different resource with a materially different failure mode (running
+    out of disk on a demo app's scale is not the emergency running out of a
+    512MB instance's RAM is). It is bounded the same way thread COUNT
+    already is for both saver kinds: MAX_LIVE_THREADS' LRU eviction calls
+    delete_thread (see ThreadRegistry._evict above), which SqliteSaver
+    implements and which removes a thread's rows outright - just not
+    per-invoke, mid-thread pruning, which nothing here has ever done for
+    sqlite and which issue #109's Done-when does not ask for.
     """
     if checkpointer is None:
+        return
+    if not isinstance(checkpointer, InMemorySaver):
         return
     try:
         thread_storage = checkpointer.storage.get(thread_id)
@@ -1763,13 +1790,26 @@ class AppResources:
 def build_resources():
     """Construct every injectable ONCE for the life of the process.
 
-    Never raises: a missing OPENROUTER_API_KEY (the likely state of a
-    fresh Hugging Face Space with no secret set yet) must not crash the
-    app at import/startup time - it degrades to client=None plus a spoken
-    message, checked by handle_submit before the graph is ever invoked.
-    The research searcher/client are best-effort shared instances too (see
-    module docstring); if either fails to construct, they're left None and
-    research_node falls back to its own lazy per-call defaults.
+    Never raises IN THE DEFAULT DEPLOYMENT (CLARIFEYE_CHECKPOINT_DB unset,
+    the case every existing caller and the live app hit today): a missing
+    OPENROUTER_API_KEY (the likely state of a fresh Hugging Face Space with
+    no secret set yet) must not crash the app at import/startup time - it
+    degrades to client=None plus a spoken message, checked by handle_submit
+    before the graph is ever invoked. The research searcher/client are
+    best-effort shared instances too (see module docstring); if either
+    fails to construct, they're left None and research_node falls back to
+    its own lazy per-call defaults.
+
+    THE ONE DELIBERATE EXCEPTION (issue #109 / P10.1): setting
+    CLARIFEYE_CHECKPOINT_DB to an unusable path (an unwritable directory, a
+    file the process has no permission to open) makes make_checkpointer's
+    sqlite3.connect raise EAGERLY, right here, before the app finishes
+    booting - and that is by design, not an oversight this function's
+    "never raises" promise was supposed to cover. A checkpointer is either
+    real or the process should not start claiming to offer durable
+    checkpointing it cannot actually provide; failing loudly at startup
+    beats silently falling back to a saver whose name no longer matches
+    what an operator configured.
 
     CHECKPOINTING (issue #81 / P9.2): the live app compiles WITH a fresh
     langgraph.checkpoint.memory.InMemorySaver, one per process (the same
@@ -1839,7 +1879,14 @@ def build_resources():
     except Exception:
         research_client = None
 
-    checkpointer = InMemorySaver()
+    # issue #109 / P10.1: selected by CLARIFEYE_CHECKPOINT_DB (see
+    # clarif_eye.graph.make_checkpointer's own docstring for the two cases
+    # and the honest limits of each) instead of always constructing
+    # InMemorySaver() directly. Unset keeps exactly the InMemorySaver this
+    # line built before this issue - the deployment default (see this
+    # function's CHECKPOINTING comment above and README.md's Deployment
+    # section, both of which stay true either way).
+    checkpointer = make_checkpointer()
     store = InMemoryStore()
 
     return AppResources(

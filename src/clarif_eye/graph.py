@@ -80,8 +80,12 @@ gives callers (and tests) real per-node progress instead of a debugging
 side-channel, and needs nothing extra recorded by the nodes themselves.
 """
 
+import os
+import sqlite3
 import time
 
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
 from langgraph.types import Command, interrupt
 
@@ -957,6 +961,67 @@ def dynamic_router(state):
             f"{type(flag).__name__} ({flag!r})"
         )
     return DEEP_PATH_NODE if flag else "fast_synth"
+
+
+# Env var name for issue #109 / P10.1's pluggable durable checkpointing.
+# Named here, next to the factory that reads it, so clarif_eye.ui.build_resources
+# (the sole caller) never has to repeat the literal.
+CHECKPOINT_DB_ENV_VAR = "CLARIFEYE_CHECKPOINT_DB"
+
+
+def make_checkpointer():
+    """Build the ONE checkpointer a process's graph and thread registry both
+    share (issue #109 / P10.1), selected by the CHECKPOINT_DB_ENV_VAR
+    environment variable.
+
+    UNSET (today's default, byte-identical): a fresh
+    langgraph.checkpoint.memory.InMemorySaver - exactly what
+    clarif_eye.ui.build_resources constructed directly before this issue.
+    See that function's own comment for its honest, in-process-only limits.
+
+    SET to a path: a langgraph.checkpoint.sqlite.SqliteSaver over that file,
+    built from a connection opened with check_same_thread=False. THAT FLAG
+    IS LOAD-BEARING, not a default left alone - Gradio serves requests from
+    worker threads, and sqlite3's own default (check_same_thread=True) raises
+    the moment a connection opened on one thread is used from another, which
+    is exactly what every request after the first would do against one
+    module-level connection. See README.md's Deployment section for why this
+    still is not durable on Render's free tier even though it survives a
+    same-process restart.
+
+    FAILS LOUDLY ON A BAD PATH, BY DESIGN: an unwritable directory or an
+    unopenable file makes sqlite3.connect raise EAGERLY, right here, at app
+    build time - not caught and not degraded to a silent InMemorySaver
+    fallback. See clarif_eye.ui.build_resources's own docstring for why: a
+    misconfigured checkpoint path should stop the app from booting, not
+    quietly hand back a checkpointer that isn't the durable one an operator
+    asked for.
+
+    WHAT SETTING THE PATH ACTUALLY PUTS ON DISK, stated here because this is
+    where the operator deciding whether to set it reads: a LangGraph
+    checkpoint stores the WHOLE state of the graph that wrote it (see
+    clarif_eye.deep_path's own "THE PRIVACY WIN, STATED PLAINLY" comment for
+    the fact itself), which for this app means image_data - a base64 JPEG of
+    the photographed label or bill - and ocr_output sitting unencrypted in
+    that sqlite file for as long as the file and its thread survive. That is
+    the exact class of data clarif_eye.preferences's cross-thread store
+    refuses to hold even in memory (see its own "PRIVACY, NON-NEGOTIABLE"
+    comment). Choosing the sqlite path over InMemorySaver is choosing at-rest
+    persistence over the session-scoped privacy the in-memory default gives
+    for free (everything gone the moment the process exits) - the operator
+    who sets CHECKPOINT_DB_ENV_VAR owns that file's filesystem protection and
+    its retention or deletion from that point on.
+
+    Read PER CALL, not cached: this runs once, at app build time (see
+    clarif_eye.ui.build_resources), so "per call" and "per process" are the
+    same thing here - there is no request-scoped re-evaluation to worry
+    about.
+    """
+    db_path = os.environ.get(CHECKPOINT_DB_ENV_VAR)
+    if not db_path:
+        return InMemorySaver()
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    return SqliteSaver(conn)
 
 
 def build_graph(checkpointer=None, store=None):

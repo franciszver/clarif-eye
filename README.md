@@ -35,6 +35,7 @@ this table cannot silently drift out of date with the code.
 | `Command(goto=...)` routing | A node that decides its own successor instead of handing off to a separate router function. The entry node reads the run's own input (a photo or a typed question) and routes itself. | `clarif_eye.graph.entry_node` |
 | Streaming with per-node narration | The compiled graph is driven with `stream_mode="updates"`, so each completed node's name is available as it finishes, not only the final result. That drives the app's spoken progress updates. | `clarif_eye.ui._narrate_stream` |
 | Checkpointing and threads | Conversation state persists across turns on a `thread_id`, so a follow-up question can be answered from what an earlier photo already read. | `clarif_eye.graph.build_graph`, `clarif_eye.ui.build_resources`, `clarif_eye.ui.ThreadRegistry` |
+| Pluggable checkpointer backends | The checkpointer is selected by an environment variable, not hardcoded: unset, the app compiles with `InMemorySaver`, exactly as above; `CLARIFEYE_CHECKPOINT_DB=<path>` set, it compiles with a `SqliteSaver` over that file instead, and a pause survives a brand-new process reopening the same file. See [Deployment](#deployment) for why this is a demonstration of the persistence contract rather than a durability guarantee on the live site. | `clarif_eye.graph.make_checkpointer` |
 | Reducers | The conversation history key accumulates across runs instead of being overwritten by each new one, and is capped so a long-lived thread's checkpoint does not grow without bound. | `clarif_eye.state.ClarifEyeState`, `clarif_eye.state._keep_last_n_messages` |
 | `update_state` at the conversation boundary | A completed turn is written onto the thread once, from outside any node, rather than inside the node that happened to run last. | `clarif_eye.ui._record_turn` |
 | Human-in-the-loop interrupt and `Command(resume=...)` | When a number in a drafted script cannot be traced back to the photographed text, the run pauses and asks the user whether to hear it anyway or take a new photo, instead of guessing. | `clarif_eye.graph.verify_numbers_node` |
@@ -141,6 +142,34 @@ URL:
 The host supplies `OPENROUTER_API_KEY` as an environment variable in its
 own dashboard. `.env` is never deployed; it exists only for running the
 app locally.
+
+- **`CLARIFEYE_CHECKPOINT_DB` is not set on the live deployment, and the
+  default stays `InMemorySaver`.** The variable exists so this app can
+  demonstrate LangGraph's pluggable persistence contract (see the
+  capability table above) - setting it swaps in a `SqliteSaver` over a
+  file, and a pause on that file survives a brand-new process reopening
+  it. But Render's free tier gives the container an EPHEMERAL filesystem:
+  the sqlite file does not survive a redeploy or a restart there, so
+  setting the variable on this specific host would not add real
+  durability, only a database file that vanishes at the next cold start.
+  Real durability from `SqliteSaver` accrues to anyone running this app on
+  a persistent disk - a paid Render disk, a VM, a container with a mounted
+  volume - which is not what the free tier gives it today.
+- **What that file would hold, at rest, if it did persist.** Every
+  LangGraph checkpoint stores the WHOLE state of the graph that wrote it -
+  for this app, that means `image_data` (a base64 JPEG of the photographed
+  label or bill) and `ocr_output` (the text a model read off it), sitting
+  unencrypted in a plain sqlite file on disk, for as long as that file and
+  its thread survive. That is precisely the data this app's cross-thread
+  preference store refuses to hold even in memory (see
+  `clarif_eye.preferences`'s own "PRIVACY, NON-NEGOTIABLE" comment) -
+  photographs of medication labels and bills, from users who did not
+  expect them to outlive one sitting. Enabling `CLARIFEYE_CHECKPOINT_DB`
+  is an explicit trade: the operator who sets it is choosing at-rest
+  persistence over the session-scoped privacy `InMemorySaver` gives by
+  default (everything gone the moment the process exits), and takes on
+  responsibility for that file's filesystem protection and its retention
+  or deletion. That is why the deployment default stays `InMemorySaver`.
 
 ## License
 
