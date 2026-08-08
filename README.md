@@ -155,6 +155,21 @@ app locally.
   Real durability from `SqliteSaver` accrues to anyone running this app on
   a persistent disk - a paid Render disk, a VM, a container with a mounted
   volume - which is not what the free tier gives it today.
+- **What that file would hold, at rest, if it did persist.** Every
+  LangGraph checkpoint stores the WHOLE state of the graph that wrote it -
+  for this app, that means `image_data` (a base64 JPEG of the photographed
+  label or bill) and `ocr_output` (the text a model read off it), sitting
+  unencrypted in a plain sqlite file on disk, for as long as that file and
+  its thread survive. That is precisely the data this app's cross-thread
+  preference store refuses to hold even in memory (see
+  `clarif_eye.preferences`'s own "PRIVACY, NON-NEGOTIABLE" comment) -
+  photographs of medication labels and bills, from users who did not
+  expect them to outlive one sitting. Enabling `CLARIFEYE_CHECKPOINT_DB`
+  is an explicit trade: the operator who sets it is choosing at-rest
+  persistence over the session-scoped privacy `InMemorySaver` gives by
+  default (everything gone the moment the process exits), and takes on
+  responsibility for that file's filesystem protection and its retention
+  or deletion. That is why the deployment default stays `InMemorySaver`.
 
 ## License
 

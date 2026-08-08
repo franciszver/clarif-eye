@@ -989,6 +989,21 @@ def make_checkpointer():
     still is not durable on Render's free tier even though it survives a
     same-process restart.
 
+    WHAT SETTING THE PATH ACTUALLY PUTS ON DISK, stated here because this is
+    where the operator deciding whether to set it reads: a LangGraph
+    checkpoint stores the WHOLE state of the graph that wrote it (see
+    clarif_eye.deep_path's own "THE PRIVACY WIN, STATED PLAINLY" comment for
+    the fact itself), which for this app means image_data - a base64 JPEG of
+    the photographed label or bill - and ocr_output sitting unencrypted in
+    that sqlite file for as long as the file and its thread survive. That is
+    the exact class of data clarif_eye.preferences's cross-thread store
+    refuses to hold even in memory (see its own "PRIVACY, NON-NEGOTIABLE"
+    comment). Choosing the sqlite path over InMemorySaver is choosing at-rest
+    persistence over the session-scoped privacy the in-memory default gives
+    for free (everything gone the moment the process exits) - the operator
+    who sets CHECKPOINT_DB_ENV_VAR owns that file's filesystem protection and
+    its retention or deletion from that point on.
+
     Read PER CALL, not cached: this runs once, at app build time (see
     clarif_eye.ui.build_resources), so "per call" and "per process" are the
     same thing here - there is no request-scoped re-evaluation to worry
