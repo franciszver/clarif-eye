@@ -404,6 +404,21 @@ def analysis_node(state, config=None, client=None, store=None):
 # repeating the magic string (next_node_after already returns None for it).
 INTERRUPT_CHUNK_KEY = "__interrupt__"
 
+# WHICH FLOW ASKED, as a value in the interrupt payload's `reason` field.
+# CONSTANTS, not inline literals, because this is a cross-module contract
+# now (issue #92 / P9.11 deep-review MAJOR): the asking nodes below stamp
+# one of these on every payload, and clarif_eye.ui branches its spoken
+# wording on it - the question it reads out, and the refusal a user gets for
+# typing while that question is pending. A typo in one of two string
+# literals would silently give a follow-up pause the photo path's wording
+# back, which is exactly the defect this pair exists to fix.
+#
+# STRUCTURAL, NOT PROSE (D15): the payload carries fields, and this module
+# is the only thing that decides how any of them SOUND. Nothing downstream
+# parses a noun back out of a sentence to work out which flow it is in.
+INTERRUPT_REASON_NUMBERS = "unverified_numbers"
+INTERRUPT_REASON_ANSWER = "unverified_answer"
+
 # The two answers this app sends back via Command(resume=...). Constants,
 # not inline literals, for the same reason vision.py's DEGRADED_* messages
 # are: the UI's buttons and the node's branch must agree, and a typo in one
@@ -545,18 +560,19 @@ def followup_destination(state):
     return VERIFY_ANSWER_NODE if numbers_need_asking(state) else TTS_NODE
 
 
-def _ask_about_held_numbers(state, reason, retake_confirmation):
+def _ask_about_held_numbers(state, reason, caveat, retake_confirmation):
     """Ask the user before speaking a number that could not be checked
     (issue #83 / P9.4) - or pass straight through when there is nothing to
     ask about.
 
     THE WHOLE BODY OF BOTH ASKING NODES, in one place (issue #92 / P9.11).
     verify_numbers_node (the deep path's) and verify_answer_node (the
-    follow-up path's) differ by exactly two values - the `reason` they stamp
-    on the interrupt payload, and the sentence they speak when the user
-    declines - and by nothing else at all. Two copies of an interrupt-raising
-    node would be two places for the payload shape to drift, and the payload
-    shape is what clarif_eye.ui's entire pause flow is built on.
+    follow-up path's) differ by exactly three values - the `reason` they
+    stamp on the interrupt payload, and the two sentences they speak, one
+    per answer - and by nothing else at all. Two copies of an
+    interrupt-raising node would be two places for the payload shape to
+    drift, and the payload shape is what clarif_eye.ui's entire pause flow is
+    built on.
 
     WHY TWO REGISTERED NODES RATHER THAN ONE SHARED REGISTRATION: the two
     graphs' node names must stay DISJOINT. clarif_eye.graph's
@@ -577,11 +593,13 @@ def _ask_about_held_numbers(state, reason, retake_confirmation):
     so the guard below is the second line of defence, not the gate: it keeps
     a direct call - a unit test, a future caller - from raising on a state
     that holds nothing, which this pipeline must never do.
-    - RESUME_CONTINUE: the held draft IS spoken, with UNVERIFIED_NUMBER_CAVEAT
-      in front of it. The user asked to hear it; hiding it now would be a
-      second, quieter refusal. THE SAME CAVEAT on both paths, on purpose:
-      what it warns about ("a number in this could not be checked against the
-      photo") is identical whichever draft is being spoken.
+    - RESUME_CONTINUE: the held draft IS spoken, with `caveat` in front of
+      it. The user asked to hear it; hiding it now would be a second,
+      quieter refusal. PREPENDED, never appended - the warning has to arrive
+      before the number it is about. The two caveats differ by one noun
+      (description / answer), because this product is audio-only at the
+      moment it speaks and calling a follow-up's answer "this description"
+      names something the user never asked for.
     - ANYTHING ELSE (including RESUME_RETAKE): `retake_confirmation` is
       spoken and the draft is discarded. Defaulting the unrecognised case to
       "do not speak it" is deliberate - only an answer this app actually
@@ -618,10 +636,11 @@ def _ask_about_held_numbers(state, reason, retake_confirmation):
     # clarif_eye.ui._interrupt_question, the resume buttons, the refusals and
     # the staging all work identically whichever node raised it. `reason` is
     # the ONE field that says which flow asked; it is a value, not an extra
-    # key, so the shape does not widen. Nothing in the UI branches on it
-    # today (the spoken question is built from `script` and `numbers`); it is
-    # carried because a structural signal beats re-deriving the flow later
-    # from the wording of a sentence.
+    # key, so the shape does not widen. clarif_eye.ui READS IT (issue #92 /
+    # P9.11 deep-review MAJOR) to choose the noun in the question it speaks
+    # and in the refusal a user gets for typing while that question is
+    # pending - structurally, so nothing anywhere has to work out which flow
+    # it is in by matching the wording of a sentence.
     answer = interrupt(
         {
             "reason": reason,
@@ -638,7 +657,7 @@ def _ask_about_held_numbers(state, reason, retake_confirmation):
         # _degraded), which is exactly the point of writing the flag on
         # every path: the last node to speak owns it.
         return {
-            "final_output": f"{UNVERIFIED_NUMBER_CAVEAT} {hold.get('script', '')}".strip(),
+            "final_output": f"{caveat} {hold.get('script', '')}".strip(),
             "verification_hold": None,
             "output_degraded": False,
         }
@@ -660,7 +679,9 @@ def verify_numbers_node(state):
     clarif_eye.deep_path.build_deep_path_graph, which wires it). Asks about a
     number in a drafted DESCRIPTION; declining means the photo itself is the
     thing to retake. All behaviour is in _ask_about_held_numbers above."""
-    return _ask_about_held_numbers(state, "unverified_numbers", RETAKE_CONFIRMATION)
+    return _ask_about_held_numbers(
+        state, INTERRUPT_REASON_NUMBERS, UNVERIFIED_NUMBER_CAVEAT, RETAKE_CONFIRMATION
+    )
 
 
 def verify_answer_node(state):
@@ -669,7 +690,9 @@ def verify_answer_node(state):
     drafted ANSWER; declining leaves the photo where it is, so it speaks
     ANSWER_RETAKE_CONFIRMATION instead. All behaviour is in
     _ask_about_held_numbers above."""
-    return _ask_about_held_numbers(state, "unverified_answer", ANSWER_RETAKE_CONFIRMATION)
+    return _ask_about_held_numbers(
+        state, INTERRUPT_REASON_ANSWER, UNVERIFIED_ANSWER_CAVEAT, ANSWER_RETAKE_CONFIRMATION
+    )
 
 
 # The name the deep path's child graph is mounted under in the parent. A

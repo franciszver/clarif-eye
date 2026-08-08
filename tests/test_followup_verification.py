@@ -695,7 +695,7 @@ def test_the_ask_handler_reveals_the_answer_buttons_but_never_hides_them():
 
         refused = list(ask_handler("what colour is it?", "ui-wiring", "ui-wiring-session"))
         _status, _audio, text, continue_update, retake_update = refused[-1]
-        assert text == QUESTION_PENDING_MESSAGE, "setup: the refusal branch"
+        assert text == ANSWER_QUESTION_PENDING_MESSAGE, "setup: the refusal branch"
         # An empty update carries no `visible` key at all, which is what
         # "leave them exactly as they are" looks like on the wire.
         assert "visible" not in dict(continue_update)

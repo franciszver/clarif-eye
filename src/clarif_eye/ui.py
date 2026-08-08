@@ -64,6 +64,7 @@ from clarif_eye.graph import (
     DEEP_PATH_NODE,
     DEFAULT_PIPELINE_BUDGET_SECONDS,
     INTERRUPT_CHUNK_KEY,
+    INTERRUPT_REASON_ANSWER,
     RESUME_CONTINUE,
     RESUME_RETAKE,
     TTS_NODE,
@@ -276,9 +277,12 @@ UPLOADED_PHOTO_ALT = "The photo you submitted"
 #     its own successor rather than having an edge evaluated for it (issue
 #     #82 / P9.3 - see graph.py's "TWO ROUTING MECHANISMS" block for why
 #     both mechanisms are in this graph deliberately).
-#   - state.py: ClarifEyeState is a 9-key TypedDict (issue #81 / P9.2 added
-#     `messages`, the app's first LangGraph reducer; issue #82 / P9.3 added
-#     `question`).
+#   - state.py: ClarifEyeState is an 11-key TypedDict (issue #81 / P9.2 added
+#     `messages`, the app's first LangGraph reducer; #82 / P9.3 added
+#     `question`; #83 / P9.4 added `verification_hold`; #93 / P9.12 added
+#     `output_degraded`). Counted off the TypedDict itself, not carried
+#     forward from the last time this comment was edited - it had drifted
+#     twice.
 #   - registry.py / config/models.toml: the "eyes" and "brain" roles each
 #     hold an ORDERED ladder of free-only (":free", policy D10) model IDs,
 #     tried in turn on failure.
@@ -376,10 +380,10 @@ code actually does with your photo.
 
 This pipeline is built with [LangGraph](https://github.com/langchain-ai/langgraph)'s
 `StateGraph` (this app depends on `langgraph`, not `langchain` - there is no
-LangChain in this codebase). The graph state is a 10-key `TypedDict`:
+LangChain in this codebase). The graph state is an 11-key `TypedDict`:
 `image_data`, `ocr_output`, `scene_context`, `complexity_flag`,
 `scraper_data`, `final_output`, `audio_file_path`, `messages`, `question`,
-`verification_hold`.
+`verification_hold`, `output_degraded`.
 
 Seven nodes are registered: `entry`, `vision`, `fast_synth`, `deep_path`,
 `followup`, `verify_answer`, and `tts`. Every run starts at
@@ -775,35 +779,100 @@ INTERRUPT_QUESTION_TEMPLATE = (
     'Activate "{continue_label}" to hear the description anyway, or '
     '"{retake_label}" to take a new photo instead.'
 )
+# The SAME question about a follow-up ANSWER (issue #92 / P9.11 deep-review
+# MAJOR). Two differences from the template above, both of them defects
+# being fixed rather than polish:
+#   - what was written is "the answer", not "the description". The user
+#     typed a question a moment ago and is being read the reply to it.
+#   - the second choice says WHAT IT ACTUALLY DOES. The photo wording sent
+#     the user off to "take a new photo instead" - and then the retake
+#     button spoke ANSWER_RETAKE_CONFIRMATION, which tells them the photo
+#     they already sent is still there. A spoken flow that contradicts the
+#     instruction it just gave is worse than a clumsy one, because there is
+#     no screen to glance at and check.
+# The button LABEL is still quoted verbatim, so "activate I'll retake the
+# photo" points at something findable in the tab order - only the
+# description of its effect is honest to this path.
+INTERRUPT_ANSWER_QUESTION_TEMPLATE = (
+    "Here is the answer that was written: {script} "
+    "One number in it could not be checked against the photo: {numbers}. "
+    'Activate "{continue_label}" to hear the answer anyway, or '
+    '"{retake_label}" to leave it unread and ask again.'
+)
 # Used when the payload is not the shape this module expects. Should be
-# unreachable - the only thing that raises this interrupt is
-# verify_numbers_node, right next door - but this module's contract is
-# "never raise into Gradio", and a KeyError while building a sentence would
-# cost the user the whole run rather than one detail of it.
+# unreachable - the only things that raise this interrupt are
+# verify_numbers_node and verify_answer_node, right next door - but this
+# module's contract is "never raise into Gradio", and a KeyError while
+# building a sentence would cost the user the whole run rather than one
+# detail of it. One per path, for the same reason the templates are: a
+# fallback that named the wrong thing would be a quieter version of the very
+# defect above.
 INTERRUPT_QUESTION_FALLBACK = (
     "A number in the description could not be checked against the photo. "
     f'Activate "{RESUME_CONTINUE_LABEL}" to hear the description anyway, or '
     f'"{RESUME_RETAKE_LABEL}" to take a new photo instead.'
 )
+INTERRUPT_ANSWER_QUESTION_FALLBACK = (
+    "A number in the answer could not be checked against the photo. "
+    f'Activate "{RESUME_CONTINUE_LABEL}" to hear the answer anyway, or '
+    f'"{RESUME_RETAKE_LABEL}" to leave it unread and ask again.'
+)
+
+
+def _asked_about_an_answer(payload):
+    """True when the pending question is about a follow-up ANSWER rather
+    than a drafted description.
+
+    STRUCTURAL (D15): reads the `reason` field the asking node stamped on
+    its own payload (clarif_eye.graph.INTERRUPT_REASON_ANSWER), never the
+    wording of anything. Defaults to False - the photo path - for a payload
+    of any shape this module does not recognise, which is the older and
+    more common flow and therefore the safer thing to be wrong about.
+    """
+    try:
+        return payload.get("reason") == INTERRUPT_REASON_ANSWER
+    except Exception:
+        return False
 
 
 def _interrupt_question(payload):
-    """Turn verify_numbers_node's structural interrupt payload into the
-    sentence a screen reader reads out. Never raises - see
-    INTERRUPT_QUESTION_FALLBACK."""
+    """Turn an asking node's structural interrupt payload into the sentence
+    a screen reader reads out. Never raises - see the two fallbacks above."""
+    about_answer = _asked_about_an_answer(payload)
+    fallback = (
+        INTERRUPT_ANSWER_QUESTION_FALLBACK if about_answer else INTERRUPT_QUESTION_FALLBACK
+    )
     try:
         script = (payload["script"] or "").strip()
         numbers = ", ".join(str(number) for number in payload["numbers"])
         if not script or not numbers:
-            return INTERRUPT_QUESTION_FALLBACK
-        return INTERRUPT_QUESTION_TEMPLATE.format(
+            return fallback
+        template = (
+            INTERRUPT_ANSWER_QUESTION_TEMPLATE if about_answer else INTERRUPT_QUESTION_TEMPLATE
+        )
+        return template.format(
             script=script,
             numbers=numbers,
             continue_label=RESUME_CONTINUE_LABEL,
             retake_label=RESUME_RETAKE_LABEL,
         )
     except Exception:
-        return INTERRUPT_QUESTION_FALLBACK
+        return fallback
+
+
+def _question_pending_message(payload):
+    """The refusal spoken when the user types while a safety question is
+    still waiting - worded for the question that is ACTUALLY pending.
+
+    Same structural signal as _interrupt_question above, read off the same
+    payload, so the refusal can never describe a different pending question
+    than the one the user was actually asked.
+    """
+    return (
+        ANSWER_QUESTION_PENDING_MESSAGE
+        if _asked_about_an_answer(payload)
+        else QUESTION_PENDING_MESSAGE
+    )
 
 # Gradio has no native aria-live prop (as of 6.22.0), so a minimal,
 # commented JS shim marks the status control's wrapper as a polite live
@@ -2507,11 +2576,26 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
     graph is touched, so the refusal costs no model call and writes no
     state - the pause is left exactly as it was and can still be answered.
 
-    THE HOLD IS NOT CLEARED HERE, and does not need to be: `followup` never
-    routes through `verify_numbers` (the edge is out of `analysis` only), so
-    a stale verification_hold could not divert an answer even if one
-    existed - and after this guard, a follow-up cannot run on a thread that
-    has one at all.
+    THE HOLD IS NOT CLEARED HERE, and does not need to be - but the reason
+    CHANGED COMPLETELY in issue #92 / P9.11 and this paragraph used to state
+    the old one as if it still held. It said `followup` never routes through
+    an asking node and that a stale verification_hold therefore could not
+    divert an answer. Both clauses are now false: there IS a conditional edge
+    out of `followup` (clarif_eye.graph.followup_destination), and a stale
+    hold on the thread is exactly what would divert a perfectly good answer
+    into a question about a number nobody just heard.
+
+    THE REAL INVARIANT, and the only thing keeping that safe:
+    clarif_eye.followup.run_followup writes `verification_hold` on EVERY
+    return path - None on all of them except the one that genuinely holds
+    something, which it writes fresh. So whatever the thread was carrying
+    before this run is REPLACED by this run's own verdict before the edge is
+    ever evaluated (it is a plain, non-reducer state key - see
+    clarif_eye.state.ClarifEyeState.verification_hold). Nothing here has to
+    clear anything, because the answering node cannot leave last time's
+    verdict standing. The pending-question guard above is a separate
+    protection for a separate problem: it stops a follow-up running at all
+    while a question is unanswered.
 
     A PREFERENCE-SETTING COMMAND (issue #86 / P9.7) IS CHECKED AFTER THE
     BLANK/NON-STRING GUARDS AND AFTER THE PENDING-INTERRUPT CHECK BELOW -
@@ -2593,8 +2677,17 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
         # a preference-setting command typed while a run is paused must get
         # the SAME refusal an ordinary follow-up gets, not be silently
         # accepted while the safety question goes unanswered and unheard.
-        if _has_pending_interrupt(graph, config):
-            yield "outcome", _degraded_outcome(QUESTION_PENDING_MESSAGE)
+        # The refusal is WORDED FOR WHATEVER IS ACTUALLY PENDING (issue #92 /
+        # P9.11 deep-review MAJOR): the same read that detects the pause
+        # yields the payload, and _question_pending_message picks the noun
+        # from its `reason` field. Telling a user that a DESCRIPTION is
+        # waiting when the question they were asked was about the answer to
+        # their own last question - and offering "take a new photo" as the
+        # way past it - would be a third piece of photo wording on a path
+        # where the photo was never the problem.
+        pending = _pending_interrupt_payload(_thread_snapshot(graph, config))
+        if pending is not None:
+            yield "outcome", _degraded_outcome(_question_pending_message(pending))
             return
 
         verbosity_command = detect_preference_command(question)
@@ -2913,9 +3006,23 @@ def _run_resume_events(answer, resources, pipeline_budget_seconds, thread_id=Non
         # No thread_id survived thread_configurable's pairing guard (no
         # checkpointer, no registry, or no thread at all) - then nothing
         # can be paused, because a pause only exists in a checkpoint.
-        if "thread_id" not in configurable or not _has_pending_interrupt(graph, config):
+        #
+        # READ ONCE, USED TWICE (issue #92 / P9.11): the same snapshot that
+        # proves something is pending also carries WHICH FLOW asked (the
+        # payload's `reason`) and, for a follow-up, the question that was
+        # typed before the pause. Both are needed below to record the turn
+        # honestly, and both must be read BEFORE the resume - the hold is
+        # cleared by the asking node as it completes.
+        snapshot = _thread_snapshot(graph, config)
+        pending = _pending_interrupt_payload(snapshot)
+        if "thread_id" not in configurable or pending is None:
             yield "outcome", _degraded_outcome(NOTHING_TO_RESUME_MESSAGE)
             return
+        # `question` survives the pause untouched - it is a plain,
+        # non-reducer state key and the paused run never overwrote it (see
+        # clarif_eye.state.ClarifEyeState.question). None on a photo pause,
+        # which make_initial_state seeds explicitly.
+        paused_question = (getattr(snapshot, "values", None) or {}).get("question")
         result = {}
         yield from _narrate_stream(graph, Command(resume=answer), config, result)
     except LadderExhaustedError as exc:
@@ -2932,16 +3039,38 @@ def _run_resume_events(answer, resources, pipeline_budget_seconds, thread_id=Non
     audio_path = result.get("audio_file_path") or ""
 
     if answer == RESUME_CONTINUE and final_output:
-        # The caveated script IS this photo's answer, so
-        # clarif_eye.graph.verify_numbers_node writes output_degraded=False
-        # on the continue branch and this records (issue #93 / P9.12). The
-        # flag is passed through rather than hard-coded False so that if a
-        # future resume path can degrade, it degrades here too.
+        # The caveated script IS this photo's answer, so the asking node
+        # writes output_degraded=False on the continue branch and this
+        # records (issue #93 / P9.12). The flag is passed through rather than
+        # hard-coded False so that if a future resume path can degrade, it
+        # degrades here too.
+        #
+        # BOTH SIDES OF A RESUMED FOLLOW-UP (issue #92 / P9.11 deep-review
+        # MEDIUM), and this fixes a real orphan rather than tidying one up.
+        # A photo run records the assistant's side alone - the user's side of
+        # that turn is a photograph, not text. A follow-up's user side IS
+        # text, and _run_followup_events already records the pair for the
+        # unpaused case precisely because an answer with no question above it
+        # is misread: stored alone under the photo's description, "The jar
+        # holds 500 grams." reads back as a SECOND description of the photo,
+        # which is the same failure class #93 exists to prevent. Recording
+        # both keeps the paused path's history identical in shape to the
+        # unpaused path's.
+        #
+        # WHICH FLOW IS DECIDED STRUCTURALLY, from the pending payload's own
+        # `reason` - not from "is there a question in state?", which would
+        # also be true on a PHOTO pause taken on a thread that answered a
+        # question earlier in the session and would attach that stale
+        # question to a description. The question text still has to be
+        # non-empty for there to be anything to record.
+        messages = [{"role": "assistant", "content": final_output}]
+        if _asked_about_an_answer(pending) and (paused_question or "").strip():
+            messages.insert(0, {"role": "user", "content": paused_question})
         _record_turn(
             graph,
             config,
             thread_id,
-            [{"role": "assistant", "content": final_output}],
+            messages,
             bool(result.get("output_degraded")),
         )
     else:
@@ -2955,13 +3084,47 @@ def _run_resume_events(answer, resources, pipeline_budget_seconds, thread_id=Non
     yield "outcome", _outcome_for(final_output, audio_path)
 
 
+def _thread_snapshot(graph, config):
+    """graph.get_state(config), or None if this graph/thread cannot report
+    one. Never raises.
+
+    Split out (issue #92 / P9.11) because two callers now need MORE than
+    "is something paused": _run_followup_events needs the pending payload to
+    word its refusal, and _run_resume_events needs both that payload and the
+    thread's stored `question` to record the resumed turn as a pair. One
+    read, several answers, and no second source of truth alongside the
+    checkpointer.
+    """
+    try:
+        return graph.get_state(config)
+    except Exception:
+        return None
+
+
+def _pending_interrupt_payload(snapshot):
+    """The pending question's structural payload dict, or None when nothing
+    is paused.
+
+    STRUCTURAL (D15): reads the `interrupts` tuple LangGraph itself
+    populates from the pending task's interrupt writes - never a flag this
+    module maintains alongside it, which would be a second source of truth
+    able to disagree with the checkpointer.
+
+    Returns {} rather than None for a pending interrupt whose value is not a
+    dict, so callers can tell "nothing is paused" (None) apart from "paused,
+    but the payload is not a shape this module knows" ({}) - the latter
+    still has to be refused and still has to be resumable, it just gets the
+    default wording.
+    """
+    interrupts = getattr(snapshot, "interrupts", None) or ()
+    if not interrupts:
+        return None
+    value = interrupts[0].value
+    return value if isinstance(value, dict) else {}
+
+
 def _has_pending_interrupt(graph, config):
     """True if `config`'s thread is paused waiting on an answer.
-
-    STRUCTURAL (D15): reads graph.get_state(...).interrupts, the tuple
-    LangGraph itself populates from the pending task's interrupt writes -
-    never a flag this module maintains alongside it, which would be a
-    second source of truth able to disagree with the checkpointer.
 
     Never raises: a graph with no checkpointer, a test double with no
     get_state, or any other shape this module has not anticipated is
@@ -2969,10 +3132,7 @@ def _has_pending_interrupt(graph, config):
     be resumed exists) and the safe answer - the caller then speaks
     NOTHING_TO_RESUME_MESSAGE instead of losing the click to a traceback.
     """
-    try:
-        return bool(graph.get_state(config).interrupts)
-    except Exception:
-        return False
+    return _pending_interrupt_payload(_thread_snapshot(graph, config)) is not None
 
 
 def handle_resume_staged(
