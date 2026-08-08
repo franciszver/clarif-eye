@@ -219,9 +219,12 @@ UPLOADED_PHOTO_ALT = "The photo you submitted"
 
 # --- "How this works" section (issue #49 / P4.3) ---------------------------
 #
-# Owner request: a section near the bottom explaining the pipeline, the data
-# flow, and the LangGraph implementation, since this is a demo application.
-# Content below is checked against the source it describes, not against the
+# Owner request: a section explaining the pipeline, the data flow, and the
+# LangGraph implementation, since this is a demo application. UPDATED for
+# issue #87 / P9.8: this content now lives on its own explanation tab
+# (EXPLANATION_TAB_LABEL) rather than at the bottom of a single long page -
+# see build_interface() below. Content below is checked against the source
+# it describes, not against the
 # issue's own wording or the (older, no longer accurate) architecture doc:
 #   - graph.py: build_graph() registers exactly 6 nodes (entry, vision,
 #     fast_synth, deep_path, followup, tts). `deep_path` is a whole COMPILED
@@ -271,10 +274,14 @@ UPLOADED_PHOTO_ALT = "The photo you submitted"
 # - no img/svg markup is ever added here). Always visible, no collapsible
 # toggle: simpler, and it avoids needing to get aria-expanded/keyboard-toggle
 # wiring right for a chunk of content that costs a screen-reader/keyboard
-# user nothing extra to skip past by navigating to the next heading. Placed
-# after the result textbox in build_interface() below, so it never delays
-# someone using the tool and never sits between the live region and the
-# result it announces.
+# user nothing extra to skip past by navigating to the next heading. UPDATED
+# for issue #87 / P9.8: this content lives on its own explanation tab now,
+# not stacked after the result textbox on the same page - a stronger version
+# of the same goal the old placement served. It cannot merely be scrolled
+# past while using the tool, it is on a DIFFERENT TAB entirely, so it can
+# never delay someone submitting a photo and can never sit between the live
+# region and the result it announces, since the product tab's layout is
+# unaffected by anything here.
 #
 # THE DIAGRAM (issue #56 / P4.4): the owner later asked for a graphic. P4.3
 # deliberately shipped text-only because #48 had JUST been fixed and an
