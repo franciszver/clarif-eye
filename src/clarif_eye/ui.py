@@ -1753,24 +1753,47 @@ def _encode_image(image):
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def _degraded_outcome(text):
+    """The "outcome" payload for a guard/early-failure exit that never
+    attempted TTS (no image, no client, an exception escaping the graph,
+    ...) - always STATUS_DEGRADED, never is_chain_exhausted()-derived (see
+    _outcome_for's ISSUE #88 / P9.9 note for why). One helper instead of
+    the same (None, text, STATUS_DEGRADED) literal repeated at every such
+    call site, so the invariant lives in one place.
+    """
+    return (None, text, STATUS_DEGRADED)
+
+
 def _outcome_for(final_output, audio_path):
     """Map a completed run's (final_output, audio_path) to the
-    (audio_path_or_None, text) tuple this module returns.
+    (audio_path_or_None, text, status) tuple every "outcome" event carries.
 
     THE THREE OUTCOMES, told apart STRUCTURALLY - see this module's
-    top-level docstring. Shared by _run_pipeline_events and
-    _run_followup_events (issue #82 / P9.3) so a spoken ANSWER degrades
-    through exactly the same three branches a spoken DESCRIPTION does; two
-    copies would be two places for the audio-unavailable wording and the
-    is_chain_exhausted() ordering to drift apart.
+    top-level docstring. Shared by _run_pipeline_events, _run_followup_events
+    and _run_resume_events (issue #82 / P9.3, issue #83 / P9.4) so a spoken
+    ANSWER degrades through exactly the same three branches a spoken
+    DESCRIPTION does; two copies would be two places for the
+    audio-unavailable wording and the is_chain_exhausted() ordering to drift
+    apart.
+
+    ISSUE #88 / P9.9: `status` is computed HERE, at the one point where
+    is_chain_exhausted() is guaranteed to describe THIS run - immediately
+    after the TTS attempt that produced `audio_path` - and carried out in
+    the outcome tuple from then on. Callers (_stage_events) use this status
+    as-is and never call is_chain_exhausted() themselves, which is what
+    used to let a later, unrelated run's stale module-global TTS state leak
+    into an early-failure outcome that never attempted TTS at all (that
+    None/2-tuple case never reaches this function - see the "outcome"
+    literals in _run_pipeline_events/_run_followup_events/_run_resume_events,
+    which carry STATUS_DEGRADED directly instead).
     """
     if audio_path:
-        return (audio_path, final_output)
-    if is_chain_exhausted():
-        if final_output:
-            return (None, f"{final_output} {AUDIO_UNAVAILABLE_NOTE}")
-        return (None, AUDIO_UNAVAILABLE_NOTE)
-    return (None, final_output or UNEXPECTED_ERROR_MESSAGE)
+        return (audio_path, final_output, status_for_result(audio_path, False))
+    chain_exhausted = is_chain_exhausted()
+    if chain_exhausted:
+        text = f"{final_output} {AUDIO_UNAVAILABLE_NOTE}" if final_output else AUDIO_UNAVAILABLE_NOTE
+        return (None, text, status_for_result(None, True))
+    return (None, final_output or UNEXPECTED_ERROR_MESSAGE, status_for_result(None, False))
 
 
 def _update_thread_state(graph, config, thread_id, update, as_node=None):
@@ -2024,17 +2047,17 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
     exercise the race itself.
     """
     if image is None:
-        yield "outcome", (None, NO_IMAGE_MESSAGE)
+        yield "outcome", _degraded_outcome(NO_IMAGE_MESSAGE)
         return
 
     if resources.client is None:
-        yield "outcome", (None, resources.client_error or CONFIG_ERROR_MESSAGE)
+        yield "outcome", _degraded_outcome(resources.client_error or CONFIG_ERROR_MESSAGE)
         return
 
     try:
         image_data = _encode_image(image)
     except Exception:
-        yield "outcome", (None, UNREADABLE_IMAGE_MESSAGE)
+        yield "outcome", _degraded_outcome(UNREADABLE_IMAGE_MESSAGE)
         return
 
     # Issue #75: key on a hash of the DECODED image content (never the
@@ -2144,7 +2167,7 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
                         update,
                         as_node=TTS_NODE,
                     )
-            yield "outcome", (cached_audio_path or None, cached_text)
+            yield "outcome", (cached_audio_path or None, cached_text, STATUS_SUCCESS_AUDIO)
             return
         resources.image_cache.discard(cache_key)
 
@@ -2185,13 +2208,13 @@ def _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=No
         # collapsing into the generic UNEXPECTED_ERROR_MESSAGE below. Not
         # cached (issue #75): a quota/API failure must never be replayed
         # to the next visitor as if it were that photo's own answer.
-        yield "outcome", (None, message_for_ladder_exhausted(exc))
+        yield "outcome", _degraded_outcome(message_for_ladder_exhausted(exc))
         return
     except OpenRouterError as exc:
-        yield "outcome", (None, message_for_terminal_error(exc))
+        yield "outcome", _degraded_outcome(message_for_terminal_error(exc))
         return
     except Exception:
-        yield "outcome", (None, UNEXPECTED_ERROR_MESSAGE)
+        yield "outcome", _degraded_outcome(UNEXPECTED_ERROR_MESSAGE)
         return
 
     final_output = (result.get("final_output") or "").strip()
@@ -2252,16 +2275,17 @@ def _handle_preference_command(verbosity, resources, session_id):
     graph run, NO model call (issue #86 / P9.7's own rule).
 
     THE STAGED CONTRACT, EVEN THOUGH THE GRAPH NEVER RUNS: this yields
-    exactly the same ("outcome", (audio_path_or_None, text)) shape every
-    other branch of _run_followup_events/_run_pipeline_events yields, so
+    exactly the same ("outcome", (audio_path_or_None, text, status)) shape
+    every other branch of _run_followup_events/_run_pipeline_events yields
+    (see _outcome_for's issue #88 / P9.9 note for `status`), so
     _stage_events (the caller two levels up) stages it identically to a
     real answer - the confirmation is genuinely SPOKEN (through run_tts,
     called directly here since there is no graph run to produce it), not
     merely written to the text box. clarif_eye.tts.run_tts already never
     raises (see its own docstring) and always returns {"audio_file_path":
     "" } on any failure, so this function inherits that same guarantee with
-    no try/except of its own needed. The (audio_path, text) MAPPING itself
-    is _outcome_for, the SAME helper _run_pipeline_events/_run_followup_events
+    no try/except of its own needed. The (audio_path, text, status) MAPPING
+    itself is _outcome_for, the SAME helper _run_pipeline_events/_run_followup_events
     use for every other outcome - reused rather than hand-rolled, so a
     confirmation spoken while the TTS provider chain happens to be
     exhausted gets the same AUDIO_UNAVAILABLE_NOTE fallback wording every
@@ -2383,7 +2407,7 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
     is waiting.
     """
     if resources.client is None:
-        yield "outcome", (None, resources.client_error or CONFIG_ERROR_MESSAGE)
+        yield "outcome", _degraded_outcome(resources.client_error or CONFIG_ERROR_MESSAGE)
         return
 
     # See NO_QUESTION_MESSAGE: a blank question must never reach the graph,
@@ -2403,11 +2427,11 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
     # was: the second layer, for a question that reaches the graph by some
     # other route.
     if not isinstance(question, str):
-        yield "outcome", (None, NO_QUESTION_MESSAGE)
+        yield "outcome", _degraded_outcome(NO_QUESTION_MESSAGE)
         return
     question = question.strip()
     if not question:
-        yield "outcome", (None, NO_QUESTION_MESSAGE)
+        yield "outcome", _degraded_outcome(NO_QUESTION_MESSAGE)
         return
 
     try:
@@ -2432,7 +2456,7 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
         # the SAME refusal an ordinary follow-up gets, not be silently
         # accepted while the safety question goes unanswered and unheard.
         if _has_pending_interrupt(graph, config):
-            yield "outcome", (None, QUESTION_PENDING_MESSAGE)
+            yield "outcome", _degraded_outcome(QUESTION_PENDING_MESSAGE)
             return
 
         verbosity_command = detect_preference_command(question)
@@ -2445,13 +2469,13 @@ def _run_followup_events(question, resources, pipeline_budget_seconds, thread_id
         result = dict(state)
         yield from _narrate_stream(graph, state, config, result)
     except LadderExhaustedError as exc:
-        yield "outcome", (None, message_for_ladder_exhausted(exc))
+        yield "outcome", _degraded_outcome(message_for_ladder_exhausted(exc))
         return
     except OpenRouterError as exc:
-        yield "outcome", (None, message_for_terminal_error(exc))
+        yield "outcome", _degraded_outcome(message_for_terminal_error(exc))
         return
     except Exception:
-        yield "outcome", (None, UNEXPECTED_ERROR_MESSAGE)
+        yield "outcome", _degraded_outcome(UNEXPECTED_ERROR_MESSAGE)
         return
 
     final_output = (result.get("final_output") or "").strip()
@@ -2533,12 +2557,16 @@ def handle_submit(image, resources, pipeline_budget_seconds=DEFAULT_PIPELINE_BUD
     handle_submit_staged can share it and turn its "status" events into
     live per-node progress yields; this just drains the generator and
     returns its final ("outcome", ...) item, ignoring any "status" events -
-    same return-tuple contract as before streaming existed.
+    same return-tuple contract as before streaming existed. An "outcome"
+    payload is (audio_path_or_None, text, status) as of issue #88 / P9.9
+    (see _stage_events); only the first two elements are this function's
+    own (audio, text) return contract, so `status` is dropped here rather
+    than widening what every existing caller of handle_submit unpacks.
     """
     outcome = (None, UNEXPECTED_ERROR_MESSAGE)
     for kind, payload in _run_pipeline_events(image, resources, pipeline_budget_seconds, thread_id=thread_id):
         if kind == "outcome":
-            outcome = payload
+            outcome = payload[:2]
         elif kind == "interrupt":
             # A paused run (issue #83 / P9.4) never produces an "outcome"
             # event, so without this branch this function would return the
@@ -2580,6 +2608,21 @@ def _stage_events(opening_status, events, pause_signal=None):
     into the (status_text, audio_path_or_None, description_text) tuples
     Gradio streams straight to the UI.
 
+    ISSUE #88 / P9.9: an "outcome" payload is now a 3-tuple, (audio_path,
+    text, status) - `status` is read from it verbatim, never recomputed
+    here via status_for_result(audio_path, is_chain_exhausted()). That
+    used to re-read tts.is_chain_exhausted()'s MODULE-GLOBAL state at the
+    end of every run, including a run that failed before TTS was ever
+    attempted (e.g. a LadderExhaustedError while reading the photo) - so
+    an early failure could announce a PREVIOUS request's "chain exhausted,
+    here is the text" status over its own failure message. Every "outcome"
+    site now carries the correct status for what actually happened in
+    THAT run: _outcome_for computes it at the one point
+    is_chain_exhausted() is guaranteed to describe THIS run's own TTS
+    attempt (see that function), and every early-failure/guard "outcome"
+    literal in _run_pipeline_events/_run_followup_events/_run_resume_events
+    carries STATUS_DEGRADED directly, since none of them ever reach TTS.
+
     ONE COPY, ON PURPOSE: handle_submit_staged and handle_ask_staged
     differed only in their opening announcement and which event generator
     they drained, but each carried its own copy of this ending. The
@@ -2614,7 +2657,7 @@ def _stage_events(opening_status, events, pause_signal=None):
     and so FOCUS_RESULT_JS lands the user on it).
     """
     yield opening_status, None, ""
-    audio_path, text = None, ""
+    audio_path, text, status = None, "", STATUS_DEGRADED
     question = None
     for kind, payload in events:
         if kind == "status":
@@ -2624,11 +2667,10 @@ def _stage_events(opening_status, events, pause_signal=None):
             if pause_signal is not None:
                 pause_signal.paused = True
         else:
-            audio_path, text = payload
+            audio_path, text, status = payload
     if question is not None:
         yield question, None, question
         return
-    status = status_for_result(audio_path, is_chain_exhausted())
     if not audio_path:
         yield status, audio_path, text
         return
@@ -2678,7 +2720,7 @@ def _run_resume_events(answer, resources, pipeline_budget_seconds, thread_id=Non
     An interrupted photo simply costs its quota again, and asks again.
     """
     if resources.client is None:
-        yield "outcome", (None, resources.client_error or CONFIG_ERROR_MESSAGE)
+        yield "outcome", _degraded_outcome(resources.client_error or CONFIG_ERROR_MESSAGE)
         return
 
     try:
@@ -2694,18 +2736,18 @@ def _run_resume_events(answer, resources, pipeline_budget_seconds, thread_id=Non
         # checkpointer, no registry, or no thread at all) - then nothing
         # can be paused, because a pause only exists in a checkpoint.
         if "thread_id" not in configurable or not _has_pending_interrupt(graph, config):
-            yield "outcome", (None, NOTHING_TO_RESUME_MESSAGE)
+            yield "outcome", _degraded_outcome(NOTHING_TO_RESUME_MESSAGE)
             return
         result = {}
         yield from _narrate_stream(graph, Command(resume=answer), config, result)
     except LadderExhaustedError as exc:
-        yield "outcome", (None, message_for_ladder_exhausted(exc))
+        yield "outcome", _degraded_outcome(message_for_ladder_exhausted(exc))
         return
     except OpenRouterError as exc:
-        yield "outcome", (None, message_for_terminal_error(exc))
+        yield "outcome", _degraded_outcome(message_for_terminal_error(exc))
         return
     except Exception:
-        yield "outcome", (None, UNEXPECTED_ERROR_MESSAGE)
+        yield "outcome", _degraded_outcome(UNEXPECTED_ERROR_MESSAGE)
         return
 
     final_output = (result.get("final_output") or "").strip()

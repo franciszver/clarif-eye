@@ -36,6 +36,7 @@ from clarif_eye.ui import (
     STATUS_ASKING,
     STATUS_NODE_ANSWERING,
     STATUS_NODE_TTS,
+    STATUS_SUCCESS_TEXT_ONLY,
     ThreadRegistry,
     handle_ask_staged,
     handle_submit_staged,
@@ -133,6 +134,17 @@ class _FakeTtsProvider:
             f.write(b"ID3" + b"\x00" * 32)
 
 
+class _FailingTtsProvider:
+    """Raises TtsError on every synthesize() call, so run_tts genuinely
+    exhausts the whole chain rather than faking the exhausted state via
+    tts_module._last_result_set - used only by
+    test_follow_up_announces_text_only_status_when_chain_exhausted below
+    (issue #88 / P9.9 coverage)."""
+
+    def synthesize(self, text, out_path):
+        raise tts_module.TtsError("boom")
+
+
 def _resources(client):
     """A REAL checkpointed graph plus a REAL ThreadRegistry - the pairing
     invariant clarif_eye.ui.AppResources documents, and the only
@@ -201,6 +213,30 @@ def test_follow_up_answers_from_stored_state_with_no_second_vision_call():
     assert updates[-2][0] == updates[-1][0]
     assert updates[-2][2] == updates[-1][2]
     assert CANNED_ANSWER in updates[-1][2]
+
+
+def test_follow_up_announces_text_only_status_when_chain_exhausted():
+    # Issue #88 / P9.9 coverage: the follow-up path shares _outcome_for
+    # with every other path (see that function's docstring "Shared by
+    # _run_pipeline_events, _run_followup_events and _run_resume_events"),
+    # so a REAL chain exhaustion on THIS run must still announce
+    # STATUS_SUCCESS_TEXT_ONLY, not just on the photo path - named here so
+    # the sharing can't silently unshare later.
+    client = RecordingClient()
+    resources = _resources(client)
+    thread_id = "follow-up-exhausted"
+
+    list(handle_submit_staged(FakeImage(), resources, thread_id=thread_id))
+    # Only the FOLLOW-UP call needs every provider to fail - the photo run
+    # above already spoke successfully with the fake provider.
+    resources.tts_providers = [_FailingTtsProvider()]
+
+    updates = list(handle_ask_staged(QUESTION, resources, thread_id=thread_id))
+
+    final_status, final_audio, final_text = updates[-1]
+    assert final_status == STATUS_SUCCESS_TEXT_ONLY
+    assert final_audio is None
+    assert CANNED_ANSWER in final_text
 
 
 def test_a_new_photo_after_a_question_is_not_diverted_into_the_followup_node():

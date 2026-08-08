@@ -32,12 +32,13 @@ from clarif_eye.graph import build_graph
 from clarif_eye.prompting import SHORT_VERBOSITY_INSTRUCTION
 from clarif_eye.ui import (
     AppResources,
+    STATUS_SUCCESS_TEXT_ONLY,
     ThreadRegistry,
     handle_ask_staged,
     handle_submit_staged,
 )
 
-from tests.test_followup import RecordingClient, _FakeTtsProvider
+from tests.test_followup import RecordingClient, _FailingTtsProvider, _FakeTtsProvider
 # Reused, not re-declared - the same PIL-image stand-in tests/test_ui.py and
 # tests/test_followup.py already use.
 from tests.test_ui import FakeImage
@@ -124,6 +125,30 @@ def test_a_recognised_preference_command_speaks_a_confirmation_and_never_runs_th
     assert len(client.calls) == calls_after_photo, "a recognised preference command must cost no model call"
     final_status, final_audio, final_text = updates[-1]
     assert final_audio, "the confirmation must be spoken, not text-only"
+    assert "shorter" in final_text.lower()
+
+
+def test_preference_confirmation_announces_text_only_status_when_chain_exhausted():
+    # Issue #88 / P9.9 coverage: _handle_preference_command shares
+    # _outcome_for too (see that function's own docstring), so a REAL chain
+    # exhaustion on THIS confirmation must still announce
+    # STATUS_SUCCESS_TEXT_ONLY, not just on the photo path - named here so
+    # the sharing can't silently unshare later.
+    client = RecordingClient()
+    resources = _resources(client)
+
+    list(handle_submit_staged(FakeImage(), resources, thread_id="thread-a", session_id=SESSION_ID))
+    # Only the PREFERENCE COMMAND needs every provider to fail - the photo
+    # run above already spoke successfully with the fake provider.
+    resources.tts_providers = [_FailingTtsProvider()]
+
+    updates = list(
+        handle_ask_staged("shorter descriptions please", resources, thread_id="thread-a", session_id=SESSION_ID)
+    )
+
+    final_status, final_audio, final_text = updates[-1]
+    assert final_status == STATUS_SUCCESS_TEXT_ONLY
+    assert final_audio is None
     assert "shorter" in final_text.lower()
 
 
