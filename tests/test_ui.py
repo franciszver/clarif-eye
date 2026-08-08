@@ -27,9 +27,11 @@ from clarif_eye.ui import (
     CONFIG_ERROR_MESSAGE,
     IMAGE_CACHE_MAX_ENTRIES,
     NO_IMAGE_MESSAGE,
+    STATUS_DEGRADED,
     STATUS_NODE_RESEARCH,
     STATUS_NODE_TTS,
     STATUS_NODE_WRITING,
+    STATUS_SUCCESS_TEXT_ONLY,
     STATUS_WORKING,
     UNEXPECTED_ERROR_MESSAGE,
     UNREADABLE_IMAGE_MESSAGE,
@@ -304,6 +306,55 @@ def test_terminal_config_error_escaping_the_graph_never_says_try_again():
     assert audio is None
     assert text == MAPPED_CONFIG_ERROR_MESSAGE
     assert "try again" not in text.lower()
+
+
+# --- Issue #88 / P9.9: stale audio-exhaustion status on an early failure ---
+
+
+def test_early_failure_after_exhausted_chain_never_announces_stale_text_ready():
+    # RED-FIRST for issue #88. Run A's own TTS attempt exhausts the
+    # provider chain for real, leaving tts.is_chain_exhausted() True in
+    # this process (module-global state, see tts.py's module docstring).
+    # Run B fails BEFORE any TTS attempt at all (a LadderExhaustedError
+    # raised while reading the photo, same shape as
+    # test_ladder_exhausted_escaping_the_graph_produces_the_busy_message
+    # above). Before the fix, the final status was derived from
+    # tts.is_chain_exhausted() re-read AFTER run B finished, so it saw run
+    # A's leftover True and announced STATUS_SUCCESS_TEXT_ONLY ("Description
+    # ready as text...") over run B's own failure message - the live
+    # region's only signal, lying to a user who cannot see the screen.
+    graph_a = FakeGraph(result={"final_output": "A cat sits on a mat.", "audio_file_path": ""})
+    resources_a = _resources(graph_a)
+    tts_module._last_result_set(
+        tts_module.TtsResult(
+            "",
+            (
+                tts_module.ProviderAttempt("Edge", "error", "boom"),
+                tts_module.ProviderAttempt("Gtts", "error", "boom"),
+            ),
+            None,
+        )
+    )
+    *_, (status_a, audio_a, text_a) = handle_submit_staged(FakeImage(), resources_a)
+    # Sanity: run A's own outcome IS the real text-only-ready case - the
+    # fix must not break this true case (see module docstring THE THREE
+    # OUTCOMES outcome (b)).
+    assert status_a == STATUS_SUCCESS_TEXT_ONLY
+    assert audio_a is None
+
+    attempts = (
+        Attempt("model-a", "rate_limited", 429, "rate limited"),
+        Attempt("model-b", "rate_limited", 429, "rate limited"),
+    )
+    graph_b = FakeGraph(exc=LadderExhaustedError("eyes", attempts))
+    resources_b = _resources(graph_b)
+
+    *_, (status_b, audio_b, text_b) = handle_submit_staged(FakeImage(), resources_b)
+
+    assert status_b != STATUS_SUCCESS_TEXT_ONLY
+    assert status_b == STATUS_DEGRADED
+    assert audio_b is None
+    assert text_b == BUSY_MESSAGE
 
 
 # --- Shared client: constructed once, injected on every invocation -------
