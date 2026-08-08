@@ -26,6 +26,7 @@ from langgraph.graph import StateGraph
 from langgraph.types import Command
 
 from clarif_eye import tts as tts_module
+from clarif_eye.client import LadderExhaustedError
 from clarif_eye.graph import (
     INTERRUPT_CHUNK_KEY,
     RESUME_CONTINUE,
@@ -440,6 +441,87 @@ def test_describe_document_text_never_raises():
     unconfigured = _resources(RecordingClient(HONEST_DRAFT))
     unconfigured.client = None
     assert describe_document_text(BILL_OCR, unconfigured) == CONFIG_ERROR_MESSAGE
+
+
+class CountingSearcher:
+    """FakeSearcher that records how many lookups it was asked for - the
+    text route's web lookup is an outbound request per call, so "did this
+    cost anything?" has to be measurable, not inferred."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def text(self, query, **kwargs):
+        self.calls += 1
+        return []
+
+
+def _text_route_resources(client, searcher=None):
+    resources = _resources(client)
+    resources.searcher = searcher or CountingSearcher()
+    return resources
+
+
+def test_the_text_only_route_does_not_spend_quota_twice_on_the_same_document():
+    """THE SAME DOCUMENT COSTS ONCE. The photo path has been content-cached
+    since issue #75 precisely because a repeat submission spending a second
+    model call against a 1,000/day shared allowance is a real cost, not a
+    theoretical one. This route spends the SAME allowance and had no cache at
+    all, so an API caller in a retry loop could drain the day's quota - and
+    the UI would go quiet for everyone.
+    """
+    from clarif_eye.ui import describe_document_text
+
+    searcher = CountingSearcher()
+    resources = _text_route_resources(RecordingClient(HONEST_DRAFT), searcher)
+
+    first = describe_document_text(BILL_OCR, resources)
+    calls_after_first = len(resources.client.calls)
+    second = describe_document_text(BILL_OCR, resources)
+
+    assert second == first
+    assert len(resources.client.calls) == calls_after_first, "the repeat call spent a model call"
+    assert searcher.calls == 1, "the repeat call made a second web lookup"
+
+
+def test_the_text_only_route_never_replays_a_failure_as_an_answer():
+    """The photo cache's own rule, applied here: a quota/API failure must
+    never be served to the next caller as if it were that document's answer.
+    A failing call must be retried next time, not remembered."""
+    from clarif_eye.ui import describe_document_text
+
+    class FailingClient(RecordingClient):
+        def complete(self, role, messages, **params):
+            self.calls.append((role, False, ""))
+            raise LadderExhaustedError("brain", [])
+
+    resources = _text_route_resources(FailingClient(HONEST_DRAFT))
+
+    describe_document_text(BILL_OCR, resources)
+    calls_after_first = len(resources.client.calls)
+    describe_document_text(BILL_OCR, resources)
+
+    assert len(resources.client.calls) > calls_after_first, "a failure was cached and replayed"
+
+
+def test_the_text_only_route_caps_what_it_sends_to_the_model():
+    """UNCAPPED INPUT IS A QUOTA HOLE AND A CORRECTNESS ONE. Probed: this
+    route happily pushed a 2.3-million-character prompt at the brain model.
+    Nothing upstream bounds it - unlike the photo path, where the text can
+    only ever be what a vision pass read off one photograph.
+    """
+    from clarif_eye.ui import DOCUMENT_TEXT_CAP, describe_document_text
+
+    resources = _text_route_resources(RecordingClient(HONEST_DRAFT))
+    oversized = "x" * (DOCUMENT_TEXT_CAP * 3)
+
+    describe_document_text(oversized, resources)
+
+    brain_prompts = [prompt for role, has_image, prompt in resources.client.calls if role == "brain"]
+    assert brain_prompts, "the model was never reached"
+    assert brain_prompts[0].count("x") <= DOCUMENT_TEXT_CAP, (
+        "more than the cap's worth of document text reached the model"
+    )
 
 
 def test_the_text_only_consumer_is_an_api_route_and_not_in_the_ui_flow():
